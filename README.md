@@ -41,7 +41,9 @@ Shpejtësia, n = 4096 (TFLOPS FP64-ekuivalentë; piku vendas FP64 i matur 0,449)
 | TFLOPS | 7.55 | 6.46 | **5.56 — 12.4× the native peak, and more accurate** |
 
 Time split at 16 moduli / ndarja e kohës: scales 1.0 ms · residues 3.0 ms · 16 INT8 GEMMs 16.8 ms · CRT 3.6 ms.
-The INT8 GEMM runs at ~57 % of the measured tensor-core peak — the next gains are there.
+The INT8 GEMM runs at 67 % of the measured tensor-core peak (157 TOPS, three-stage cp.async). With real data the laptop is
+**power-bound** (~95 W, SM 1.8 GHz): a faster kernel did not move the end-to-end numbers, so the next gains are in energy
+per INT8 operation (fewer moduli, fewer bit flips), not in latency hiding.
 
 ## Energy / Energjia (n = 4096, 12 s each, `bench/energy.cu`, nvidia-smi every 200 ms)
 
