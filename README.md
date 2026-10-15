@@ -42,3 +42,17 @@ Shpejtësia, n = 4096 (TFLOPS FP64-ekuivalentë; piku vendas FP64 i matur 0,449)
 
 Time split at 16 moduli / ndarja e kohës: scales 1.0 ms · residues 3.0 ms · 16 INT8 GEMMs 16.8 ms · CRT 3.6 ms.
 The INT8 GEMM runs at ~57 % of the measured tensor-core peak — the next gains are there.
+
+## Energy / Energjia (n = 4096, 12 s each, `bench/energy.cu`, nvidia-smi every 200 ms)
+
+| | GFLOPS | mean W | GFLOPS/W |
+|---|---|---|---|
+| native FP64, peak kernel | 423 | 56.8 | 7.4 |
+| **Ozaki-II, 16 moduli** | **5 068** | 94.6 | **53.6 (7.2×)** |
+| Ozaki-II, 12 moduli | 6 580 | 94.6 | 69.5 |
+
+Under load the laptop holds ~95 W and the SM clock drops to ~1.8 GHz (2.76 GHz on the FP64 units alone).
+
+## Next / Më tej
+Quad-precision-class GEMM (~30 moduli, ~2^240 range) from the same INT8 tensor cores: a unit no GPU has in hardware.
+GEMM me precizion të klasës katërfishe nga të njëjtat tensor core INT8: një njësi që asnjë GPU s'e ka në harduer.
