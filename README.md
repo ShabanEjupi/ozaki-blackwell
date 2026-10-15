@@ -73,3 +73,11 @@ Error: max componentwise |C − C_ref| / (|A||B|), in units of **2⁻¹⁰⁶**,
 Speed at n = 4096: **1.76 TFLOPS of double-double with 32 moduli (2.34 with 24) — 3.9× this GPU's own plain FP64 (0.449), with twice
 the significand bits.** Ndërtohet nga të njëjtat tensor core INT8; asnjë GPU s'ka double-double/FP128 në harduer.
 Residues split into two int64 limbs instead of fmod on 2^107 values: 211 → 78 ms. The 32 INT8 GEMMs are ~35 of those 78.
+
+## Related work / Puna e mëparshme (checked 15-10-2026)
+- Ozaki, Uchino, Imamura — Ozaki Scheme II (arXiv 2504.08009): FP64 from INT8 via CRT, 7.4–9.8 TFLOPS on an RTX 4090. Public code: RIKEN GEMMul8.
+- Ozaki-II SGEMM incl. power efficiency on RTX 5080 (arXiv 2508.03984); FP8 variant (2603.10634); FP4 limbs (2608.06812, 2609.24519);
+  EmuGEMM fused kernels, 81 % of INT8 peak on Blackwell (2606.25453); complex CRT GEMM (2512.08321).
+- **Not found:** a double-double / >FP64 GEMM built this way. Ozaki-II mentions such an extension as possible; no implementation or
+  measurement turned up. That — and the power-bound laptop regime — is where this work can claim something new.
+  FP64 alone is **not** new; it is the baseline.
