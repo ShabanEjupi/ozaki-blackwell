@@ -68,6 +68,6 @@ Error: max componentwise |C − C_ref| / (|A||B|), in units of **2⁻¹⁰⁶**,
 | 1024 | 2^±0 | 4.7e5 | 31 | **0.49** |
 | 1024 | 2^±8 | 1.1e7 | 713 | **12.4** |
 
-Speed at n = 4096: **0.65 TFLOPS of double-double with 32 moduli — faster than this GPU's own plain FP64 (0.449), with twice
+Speed at n = 4096: **1.76 TFLOPS of double-double with 32 moduli (2.34 with 24) — 3.9× this GPU's own plain FP64 (0.449), with twice
 the significand bits.** Ndërtohet nga të njëjtat tensor core INT8; asnjë GPU s'ka double-double/FP128 në harduer.
-The 32 INT8 GEMMs take ~35 of 211 ms; residues (fmod) and the O(32²) Garner step are the rest — the next target.
+Residues split into two int64 limbs instead of fmod on 2^107 values: 211 → 78 ms. The 32 INT8 GEMMs are ~35 of those 78.

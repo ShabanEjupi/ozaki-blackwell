@@ -8,6 +8,8 @@
 
 namespace oz {
 
+__host__ __device__ constexpr int pow2mod(int e, int m) { int r = 1 % m; for (int i = 0; i < e; i++) r = r * 2 % m; return r; }
+
 struct dd { double hi, lo; };
 __device__ __forceinline__ dd two_sum(double a, double b) { double s = a + b, v = s - a; return {s, (a - (s - v)) + (b - v)}; }
 __device__ __forceinline__ dd quick_two_sum(double a, double b) { double s = a + b; return {s, b - (s - a)}; }
@@ -41,9 +43,12 @@ __global__ void residues_dd(const double *Xh, const double *Xl, int len, long lo
     double a = ldexp(Xh[at], s[r]), b = ldexp(Xl[at], s[r]);
     double ai = trunc(a), bi = trunc(b);
     double f = rint((a - ai) + (b - bi));   // |f| <= 2
+    // ai = u * 2^53 + w exactly (u, w in int64), then everything mod m with compile-time m.
+    // fmod on a 2^107 value loops bit by bit (15-10: residues were most of the 211 ms).
+    long long u = (long long)trunc(ldexp(ai, -53)), w = (long long)(ai - ldexp((double)u, 53)), bb = (long long)bi;
     each<0, NM>([&](auto L) {
-        constexpr int m = modulus(decltype(L)::value);
-        int v = (int)fmod(ai, (double)m) + (int)fmod(bi, (double)m) + (int)f;   // each |.| < m
+        constexpr int m = modulus(decltype(L)::value), p53 = pow2mod(53, m);
+        int v = balc<m>(u) * p53 + balc<m>(w) + balc<m>(bb) + (int)f;   // |.| < 128*256 + 3*128
         R[decltype(L)::value * plane + (size_t)r * ld + k] = (int8_t)balc<m>(v);
     });
 }
