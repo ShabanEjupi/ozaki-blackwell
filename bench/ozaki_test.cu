@@ -24,10 +24,11 @@ static void fill(std::vector<double> &v, double spread, unsigned seed) {   // si
 }
 
 int main() {
-    const int M = 256, N = 256;
+    int M = 256, N = 256;
     printf("accuracy, M=N=%d (componentwise err / unit roundoff 2^-53)\n", M);
-    for (int K : {512, 4096})
+    for (int K : {512, 4096, 500})
         for (double spread : {0.0, 8.0}) {
+            if (K == 500) { M = 200; N = 300; if (spread) continue; }   // nothing a multiple of the 128x128x64 tile
             std::vector<double> A((size_t)M * K), B((size_t)K * N), C((size_t)M * N);
             fill(A, spread, 1 + K); fill(B, spread, 2 + K);
             std::vector<long double> ref((size_t)M * N), abs_((size_t)M * N);
@@ -49,8 +50,8 @@ int main() {
                 for (size_t t = 0; t < C.size(); t++) e = fmaxl(e, fabsl(C[t] - ref[t]) / abs_[t]);
                 return (double)(e / 0x1p-53L);
             };
-            dgemm_native<<<dim3(N / 128, M), 128>>>(dA, dB, dC, M, N, K); CK(cudaGetLastError());
-            printf("K=%5d spread 2^±%-2.0f  native FP64 %8.2f |", K, spread, err());
+            dgemm_native<<<dim3((N + 127) / 128, M), 128>>>(dA, dB, dC, M, N, K); CK(cudaGetLastError());
+            printf("%dx%d K=%5d spread 2^±%-2.0f  native FP64 %8.2f |", M, N, K, spread, err());
             for (int nm : {8, 10, 12, 14, 16}) {
                 oz::Plan p = oz::plan(M, N, K, nm);
                 oz::dgemm(p, dA, dB, dC); CK(cudaGetLastError());

@@ -6,6 +6,8 @@
 // The integer product is exact while sum_k |A'||B'| < P/2, P = product of the moduli: bits = (log2 P - 2 - log2 K) / 2.
 #pragma once
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <type_traits>
 #include <cuda_runtime.h>
@@ -97,6 +99,7 @@ inline Plan plan(int M, int N, int K, int nm) {
     Plan p{M, N, K, (M + BM - 1) / BM * BM, (N + BN - 1) / BN * BN, (K + BK - 1) / BK * BK, nm, 0};
     double log2P = 0;
     for (int l = 0; l < nm; l++) log2P += log2((double)MODULI[l]);
+    if (K >= 131072) { fprintf(stderr, "ozaki2: K=%d, the int32 accumulators hold K < 131072 (127^2 * K < 2^31)\n", K); abort(); }
     p.bits = (int)floor((log2P - 2 - log2((double)K)) / 2);
     if (p.bits > 62) p.bits = 62;   // llrint into int64
     int mods[MAXM], inv[MAXM][MAXM] = {};
