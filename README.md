@@ -20,3 +20,25 @@ Qëllimi: një GPU e zakonshme të punojë si një kartelë FP64 e qendrave të 
 ## Run / Nisja
 `./wsl.sh 'nvcc -O3 -arch=sm_120 -o out_peak bench/peak.cu && ./out_peak'` — builds and runs inside the laptop's WSL2
 (Smart App Control refuses unsigned Windows binaries).
+
+## FP64 from INT8 — results / rezultatet (15-10-2026, `bench/ozaki_test.cu`)
+
+Error: max componentwise |C − C_ref| / (|A||B|), in units of 2⁻⁵³, against an 80-bit CPU reference. M = N = 256.
+Gabimi: maksimumi për element kundrejt |A||B|, në njësi 2⁻⁵³, kundër një reference 80-bitëshe në CPU.
+
+| K | magnitudes | native FP64 | 12 moduli | 14 moduli | **16 moduli** |
+|---|---|---|---|---|---|
+| 512 | 2^±0 | 4.71 | 2 660 | 10.9 | **0.99** |
+| 512 | 2^±8 | 24.1 | 94 600 | 395 | **3.1** |
+| 4096 | 2^±0 | 4.15 | 2 400 | 10.5 | **0.25** |
+| 4096 | 2^±8 | 25.1 | 42 200 | 203 | **1.87** |
+
+Speed, n = 4096 (FP64-equivalent TFLOPS; native FP64 peak measured at 0.449):
+Shpejtësia, n = 4096 (TFLOPS FP64-ekuivalentë; piku vendas FP64 i matur 0,449):
+
+| | 12 moduli | 14 moduli | **16 moduli** |
+|---|---|---|---|
+| TFLOPS | 7.55 | 6.46 | **5.56 — 12.4× the native peak, and more accurate** |
+
+Time split at 16 moduli / ndarja e kohës: scales 1.0 ms · residues 3.0 ms · 16 INT8 GEMMs 16.8 ms · CRT 3.6 ms.
+The INT8 GEMM runs at ~57 % of the measured tensor-core peak — the next gains are there.
