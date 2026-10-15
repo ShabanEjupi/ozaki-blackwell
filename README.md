@@ -56,3 +56,18 @@ Under load the laptop holds ~95 W and the SM clock drops to ~1.8 GHz (2.76 GHz o
 ## Next / Më tej
 Quad-precision-class GEMM (~30 moduli, ~2^240 range) from the same INT8 tensor cores: a unit no GPU has in hardware.
 GEMM me precizion të klasës katërfishe nga të njëjtat tensor core INT8: një njësi që asnjë GPU s'e ka në harduer.
+
+## Double-double (~106-bit) GEMM from INT8 — a precision no GPU has in hardware (`bench/dd_test.cu`)
+
+Error: max componentwise |C − C_ref| / (|A||B|), in units of **2⁻¹⁰⁶**, against a `__float128` CPU reference. M = N = 128.
+
+| K | magnitudes | 24 moduli | 28 moduli | **32 moduli** |
+|---|---|---|---|---|
+| 256 | 2^±0 | 6.2e5 | 27.1 | **1.09** |
+| 256 | 2^±8 | 2.0e7 | 1 160 | **46.9** |
+| 1024 | 2^±0 | 4.7e5 | 31 | **0.49** |
+| 1024 | 2^±8 | 1.1e7 | 713 | **12.4** |
+
+Speed at n = 4096: **0.65 TFLOPS of double-double with 32 moduli — faster than this GPU's own plain FP64 (0.449), with twice
+the significand bits.** Ndërtohet nga të njëjtat tensor core INT8; asnjë GPU s'ka double-double/FP128 në harduer.
+The 32 INT8 GEMMs take ~35 of 211 ms; residues (fmod) and the O(32²) Garner step are the rest — the next target.

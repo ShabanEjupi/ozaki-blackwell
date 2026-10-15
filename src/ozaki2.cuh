@@ -15,13 +15,17 @@
 
 namespace oz {
 
-constexpr int MAXM = 16;
-// pairwise coprime, largest first: 2^8, 3*5*17, 11*23, 251, 13*19, then primes, 7*31
-constexpr int MODULI[MAXM] = {256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199, 197, 193};
+constexpr int MAXM = 32;
+// pairwise coprime, largest first: 2^8, 3*5*17, 11*23, 251, 13*19, then primes, 7*31, then primes again
+constexpr int MODULI[MAXM] = {256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199, 197, 193,
+                               191, 181, 179, 173, 167, 163, 157, 151, 149, 139, 137, 131, 127, 113, 109, 107};
 __host__ __device__ constexpr int modulus(int l) {   // MODULI[l], usable as a compile-time constant on the device
     switch (l) { case 0: return 256; case 1: return 255; case 2: return 253; case 3: return 251; case 4: return 247;
     case 5: return 241; case 6: return 239; case 7: return 233; case 8: return 229; case 9: return 227; case 10: return 223;
-    case 11: return 217; case 12: return 211; case 13: return 199; case 14: return 197; default: return 193; }
+    case 11: return 217; case 12: return 211; case 13: return 199; case 14: return 197; case 15: return 193;
+    case 16: return 191; case 17: return 181; case 18: return 179; case 19: return 173; case 20: return 167; case 21: return 163;
+    case 22: return 157; case 23: return 151; case 24: return 149; case 25: return 139; case 26: return 137; case 27: return 131;
+    case 28: return 127; case 29: return 113; case 30: return 109; default: return 107; }
 }
 __constant__ int c_mod[MAXM];
 __constant__ int c_inv[MAXM][MAXM];   // c_inv[j][i] = m_j^-1 mod m_i (j < i)
@@ -95,13 +99,13 @@ struct Plan {
 };
 
 // A: M x K row-major, B: K x N row-major, C: M x N row-major, all device FP64
-inline Plan plan(int M, int N, int K, int nm) {
+inline Plan plan(int M, int N, int K, int nm, int maxbits = 62) {   // 62: llrint into int64; the dd path takes ~106
     Plan p{M, N, K, (M + BM - 1) / BM * BM, (N + BN - 1) / BN * BN, (K + BK - 1) / BK * BK, nm, 0};
     double log2P = 0;
     for (int l = 0; l < nm; l++) log2P += log2((double)MODULI[l]);
     if (K >= 131072) { fprintf(stderr, "ozaki2: K=%d, the int32 accumulators hold K < 131072 (127^2 * K < 2^31)\n", K); abort(); }
     p.bits = (int)floor((log2P - 2 - log2((double)K)) / 2);
-    if (p.bits > 62) p.bits = 62;   // llrint into int64
+    if (p.bits > maxbits) p.bits = maxbits;
     int mods[MAXM], inv[MAXM][MAXM] = {};
     for (int l = 0; l < MAXM; l++) mods[l] = MODULI[l];
     for (int t = 0; t < MAXM; t++) for (int l = t + 1; l < MAXM; l++) inv[t][l] = inv_mod(MODULI[t] % MODULI[l], MODULI[l]);
