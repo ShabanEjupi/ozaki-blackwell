@@ -106,7 +106,7 @@ int main(int argc, char **argv) {
     // A = (Q1 diag(sigma)) * Q2, in double-double, the product on the GPU
     std::vector<double> Qh((size_t)n * n), Ql(Qh.size()), sh(n), sl(n);
     quad_dst(n, Qh.data(), Ql.data()); quad_sigma(n, ek, sh.data(), sl.data());
-    std::mt19937_64 g(7);
+    std::mt19937_64 g(argc > 4 ? atoll(argv[4]) : 7);   // seed: matrix permutation, signs and x_true
     std::vector<int> perm(n); for (int i = 0; i < n; i++) perm[i] = i;
     std::shuffle(perm.begin(), perm.end(), g);
     std::vector<double> Bh(Qh.size()), Bl(Qh.size()), Q2h(Qh.size()), Q2l(Qh.size()), Ah(Qh.size()), Al(Qh.size());
