@@ -81,3 +81,22 @@ Residues split into two int64 limbs instead of fmod on 2^107 values: 211 → 78 
 - **Not found:** a double-double / >FP64 GEMM built this way. Ozaki-II mentions such an extension as possible; no implementation or
   measurement turned up. That — and the power-bound laptop regime — is where this work can claim something new.
   FP64 alone is **not** new; it is the baseline.
+
+## A real job: Ax = b at κ = 10²⁰ — Një punë reale: Ax = b me κ = 10²⁰ (18-10-2026, `bench/solve.cu`)
+
+A = Q₁ diag(σ) Q₂ (orthogonal DST-I, the second permuted and sign-flipped; σ from 1 to 10⁻²⁰) — not fixable by scaling.
+Blocked double-double LU: panels and U₁₂ on the CPU, trailing updates on the INT8 tensor cores. Error = max |x − x_ref| / max |x_ref|.
+LU-ja double-double me blloqe: panelet te CPU-ja, përditësimet e mbetura (2/3 n³) te tensor core-t INT8.
+
+| n = 4096, 24 CPU threads | seconds | err vs x_true | err vs `__float128` |
+|---|---|---|---|
+| FP64 LU | 2.69 | 193 | 193 |
+| FP64 LU + 10 refinement steps, double-double residuals | | 1.9·10¹⁰ | 647 (best) |
+| **double-double LU, INT8 tensor cores** | **5.03** (GPU 1.10) | **6.6·10⁻¹¹** | **3.3·10⁻¹¹** |
+| `__float128` LU, all cores (reference) | 50.6 | 7.1·10⁻¹¹ | 0 |
+
+- FP64 has no correct digit, and textbook refinement diverges (it needs κ·u < 1). Control at κ = 10¹², n = 512: refinement
+  converges to 3·10⁻²⁰, so the baseline is implemented right. / Kontrolli me κ = 10¹²: rafinimi konvergjon.
+- n = 2048: 0.34 s vs 5.98 s for `__float128` (17.6×), 2.2·10⁻¹⁰. At κ = 10²⁴ both reach ~4–7·10⁻⁷ (κ·u_dd).
+- Error vs x_true is floored by rounding b to double-double (κ·2⁻¹⁰⁶), for the quad solve too.
+- The CPU part (panels, U₁₂, A₂₂ −= P on the host) is now 3.9 of 5.0 s → next: keep A on the GPU, subtract there.
