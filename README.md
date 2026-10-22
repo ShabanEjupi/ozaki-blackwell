@@ -161,3 +161,29 @@ nvidia-smi (100 ms); 20 back-to-back GPU solves after a warm-up. DRAM power is n
 | double-double LU on the GPU | 0.238 s | 28.2 W (driving) | 68.3 W | **23 J** |
 
 **~270× less energy per solve, CPU and GPU both counted** (GPU alone vs CPU package alone: 360×). Idle: CPU 15.4 W.
+
+## Triple-double (~159-bit) GEMM from INT8 — precision as a software choice (22-10-2026, `bench/td_test.cu`)
+`src/ozaki_td.cuh`: 49 moduli (the 32 above plus the 17 primes 103…29 that are not yet factors; product ~2³⁴²); each of the
+three parts of an input split exactly into 53-bit int64 pieces for the residues; CRT as a direct sum over twelve 32-bit
+limbs on the integer units; the result peeled off the integer as three doubles (round down, round down, round to nearest,
+each exact from the integer), then made canonical. No floating-point arithmetic touches the 342-bit value.
+
+Error: max_ij |C − C_exact| / (|A||B|)_ij in units of **2⁻¹⁵⁹**, against an exact 600-bit MPFR sum. M = N = 128.
+
+| K | magnitudes | 41 moduli | 45 moduli | **49 moduli** |
+|---|---|---|---|---|
+| 256 | 2^±0 | 1.7e4 | 5.2 | **0.24** |
+| 256 | 2^±8 | 1.2e6 | 343 | **10.7** |
+| 1024 | 2^±0 | 1.8e4 | 4.6 | **0.13** |
+| 1024 | 2^±8 | 4.3e5 | 110 | **2.1** |
+
+Speed at n = 4096, every competitor on this laptop (CPU idle for the CPU runs; CPU numbers measured at n = 512 / 256 and
+scaled by n³):
+
+| ~159-bit GEMM, n = 4096 | time | TFLOPS | GPU speedup |
+|---|---|---|---|
+| **INT8 tensor cores, 49 moduli** | **0.114 s** | **1.21** | — |
+| triple-double arithmetic on 24 CPU threads (QD-style, AVX, `omp simd`) | ~16 s | 0.0086 | **141×** |
+| MPFR at 160 bits, `mpfr_fma`, 24 threads | ~230 s | 0.0006 | **~2 000×** |
+
+Triple-double GEMM runs at 2.7× this GPU's own plain-FP64 peak (0.449 TFLOPS) while carrying three times the bits.

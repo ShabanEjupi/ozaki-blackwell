@@ -10,6 +10,19 @@
 #include "../src/ozaki_td.cuh"
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
+// Triple-double arithmetic on the CPU, QD-style: the strongest software baseline for ~159 bits (MPFR is far slower).
+// s + a b down to the order-2^-106 products; the order-2^-159 terms are dropped, as a triple-double library does.
+static inline void ts(double a, double b, double &s, double &e) { s = a + b; double v = s - a; e = (a - (s - v)) + (b - v); }
+static inline void td_fma(double &sx, double &sy, double &sz, double ax, double ay, double az, double bx, double by, double bz) {
+    double p0 = ax * bx, q0 = std::fma(ax, bx, -p0), p1 = ax * by, q1 = std::fma(ax, by, -p1), p2 = ay * bx, q2 = std::fma(ay, bx, -p2);
+    double t0, e0, u, f1, f2, f3, f4;
+    ts(sx, p0, t0, e0);
+    ts(sy, q0, u, f1); ts(u, p1, u, f2); ts(u, p2, u, f3); ts(u, e0, u, f4);
+    double w = sz + ax * bz + ay * by + az * bx + q1 + q2 + f1 + f2 + f3 + f4;
+    double h, r1, r2;
+    ts(t0, u, h, r1); ts(r1, w, r1, r2); ts(h, r1, sx, sy); sz = r2;
+}
+
 // random triple-doubles: hi in +-[2^-e, 1) * 2^e', mid and lo the next 53-bit pieces
 static void fill(std::vector<double> &h, std::vector<double> &m, std::vector<double> &l, int spread, std::mt19937_64 &g) {
     std::uniform_real_distribution<double> u(-1, 1);
@@ -91,6 +104,26 @@ int main() {
         oz::release(p); for (auto x : d) cudaFree(x);
     }
 
+    {   // triple-double on the CPU, every core: loop i, k, j so the j loop vectorizes; n = 512 measured, scaled by n^3
+        int n = 512; std::vector<double> h(n * n), m(h.size()), l(h.size()); fill(h, m, l, 0, g);
+        std::vector<double> Cx(h.size()), Cy(h.size()), Cz(h.size());
+        double t0 = now();
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < n; i++) {
+            double *sx = &Cx[(size_t)i * n], *sy = &Cy[(size_t)i * n], *sz = &Cz[(size_t)i * n];
+            for (int j = 0; j < n; j++) sx[j] = sy[j] = sz[j] = 0;
+            for (int k = 0; k < n; k++) {
+                double ax = h[i * n + k], ay = m[i * n + k], az = l[i * n + k];
+                const double *bx = &h[(size_t)k * n], *by = &m[(size_t)k * n], *bz = &l[(size_t)k * n];
+#pragma omp simd
+                for (int j = 0; j < n; j++) td_fma(sx[j], sy[j], sz[j], ax, ay, az, bx[j], by[j], bz[j]);
+            }
+        }
+        double t = now() - t0;
+        printf("CPU triple-double GEMM, %d threads: n = 512 %.3f s = %.4f TFLOPS (n = 4096 would take ~%.1f s)\n",
+               omp_get_max_threads(), t, 2.0 * n * n * n / t / 1e12, t * 512);
+        double c = 0; for (double v : Cx) c += v; if (c == 12345.678) printf(" ");   // keep the result alive
+    }
     // MPFR at 160 bits, every core: n = 256 measured, scaled by n^3
     {
         int n = 256; std::vector<double> h(n * n), m(h.size()), l(h.size()); fill(h, m, l, 0, g);
@@ -108,7 +141,7 @@ int main() {
             for (int i = 0; i < n; i++)
                 for (int j = 0; j < n; j++) {
                     mpfr_set_zero(s, 1);
-                    for (int k = 0; k < n; k++) { mpfr_mul(t, &A[i * n + k], &B[k * n + j], MPFR_RNDN); mpfr_add(s, s, t, MPFR_RNDN); }
+                    for (int k = 0; k < n; k++) mpfr_fma(s, &A[i * n + k], &B[k * n + j], s, MPFR_RNDN);
                 }
             mpfr_clears(s, t, (mpfr_ptr)0);
         }
