@@ -15,17 +15,22 @@
 
 namespace oz {
 
-constexpr int MAXM = 32;
-// pairwise coprime, largest first: 2^8, 3*5*17, 11*23, 251, 13*19, then primes, 7*31, then primes again
+constexpr int MAXM = 49;
+// pairwise coprime, largest first: 2^8, 3*5*17, 11*23, 251, 13*19, then primes, 7*31, then primes again; the last 17 (the
+// primes 103..29 not already a factor) take the product to ~2^342, enough for triple-double (ozaki_td.cuh)
 constexpr int MODULI[MAXM] = {256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199, 197, 193,
-                               191, 181, 179, 173, 167, 163, 157, 151, 149, 139, 137, 131, 127, 113, 109, 107};
+                               191, 181, 179, 173, 167, 163, 157, 151, 149, 139, 137, 131, 127, 113, 109, 107,
+                               103, 101, 97, 89, 83, 79, 73, 71, 67, 61, 59, 53, 47, 43, 41, 37, 29};
 __host__ __device__ constexpr int modulus(int l) {   // MODULI[l], usable as a compile-time constant on the device
     switch (l) { case 0: return 256; case 1: return 255; case 2: return 253; case 3: return 251; case 4: return 247;
     case 5: return 241; case 6: return 239; case 7: return 233; case 8: return 229; case 9: return 227; case 10: return 223;
     case 11: return 217; case 12: return 211; case 13: return 199; case 14: return 197; case 15: return 193;
     case 16: return 191; case 17: return 181; case 18: return 179; case 19: return 173; case 20: return 167; case 21: return 163;
     case 22: return 157; case 23: return 151; case 24: return 149; case 25: return 139; case 26: return 137; case 27: return 131;
-    case 28: return 127; case 29: return 113; case 30: return 109; default: return 107; }
+    case 28: return 127; case 29: return 113; case 30: return 109; case 31: return 107; case 32: return 103; case 33: return 101;
+    case 34: return 97; case 35: return 89; case 36: return 83; case 37: return 79; case 38: return 73; case 39: return 71;
+    case 40: return 67; case 41: return 61; case 42: return 59; case 43: return 53; case 44: return 47; case 45: return 43;
+    case 46: return 41; case 47: return 37; default: return 29; }
 }
 __constant__ int c_mod[MAXM];
 __constant__ int c_inv[MAXM][MAXM];   // c_inv[j][i] = m_j^-1 mod m_i (j < i)
