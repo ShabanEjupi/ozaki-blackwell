@@ -36,6 +36,15 @@ static inline __host__ __device__ D dvd(D a, D b) {
     double q2 = r.hi / b.hi; r = sub(r, mul(b, {q2, 0}));
     return add(qts(q1, q2), {r.hi / b.hi, 0});
 }
+// a - m u in one pass, ~16 FP64 operations instead of ~29 for sub(a, mul(m, u)): the exact product error and the exact
+// sum error are both kept, only the low-order terms are summed in plain double -- error ~ 2^-104 (|a| + |m u|), the
+// backward-error model elimination needs. Used where the FP64 units are the bottleneck (the panel leaves).
+static inline __host__ __device__ D fms(D a, D m, D u) {
+    double p = m.hi * u.hi, pe = fma(m.hi, u.hi, -p);
+    D s = two_sum(a.hi, -p);
+    double lo = s.lo + (a.lo - pe - fma(m.hi, u.lo, m.lo * u.hi));
+    return qts(s.hi, lo);
+}
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_) { fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); exit(1); } } while (0)
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -194,11 +203,6 @@ __global__ void k_solve(const double *H, const double *L, int n, const int *piv,
         __syncthreads();
     }
 }
-// The blocked solve: the diagonal nb x nb block in shared memory (one block), the rest as a GEMV, one warp per row
-// reading its row of the factor in order. k_solve reads columns with stride n from one SM and takes 0.13 s at n=4096.
-__global__ void k_perm(int n, const int *piv, double *xh, double *xl) {
-    for (int j = 0; j < n; j++) { int p = piv[j]; double t = xh[j]; xh[j] = xh[p]; xh[p] = t; t = xl[j]; xl[j] = xl[p]; xl[p] = t; }
-}
 // Left-looking: before block [r0, r0+bb) is solved, each of its rows takes its whole dot product with the solved part
 // (columns c0..c1), a block of threads per row. The right-looking k_gemv paid a double-double shuffle reduction per row
 // per block -- n^2/64 reductions, 73 ms at n = 8192 -- where this pays n.
@@ -262,35 +266,6 @@ __global__ void k_gather(int n, const int *P, const double *Xh, const double *Xl
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { Yh[i] = Xh[P[i]]; Yl[i] = Xl[P[i]]; }
 }
-// The diagonal block of a triangular solve, staged in shared memory (rows padded by one against bank conflicts): read
-// from global, each step was a column with stride n, one L2 trip per step.
-__global__ void k_diag(const double *H, const double *L, int n, int b0, int bb, bool upper, double *Xh, double *Xl) {
-    extern __shared__ double sm[];
-    const int ld = bb + 1;
-    double *ah = sm, *al = sm + bb * ld, *xh = al + bb * ld, *xl = xh + bb;
-    int r = threadIdx.x;
-    for (int k = r; k < bb * bb; k += bb) { int i = k / bb, c = k % bb; ah[i * ld + c] = H[AT(b0 + i, b0 + c)]; al[i * ld + c] = L[AT(b0 + i, b0 + c)]; }
-    xh[r] = Xh[b0 + r]; xl[r] = Xl[b0 + r];
-    __syncthreads();
-    for (int s = 0; s < bb; s++) {
-        int t = upper ? bb - 1 - s : s;
-        if (upper && r == t) { D v = dvd({xh[t], xl[t]}, {ah[t * ld + t], al[t * ld + t]}); xh[t] = v.hi; xl[t] = v.lo; }
-        __syncthreads();
-        if (upper ? r < t : r > t) {
-            D v = sub({xh[r], xl[r]}, mul({ah[r * ld + t], al[r * ld + t]}, {xh[t], xl[t]})); xh[r] = v.hi; xl[r] = v.lo;
-        }
-        __syncthreads();
-    }
-    Xh[b0 + r] = xh[r]; Xl[b0 + r] = xl[r];
-}
-__global__ void k_gemv(const double *H, const double *L, int n, int r0, int r1, int b0, int bb, double *Xh, double *Xl) {
-    int i = r0 + blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;   // x_i -= A(i, b0:b0+bb) x(b0:)
-    if (i >= r1) return;
-    D s{0, 0};
-    for (int t = lane; t < bb; t += 32) s = add(s, mul({H[AT(i, b0 + t)], L[AT(i, b0 + t)]}, {Xh[b0 + t], Xl[b0 + t]}));
-    for (int o = 16; o; o >>= 1) s = add(s, {__shfl_down_sync(~0u, s.hi, o), __shfl_down_sync(~0u, s.lo, o)});
-    if (!lane) { D v = sub({Xh[i], Xl[i]}, s); Xh[i] = v.hi; Xl[i] = v.lo; }
-}
 
 // The recursive panel. The column-at-a-time panel above costs 4 launches per column plus a rank-1 update on the FP64 units
 // that grows with nb (0.33 s of 0.70 at n=4096, nb=256; 0.88 s at nb=1024). Here the panel is split in halves down to
@@ -309,7 +284,7 @@ __device__ unsigned long long g_lp[8];
 #define LP(k)
 #endif
 __global__ void __launch_bounds__(256) k_leaf(double *H, double *L, int n, int j0, int wl, int *piv, double *bv, int *bi,
-                                              double *ch, double *cl) {
+                                              double *ch, double *cl, bool fused) {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
     __shared__ double sv[8], uh[32], ul[32], rih, ril; __shared__ int si[8], sp;
@@ -379,7 +354,7 @@ __global__ void __launch_bounds__(256) k_leaf(double *H, double *L, int n, int j
                     D a{h[c], l[c]}, ri{rih, ril};
                     m = mul(a, ri); m = add(m, mul(sub(a, mul(m, {uh[c], ul[c]})), ri)); h[c] = m.hi; l[c] = m.lo;
                 }
-                else if (c > j) { D x = sub({h[c], l[c]}, mul(m, {uh[c], ul[c]})); h[c] = x.hi; l[c] = x.lo; }
+                else if (c > j) { D x = (fused ? fms({h[c], l[c]}, m, {uh[c], ul[c]}) : sub({h[c], l[c]}, mul(m, {uh[c], ul[c]}))); h[c] = x.hi; l[c] = x.lo; }
         }
         __syncthreads();   // uh, sp are rewritten by the next column
         LP(3)
@@ -459,7 +434,8 @@ static void rec(Rec &r, double *H, double *L, int k0, int j0, int w) {
     int n = r.n, nb = r.nb;
     size_t o = (size_t)(j0 - k0) * nb + (j0 - k0);   // this block's diagonal place in the inverse
     if (w <= 32) {
-        void *args[] = {&H, &L, &n, &j0, &w, &r.piv, &r.bv, &r.bi, &r.ch, &r.cl};
+        static bool fused = !getenv("OZ_ACCLEAF");   // OZ_ACCLEAF=1: the accurate sub(a, mul(m, u)) in the leaves
+        void *args[] = {&H, &L, &n, &j0, &w, &r.piv, &r.bv, &r.bi, &r.ch, &r.cl, &fused};
         static const bool prof = getenv("OZ_PROF");
         double t0 = prof ? (cudaDeviceSynchronize(), now()) : 0;
         int T = std::min(256, std::max(32, (n - j0 + 32 * r.sms - 1) / (32 * r.sms) * 32));   // a thread per row, the rows over every SM
@@ -513,6 +489,13 @@ static double solve_gpu(int n, int nb, const double *Ah, const double *Al, const
         CK(cudaMalloc(&r.ch, (size_t)r.G * 64 * 8)); CK(cudaMalloc(&r.cl, (size_t)r.G * 64 * 8));
     }
     static const bool trsm_ref = getenv("OZ_TRSM");       // OZ_TRSM=1: the column-by-column substitution instead
+    static const int sb = getenv("OZ_SB") ? atoi(getenv("OZ_SB")) : std::min(nb, 64);   // block of the triangular solves
+    if (sb > 64) { fprintf(stderr, "OZ_SB <= 64\n"); exit(1); }
+    if (n > 12288) { fprintf(stderr, "n <= 12288 (k_permidx keeps the permutation in shared memory)\n"); exit(1); }
+    int *Pm; double *Th, *Tl, *DLh, *DLl, *DUh, *DUl;
+    CK(cudaMalloc(&Pm, n * 4)); CK(cudaMalloc(&Th, n * 8)); CK(cudaMalloc(&Tl, n * 8));
+    for (double **x : {&DLh, &DLl, &DUh, &DUl}) CK(cudaMalloc(x, (size_t)n * sb * 8));
+    if (n * 4 > 48 * 1024) CK(cudaFuncSetAttribute(k_permidx, cudaFuncAttributeMaxDynamicSharedMemorySize, n * 4));
     cudaEvent_t g0, g1; cudaEventCreate(&g0); cudaEventCreate(&g1);
     CK(cudaDeviceSynchronize());
     double t0 = now();
@@ -523,6 +506,7 @@ static double solve_gpu(int n, int nb, const double *Ah, const double *Al, const
         CK(cudaMemcpyAsync(B0h, Xh, n * 8, cudaMemcpyDeviceToDevice)); CK(cudaMemcpyAsync(B0l, Xl, n * 8, cudaMemcpyDeviceToDevice));
     }
     float gms = 0;
+    std::vector<cudaEvent_t> gev;
     // OZ_PROF=1: seconds per phase, with a sync at every boundary -- only for finding where the time goes
     static const bool prof = getenv("OZ_PROF"); double ph[5] = {}, tp = now();
 #define PH(k) if (prof) { cudaDeviceSynchronize(); double t_ = now(); ph[k] += t_ - tp; tp = t_; }
@@ -537,10 +521,10 @@ static double solve_gpu(int n, int nb, const double *Ah, const double *Al, const
             double *Uh = H + (size_t)k0 * n + e, *Ul = L + (size_t)k0 * n + e;
             mm(s, kb, m, kb, Ih, Il, nb, Uh, Ul, n, Uh, Ul, n);
             PH(2);
-            cudaEventRecord(g0);
+            cudaEvent_t a_, b_; cudaEventCreate(&a_); cudaEventCreate(&b_); gev.push_back(a_); gev.push_back(b_);   // read at the end: no host stall
+            cudaEventRecord(a_);
             mm(s, m, m, kb, H + (size_t)e * n + k0, L + (size_t)e * n + k0, n, Uh, Ul, n, H + (size_t)e * n + e, L + (size_t)e * n + e, n, 1);
-            cudaEventRecord(g1); cudaEventSynchronize(g1);
-            float ms; cudaEventElapsedTime(&ms, g0, g1); gms += ms;
+            cudaEventRecord(b_);
             CK(cudaGetLastError());
             continue;
         }
@@ -577,14 +561,7 @@ static double solve_gpu(int n, int nb, const double *Ah, const double *Al, const
         CK(cudaGetLastError());
     }
     PH(0);
-    static const int sb = getenv("OZ_SB") ? atoi(getenv("OZ_SB")) : std::min(nb, 64);   // block of the triangular solves
-    const size_t dsm = (size_t)(2 * sb * (sb + 1) + 2 * sb) * 8;
-    CK(cudaFuncSetAttribute(k_diag, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dsm));
-    int *Pm; double *Th, *Tl; CK(cudaMalloc(&Pm, n * 4)); CK(cudaMalloc(&Th, n * 8)); CK(cudaMalloc(&Tl, n * 8));
     k_permidx<<<1, 1024, n * 4>>>(n, piv, Pm);
-    double *DLh, *DLl, *DUh, *DUl;
-    for (double **x : {&DLh, &DLl, &DUh, &DUl}) CK(cudaMalloc(x, (size_t)n * sb * 8));
-    if (sb > 64) { fprintf(stderr, "OZ_SB <= 64\n"); exit(1); }
     k_invdiag<<<dim3((n + sb - 1) / sb, sb), sb>>>(H, L, n, sb, false, DLh, DLl);
     k_invdiag<<<dim3((n + sb - 1) / sb, sb), sb>>>(H, L, n, sb, true, DUh, DUl);
     static double tsv[3] = {};   // OZ_PROF: gather, dot products, diagonal blocks
@@ -640,6 +617,7 @@ static double solve_gpu(int n, int nb, const double *Ah, const double *Al, const
 #endif
     CK(cudaMemcpy(xh, Xh, n * 8, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(xl, Xl, n * 8, cudaMemcpyDeviceToHost));
     double t = now() - t0;
+    for (size_t q_ = 0; q_ < gev.size(); q_ += 2) { float ms; cudaEventElapsedTime(&ms, gev[q_], gev[q_ + 1]); gms += ms; }
     tg = gms / 1e3;
     if (flat) { p.M = p.N = n - nb; oz::release(p); q.N = n - nb; oz::release(q); }
     else { mm_free(s); for (void *x : {(void *)r.bv, (void *)r.bi, (void *)r.ch, (void *)r.cl}) cudaFree(x); }
@@ -670,7 +648,7 @@ int main(int argc, char **argv) {
             T("scales B", [&] { oz::scales_dd<<<p.N, 256>>>(x[2], 1, p.N, p.K, p.bits, p.sb); });
             T("residues B", [&] { oz::residues_dd<32><<<dim3((p.K + 255) / 256, p.N), 256>>>(x[2], x[3], p.K, 1, p.N, p.sb, p.Br, p.Kp, (size_t)p.Np * p.Kp); });
             T("gemm_i8 x32", [&] { oz::gemm_i8<<<dim3(p.Np / oz::BN, p.Mp / oz::BM, 32), oz::THREADS>>>(p.Ar, p.Br, p.Cl, p.Mp, p.Np, p.Kp); });
-            T("crt_dd", [&] { oz::crt_dd<32><<<dim3((p.N + 255) / 256, p.M), 256>>>(p.Cl, (size_t)p.Mp * p.Np, p.M, p.N, p.Np, p.sa, p.sb, s.Ch, s.Cl, N); });
+            T("crt_dd", [&] { oz::crt_dd<32><<<dim3((p.N + 255) / 256, p.M), 256>>>(p.Cl, (size_t)p.Mp * p.Np, p.M, p.N, p.Np, p.sa, p.sb, s.Ch, s.Cl, N, 0); });
             {   // C[0][0..2] against a long-double sum of the inputs
                 std::vector<double> a(3), b(3), ah(p.K), al(p.K), bh((size_t)p.K * N), bl((size_t)p.K * N);
                 cudaMemcpy(a.data(), s.Ch, 24, cudaMemcpyDeviceToHost); cudaMemcpy(b.data(), s.Cl, 24, cudaMemcpyDeviceToHost);
@@ -732,7 +710,7 @@ int main(int argc, char **argv) {
     auto err_q = [&](const double *h, const double *l) { double w = 0; for (int i = 0; i < n; i++) w = fmax(w, fabs((h[i] - rh[i]) + ((l ? l[i] : 0) - rl[i]))); return w / nr; };
     printf("%-44s %9s %15s %15s\n", "solver", "seconds", "err vs x_true", "err vs quad");
 
-    static const bool skip = getenv("OZ_SKIPCPU");   // OZ_SKIPCPU=1: only the GPU solver against __float128 (large n)
+    static const bool skip = getenv("OZ_SKIPCPU") && atoi(getenv("OZ_SKIPCPU"));   // OZ_SKIPCPU=1: only the GPU solver against __float128 (large n)
     if (!skip) {
         std::vector<double> A(Ah); std::vector<int> piv(n);
         double t0 = now();

@@ -116,3 +116,37 @@ Paneli, L11⁻¹ dhe zgjidhjet si kernelë double-double; U12 dhe përditësimi 
 **82× faster than `__float128` at the same accuracy** (was 10×). Phases (`OZ_PROF=1`): INT8 GEMMs 0.22 s, panel 0.28 s
 (4 launches per column: the next target), L11⁻¹ + U12 0.04 s, blocked solve 0.03 s. `OZ_TRSM=1` / `OZ_SOLVE=1` select the
 column-by-column versions (0.42 s / 0.13 s). A one-block pivot+swap+divide kernel was slower (0.44 s) and was dropped.
+
+### Recursive panel, CRT on the integer units — 499× at n = 8192 (22-10-2026, evening)
+Same problem (κ = 10²⁰), `OZ_SKIPCPU=1 ./out_solve n 1024 20 1`; GPU times after one warm-up solve (the GPU clocks idle
+during the CPU reference). Error = max |x − x_ref| / max |x_ref|.
+
+| n | double-double LU, all on GPU | `__float128` LU, 24 threads | speedup | err vs x_true (ours / quad) |
+|---|---|---|---|---|
+| 2048 | 0.113 s | 7.65 s | 67× | 1.6e-11 / 2.4e-11 |
+| 4096 | 0.283 s | 55.6 s | ~197× | — |
+| 6144 | 0.572 s | 200.8 s | **351×** | 3.4e-10 / 2.9e-10 |
+| 8192 | 0.956 s | 476.9 s | **499×** | 2.1e-11 / 2.3e-11 |
+
+At n = 8192 the double-double answer is *closer* to x_true than the `__float128` one, 500× sooner. The 0.956 s is from the
+same run as the quad reference (after 8 minutes of all-core load); alone on a cool GPU the solve takes 0.855 s.
+Në n = 8192 përgjigjja double-double është më afër x_true se ajo `__float128`, 500 herë më shpejt.
+
+What changed / çfarë ndryshoi:
+- **CRT by direct sum** (`crt_dd`): x = Σ rₗWₗ − qM over eight 32-bit limbs on the integer units, q from 40-bit fixed-point
+  fractions, then five limbs → double-double. Garner + a double-double Horner was 41.5 of the 47 ms of a 4096² dd GEMM:
+  31 dd steps of FP64, which runs at 1/64 rate here. **dd GEMM 2.8 → 0.68 ns per output element (4.1×)**; the cost is per
+  output, nearly independent of K. Checked on the host (`bench/crt_check.cpp`, 10⁵ random 200-bit integers, 0 wrong) and
+  against a long-double sum (`OZ_MMBENCH=2`).
+- **Recursive panel**: 32-column leaves as one cooperative launch (a thread per row holding the row in registers; rows are
+  renamed instead of swapped; one grid sync per column), halves joined by dd GEMMs on the tensor cores, and L11⁻¹ assembled
+  from the halves' inverses. nb grows to 1024, so the trailing update gets 4× cheaper too.
+- **One refinement step** in double-double on the GPU (`OZ_NOREF=1` turns it off): large blocks left the LU error
+  wandering between 1e-11 and 1e-10; with the step it sits at the quad solver's level.
+- Solves: left-looking (one dot product per row instead of a dd reduction per row per block), inverted 64×64 diagonal blocks.
+- All 32 moduli in one `gemm_i8` launch; the dd GEMM reads blocks in place and subtracts into the matrix; residue planes
+  sized to the free memory, wider C done in column chunks — n = 8192 fits in 12 GB.
+
+Where the 0.855 s go at n = 8192 (`OZ_PROF=1`): panel 0.45 (leaves 0.22 — FP64-bound: ~10 GFLOPS per SM on this chip),
+trailing GEMMs 0.15, solve + refinement 0.09, U12 0.04. A kernel launch costs ~7 µs under WSL2 (`bench/launch.cu`;
+0.83 µs per node in a CUDA graph), a grid sync ~1 µs.
