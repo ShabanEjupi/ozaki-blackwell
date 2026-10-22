@@ -48,6 +48,7 @@ static inline __host__ __device__ D fms(D a, D m, D u) {
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_) { fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); exit(1); } } while (0)
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static double epoch() { return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); }   // to line up with power logs
 
 // C = A * B, all double-double on the GPU (building the matrix, and the hybrid solver's updates), in row chunks of A so that
 // n = 8192 fits: the residue planes of a whole 8192^2 C alone are 8.6 GB.
@@ -699,12 +700,17 @@ int main(int argc, char **argv) {
 
     if (getenv("OZ_PROF") || getenv("OZ_GPU")) {   // only the GPU solver, twice (the first run pays the module load); OZ_GPU=1: no phase syncs
         std::vector<double> xh(n), xl(n); double tg = 0;
-        for (int r = 0; r < 2; r++)
+        int reps = getenv("OZ_REPS") ? atoi(getenv("OZ_REPS")) : 2;   // OZ_REPS: back-to-back solves, for energy per solve
+        if (getenv("OZ_REPS")) solve_gpu(n, nb, Ah.data(), Al.data(), bh.data(), bl.data(), xh.data(), xl.data(), tg), printf("MARK gpu-start %.3f\n", epoch());
+        for (int r = 0; r < reps; r++)
             printf("all on GPU: %.3f s (INT8 GEMM %.3f s)\n", solve_gpu(n, nb, Ah.data(), Al.data(), bh.data(), bl.data(), xh.data(), xl.data(), tg), tg);
+        if (getenv("OZ_REPS")) printf("MARK gpu-end %.3f\n", epoch());
         return 0;
     }
     std::vector<double> rh(n), rl(n);
+    if (getenv("OZ_QUADONLY")) printf("MARK quad-start %.3f\n", epoch());
     double tq = quad_solve(n, Ah.data(), Al.data(), bh.data(), bl.data(), rh.data(), rl.data());
+    if (getenv("OZ_QUADONLY")) { printf("MARK quad-end %.3f\n__float128 LU: %.2f s\n", epoch(), tq); return 0; }   // for energy per solve
     double nr = 0, nt = 0; for (int i = 0; i < n; i++) { nr = fmax(nr, fabs(rh[i])); nt = fmax(nt, fabs(xt[i])); }
     auto err_t = [&](const double *h, const double *l) { double w = 0; for (int i = 0; i < n; i++) w = fmax(w, fabs((h[i] - xt[i]) + (l ? l[i] : 0))); return w / nt; };
     auto err_q = [&](const double *h, const double *l) { double w = 0; for (int i = 0; i < n; i++) w = fmax(w, fabs((h[i] - rh[i]) + ((l ? l[i] : 0) - rl[i]))); return w / nr; };

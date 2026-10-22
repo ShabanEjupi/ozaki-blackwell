@@ -150,3 +150,14 @@ What changed / çfarë ndryshoi:
 Where the 0.855 s go at n = 8192 (`OZ_PROF=1`): panel 0.45 (leaves 0.22 — FP64-bound: ~10 GFLOPS per SM on this chip),
 trailing GEMMs 0.15, solve + refinement 0.09, U12 0.04. A kernel launch costs ~7 µs under WSL2 (`bench/launch.cu`;
 0.83 µs per node in a CUDA graph), a grid sync ~1 µs.
+
+### Energy per solve / Energjia për zgjidhje (n = 4096, κ = 10²⁰, `bench/energy_solve.sh`)
+CPU package power from the Windows RAPL counters (`\Energy Meter(RAPL_Package0_PKG)\Power`, 1 s), GPU power from
+nvidia-smi (100 ms); 20 back-to-back GPU solves after a warm-up. DRAM power is not exposed on this laptop (reads 0).
+
+| | time | CPU package | GPU | energy per solve |
+|---|---|---|---|---|
+| `__float128` LU, 24 threads | 55.0 s | 106.5 W | 8.4 W (idle) | **6.3 kJ** |
+| double-double LU on the GPU | 0.238 s | 28.2 W (driving) | 68.3 W | **23 J** |
+
+**~270× less energy per solve, CPU and GPU both counted** (GPU alone vs CPU package alone: 360×). Idle: CPU 15.4 W.
