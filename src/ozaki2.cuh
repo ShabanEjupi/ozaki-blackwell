@@ -123,9 +123,7 @@ template <int NM> void dgemm_t(Plan &p, const double *A, const double *B, double
     scales<<<p.N, 256>>>(B, p.N, p.K, 1, p.N, p.bits, p.sb);   // column j of B: element k at k*N + j
     residues<NM><<<dim3((p.K + 255) / 256, p.M), 256>>>(A, p.M, p.K, p.K, 1, p.sa, p.Ar, p.Kp, (size_t)p.Mp * p.Kp);
     residues<NM><<<dim3((p.K + 255) / 256, p.N), 256>>>(B, p.N, p.K, 1, p.N, p.sb, p.Br, p.Kp, (size_t)p.Np * p.Kp);
-    for (int l = 0; l < NM; l++)
-        gemm_i8<<<dim3(p.Np / BN, p.Mp / BM), THREADS>>>(p.Ar + (size_t)l * p.Mp * p.Kp, p.Br + (size_t)l * p.Np * p.Kp,
-                                                         p.Cl + (size_t)l * p.Mp * p.Np, p.Mp, p.Np, p.Kp);
+    gemm_i8<<<dim3(p.Np / BN, p.Mp / BM, NM), THREADS>>>(p.Ar, p.Br, p.Cl, p.Mp, p.Np, p.Kp);   // all moduli in one launch
     crt<NM><<<dim3((p.N + 255) / 256, p.M), 256>>>(p.Cl, (size_t)p.Mp * p.Np, p.M, p.N, p.Np, p.sa, p.sb, C);
 }
 

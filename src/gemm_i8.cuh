@@ -29,6 +29,7 @@ __device__ __forceinline__ void load_tile(int8_t *s, const int8_t *g, int ld, in
 
 __global__ void __launch_bounds__(THREADS) gemm_i8(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt,
                                                     int32_t *__restrict__ C, int M, int N, int K) {
+    A += (size_t)blockIdx.z * M * K; Bt += (size_t)blockIdx.z * N * K; C += (size_t)blockIdx.z * M * N;   // z = modulus: one launch for all planes
     __shared__ __align__(128) int8_t sA[STAGES][BM * BK], sB[STAGES][BN * BK];   // 3 x 16 KB = the 48 KB static limit
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = (warp >> 2) * 64, wn = (warp & 3) * 32;   // this warp's corner inside the block tile
