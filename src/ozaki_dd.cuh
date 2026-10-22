@@ -34,6 +34,15 @@ __global__ void scales_dd(const double *Xh, long long sRow, long long sCol, int 
     }
 }
 
+// An int64 cut once into 16-bit chunks, so that its residue mod each m is a few 32-bit multiply-adds and one int32
+// reduction; reducing int64 pieces per modulus made the td residues cost as much as the 49 INT8 GEMMs (22-10: 57 vs 56 ms).
+struct C16 { int c3, c2, c1, c0; };   // S = c3 2^48 + c2 2^32 + c1 2^16 + c0, c3 signed, the rest in [0, 2^16); |S| < 2^56
+__device__ __forceinline__ C16 cut16(long long S) { return {(int)(S >> 48), (int)((S >> 32) & 0xffff), (int)((S >> 16) & 0xffff), (int)(S & 0xffff)}; }
+template <int m> __device__ __forceinline__ int res16(C16 c) {   // |sum| < 2^26
+    constexpr int p16 = pow2mod(16, m), p32 = pow2mod(32, m), p48 = pow2mod(48, m);
+    return balc<m>(c.c3 * p48 + c.c2 * p32 + c.c1 * p16 + c.c0);
+}
+
 template <int NM>
 __global__ void residues_dd(const double *Xh, const double *Xl, int len, long long sRow, long long sCol, const int *s,
                             int8_t *R, int ld, size_t plane) {
@@ -46,9 +55,10 @@ __global__ void residues_dd(const double *Xh, const double *Xl, int len, long lo
     // ai = u * 2^53 + w exactly (u, w in int64), then everything mod m with compile-time m.
     // fmod on a 2^107 value loops bit by bit (15-10: residues were most of the 211 ms).
     long long u = (long long)trunc(ldexp(ai, -53)), w = (long long)(ai - ldexp((double)u, 53)), bb = (long long)bi;
+    const C16 c1 = cut16(u), c0 = cut16(w + bb + (long long)f);
     each<0, NM>([&](auto L) {
         constexpr int m = modulus(decltype(L)::value), p53 = pow2mod(53, m);
-        int v = balc<m>(u) * p53 + balc<m>(w) + balc<m>(bb) + (int)f;   // |.| < 128*256 + 3*128
+        int v = res16<m>(c1) * p53 + res16<m>(c0);   // |.| < 128 * 256 + 128
         R[decltype(L)::value * plane + (size_t)r * ld + k] = (int8_t)balc<m>(v);
     });
 }

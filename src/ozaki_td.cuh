@@ -39,6 +39,7 @@ __device__ __forceinline__ void split3(double v, long long &p2, long long &p1, l
     p2 = (long long)t2; p1 = (long long)t1; p0 = (long long)r0;
 }
 
+// x 2^s = S2 2^106 + S1 2^53 + S0, the like pieces of the three parts summed (|S_k| < 2^56), each cut once by cut16.
 template <int NM>
 __global__ void residues_td(const double *Xh, const double *Xm, const double *Xl, int len, long long sRow, long long sCol,
                             const int *s, int8_t *R, int ld, size_t plane) {
@@ -50,10 +51,10 @@ __global__ void residues_td(const double *Xh, const double *Xm, const double *Xl
     double f = rint((a - ai) + (b - bi) + (c - ci));   // |f| <= 3
     long long u[9];
     split3(ai, u[0], u[1], u[2]); split3(bi, u[3], u[4], u[5]); split3(ci, u[6], u[7], u[8]);
+    const C16 c2 = cut16(u[0] + u[3] + u[6]), c1 = cut16(u[1] + u[4] + u[7]), c0 = cut16(u[2] + u[5] + u[8] + (long long)f);
     each<0, NM>([&](auto L) {
         constexpr int m = modulus(decltype(L)::value), p53 = pow2mod(53, m), p106 = pow2mod(106, m);
-        int v = (balc<m>(u[0]) + balc<m>(u[3]) + balc<m>(u[6])) * p106 + (balc<m>(u[1]) + balc<m>(u[4]) + balc<m>(u[7])) * p53 +
-                balc<m>(u[2]) + balc<m>(u[5]) + balc<m>(u[8]) + (int)f;   // |.| < 3 * 128 * 256 + 3 * 128 + 3
+        int v = res16<m>(c2) * p106 + res16<m>(c1) * p53 + res16<m>(c0);   // |.| < 128 * 256 * 2 + 128
         R[decltype(L)::value * plane + (size_t)r * ld + k] = (int8_t)balc<m>(v);
     });
 }

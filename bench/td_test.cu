@@ -97,6 +97,15 @@ int main() {
         for (int t = 0; t < 6; t++) cudaMemcpy(d[t], (t % 3 == 0 ? h : t % 3 == 1 ? m : l).data(), h.size() * 8, cudaMemcpyHostToDevice);
         oz::Plan p = oz::plan(n, n, n, 49, 160);
         oz::tdgemm_t<49>(p, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8]); cudaDeviceSynchronize();
+        if (getenv("TD_PHASES")) {   // the kernels one by one
+            cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+            auto T = [&](const char *w, auto f) { f(); cudaEventRecord(a); f(); cudaEventRecord(b); cudaEventSynchronize(b); float ms; cudaEventElapsedTime(&ms, a, b); printf("  n=%d %-14s %.2f ms\n", n, w, ms); };
+            T("scales", [&] { oz::scales_dd<<<p.M, 256>>>(d[0], p.K, 1, p.K, p.bits, p.sa); oz::scales_dd<<<p.N, 256>>>(d[3], 1, p.N, p.K, p.bits, p.sb); });
+            T("residues A+B", [&] { oz::residues_td<49><<<dim3((p.K + 255) / 256, p.M), 256>>>(d[0], d[1], d[2], p.K, p.K, 1, p.sa, p.Ar, p.Kp, (size_t)p.Mp * p.Kp);
+                                    oz::residues_td<49><<<dim3((p.K + 255) / 256, p.N), 256>>>(d[3], d[4], d[5], p.K, 1, p.N, p.sb, p.Br, p.Kp, (size_t)p.Np * p.Kp); });
+            T("gemm_i8 x49", [&] { oz::gemm_i8<<<dim3(p.Np / oz::BN, p.Mp / oz::BM, 49), oz::THREADS>>>(p.Ar, p.Br, p.Cl, p.Mp, p.Np, p.Kp); });
+            T("crt_td", [&] { oz::crt_td<49><<<dim3((p.N + 255) / 256, p.M), 256>>>(p.Cl, (size_t)p.Mp * p.Np, p.M, p.N, p.Np, p.sa, p.sb, d[6], d[7], d[8], p.N, 0); });
+        }
         cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b); cudaEventRecord(a);
         for (int r = 0; r < 3; r++) oz::tdgemm_t<49>(p, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8]);
         cudaEventRecord(b); cudaEventSynchronize(b); float ms; cudaEventElapsedTime(&ms, a, b); ms /= 3;
