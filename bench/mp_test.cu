@@ -1,6 +1,6 @@
 // mp_test.cu -- arbitrary-precision GEMM from INT8 (Q doubles per number): error against an exact MPFR sum in units of
 // 2^-(53 Q), speed, and MPFR GEMM at the same precision on all CPU cores.
-// nvcc -O3 -arch=sm_120 -std=c++17 -Xcompiler -fopenmp,-march=native -o out_mp bench/mp_test.cu -lmpfr -lgmp -lgomp
+// nvcc -O3 -arch=sm_120 -std=c++17 -Xcompiler -fopenmp,-march=native -o out_mp bench/mp_test.cu -lqd -lmpfr -lgmp -lgomp
 #include <chrono>
 #include <cstdio>
 #include <random>
@@ -8,6 +8,7 @@
 #include <mpfr.h>
 #include <omp.h>
 #include "../src/ozaki_mp.cuh"
+#include <qd/qd_real.h>
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 template <int Q> static void fill(std::vector<double> *x, size_t n, int spread, std::mt19937_64 &g) {
@@ -69,6 +70,20 @@ template <int Q> static void run(std::mt19937_64 &g) {
         printf("  GPU n = %d: %.1f ms, %.3f TFLOPS of %d-bit arithmetic\n", n, ms, 2.0 * n * n * n / ms / 1e9, 53 * Q);
         oz::mp_release(pl);
         for (int t = 0; t < 3; t++) for (int q = 0; q < Q; q++) cudaFree(d[t].p[q]);
+    }
+    if (Q == 4) {   // the QD library (Hida, Li, Bailey): qd_real, the classic CPU 212-bit arithmetic, every core, n = 256 measured
+        int n = 256; std::vector<double> h[Q]; for (int q = 0; q < Q; q++) h[q].resize(n * n);
+        fill<Q>(h, n * n, 0, g);
+        std::vector<qd_real> X(n * n), Y(n * n);
+        for (int i = 0; i < n * n; i++) X[i] = qd_real(h[0][i], h[1][i], h[2][i], h[3][i]);
+        unsigned int cw; fpu_fix_start(&cw);
+        double t0 = now();
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) { qd_real s = 0.0; for (int k = 0; k < n; k++) s += X[i * n + k] * X[k * n + j]; Y[i * n + j] = s; }
+        double t = now() - t0;
+        fpu_fix_end(&cw);
+        printf("  QD qd_real GEMM, %d threads: %.5f TFLOPS (n = 2048 would take ~%.1f s)\n", omp_get_max_threads(), 2.0 * n * n * n / t / 1e12, t * 512);
     }
     {   // MPFR GEMM at 53 Q bits, every core, n = 256 measured
         int n = 256; std::vector<double> h[Q]; for (int q = 0; q < Q; q++) h[q].resize(n * n);

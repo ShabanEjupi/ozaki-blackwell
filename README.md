@@ -203,3 +203,20 @@ blocks, one refinement step. Competitors on the same laptop, CPU otherwise idle 
 (error = max |x − x_true| / max |x_true|; speedups of the GPU in parentheses.) The GPU answer is also the most accurate.
 Honest note: at n ≤ 1024 a well-vectorized triple-double LU on 24 cores keeps up; the gap opens with n, as the GPU's
 work moves into the tensor-core GEMMs. Phases at n = 4096: panels 0.38 s (leaves 0.14), U12 + trailing 0.08, solves 0.08.
+
+## Beyond triple-double: arbitrary precision from INT8 (22-10-2026, `src/ozaki_mp.cuh`, `bench/mp_test.cu`)
+The 49 moduli are every pairwise-coprime 8-bit set there is (all primes < 256 are used), so ~2³⁴² caps one Ozaki-II GEMM
+at ~160-bit inputs. Beyond: balanced 160-bit slices, one 49-modulus GEMM per slice pair that reaches the result, exact
+wide-integer accumulation, Q doubles peeled. Errors vs an exact 2400-bit MPFR sum (K = 256): 212 bits 0.13 ulp,
+318 bits 0.25, 424 bits 0.08. Speed, CPU idle (campaign stopped), CPU numbers measured at n = 256/512 and scaled by n³:
+
+| precision | GPU (INT8 tensor cores) | best CPU library, 24 threads | MPFR, 24 threads |
+|---|---|---|---|
+| 159 bits (td), n = 4096 | **87 ms, 1.58 TFLOPS** | triple-double AVX ~10.7 s (**123×**) | ~208 s (**2 390×**) |
+| 212 bits (Q = 4), n = 2048 | **36 ms, 0.47 TFLOPS** | QD `qd_real` ~16.2 s (**445×**) | ~35 s (**960×**) |
+| 318 bits (Q = 6), n = 2048 | **52 ms, 0.33 TFLOPS** | — | ~37 s (**713×**) |
+| 424 bits (Q = 8), n = 2048 | **80 ms, 0.22 TFLOPS** | — | ~41 s (**514×**) |
+
+Residues cut once into 16-bit chunks (32-bit multiply-adds per modulus): td residues 57 → 19 ms at n = 4096.
+Honest limits: the INT8 GEMMs are power-bound on this laptop (~95 W); cost grows ~p² with precision, as MPFR's does at
+these sizes, so the ratio to MPFR does not grow without bound — it is largest against software emulation of each width.
