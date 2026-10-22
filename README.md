@@ -187,3 +187,19 @@ scaled by n³):
 | MPFR at 160 bits, `mpfr_fma`, 24 threads | ~230 s | 0.0006 | **~2 000×** |
 
 Triple-double GEMM runs at 2.7× this GPU's own plain-FP64 peak (0.449 TFLOPS) while carrying three times the bits.
+
+### A real job for triple-double: Ax = b at κ = 10³⁶ (22-10-2026, `bench/solve_td.cu`)
+κ·u is 10²⁰ for FP64 and 10⁴ for double-double: neither has a correct digit. A = Q₁ diag(σ) Q₂ built with MPFR (σ down to
+10⁻³⁶) and the product on the GPU as a triple-double GEMM; b = A x_true summed exactly. The GPU solver is solve.cu's
+structure in three parts: recursive panel with 16-column cooperative leaves, td GEMMs in place, inverted diagonal
+blocks, one refinement step. Competitors on the same laptop, CPU otherwise idle (the campaign stopped):
+
+| n | **td LU, all on GPU** | td LU on 24 CPU threads (AVX, same arithmetic) | MPFR LU, 160 bits, 24 threads | FP64 LU |
+|---|---|---|---|---|
+| 1024 | **0.082 s**, 1.3e-14 | 0.10 s, 3.6e-14 (1.2×) | 1.32 s, 3.3e-14 (16×) | 128 |
+| 2048 | **0.212 s**, 2.1e-14 | 1.04 s, 7.6e-14 (5×) | 10.2 s, 5.6e-14 (48×) | 103 |
+| 4096 | **0.563 s**, 2.2e-14 | 18.0 s, 1.2e-13 (**32×**) | 81.9 s, 9.6e-14 (**145×**) | 86 |
+
+(error = max |x − x_true| / max |x_true|; speedups of the GPU in parentheses.) The GPU answer is also the most accurate.
+Honest note: at n ≤ 1024 a well-vectorized triple-double LU on 24 cores keeps up; the gap opens with n, as the GPU's
+work moves into the tensor-core GEMMs. Phases at n = 4096: panels 0.38 s (leaves 0.14), U12 + trailing 0.08, solves 0.08.

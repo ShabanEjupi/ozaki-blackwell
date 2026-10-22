@@ -469,6 +469,36 @@ int main(int argc, char **argv) {
         std::vector<double> z[3] = {y, std::vector<double>(n, 0), std::vector<double>(n, 0)};
         printf("%-46s %9.2f %15.3g\n", "FP64 LU (CPU)", now() - t0, err(z));
     }
+    if (!getenv("OZ_NOCPUTD")) {   // triple-double LU on the CPU (the same arithmetic as the GPU kernels), rows in parallel, SIMD over columns
+        std::vector<double> F[3] = {A[0], A[1], A[2]}, y[3] = {b[0], b[1], b[2]}; std::vector<int> pv(n);
+        double t0 = now();
+        for (int j = 0; j < n; j++) {
+            int p = j; for (int i = j + 1; i < n; i++) if (fabs(F[0][(size_t)i * n + j]) > fabs(F[0][(size_t)p * n + j])) p = i;
+            pv[j] = p;
+            if (p != j) for (int c = 0; c < 3; c++) std::swap_ranges(F[c].begin() + (size_t)j * n, F[c].begin() + (size_t)j * n + n, F[c].begin() + (size_t)p * n);
+            T d{F[0][(size_t)j * n + j], F[1][(size_t)j * n + j], F[2][(size_t)j * n + j]};
+            const double *ux = &F[0][(size_t)j * n], *uy = &F[1][(size_t)j * n], *uz = &F[2][(size_t)j * n];
+#pragma omp parallel for schedule(static)
+            for (int i = j + 1; i < n; i++) {
+                double *rx = &F[0][(size_t)i * n], *ry = &F[1][(size_t)i * n], *rz = &F[2][(size_t)i * n];
+                T l = tdiv({rx[j], ry[j], rz[j]}, d);
+                rx[j] = l.x; ry[j] = l.y; rz[j] = l.z;
+#pragma omp simd
+                for (int c = j + 1; c < n; c++) { T v = tsub({rx[c], ry[c], rz[c]}, tmul(l, {ux[c], uy[c], uz[c]})); rx[c] = v.x; ry[c] = v.y; rz[c] = v.z; }
+            }
+        }
+        auto at = [&](int i, int k) { size_t q = (size_t)i * n + k; return T{F[0][q], F[1][q], F[2][q]}; };
+        std::vector<T> z(n); for (int i = 0; i < n; i++) z[i] = {y[0][i], y[1][i], y[2][i]};
+        for (int j = 0; j < n; j++) std::swap(z[j], z[pv[j]]);
+        for (int i = 0; i < n; i++) for (int k = 0; k < i; k++) z[i] = tsub(z[i], tmul(at(i, k), z[k]));
+        for (int i = n - 1; i >= 0; i--) { for (int k = i + 1; k < n; k++) z[i] = tsub(z[i], tmul(at(i, k), z[k])); z[i] = tdiv(z[i], at(i, i)); }
+        double tc = now() - t0;
+        std::vector<double> zz[3]; for (int c = 0; c < 3; c++) zz[c].resize(n);
+        for (int i = 0; i < n; i++) { zz[0][i] = z[i].x; zz[1][i] = z[i].y; zz[2][i] = z[i].z; }
+        char lab[64]; snprintf(lab, sizeof lab, "triple-double LU on the CPU, %d threads", thr);
+        printf("%-46s %9.2f %15.3g\n", lab, tc, err(zz));
+        printf("%-46s %9.0fx\n", "  speedup of the GPU", tc / tg);
+    }
     if (getenv("OZ_NOMPFR")) return 0;
     {   // MPFR LU with partial pivoting at 160 bits, rows in parallel
         int prec = getenv("OZ_PREC") ? atoi(getenv("OZ_PREC")) : 160;
