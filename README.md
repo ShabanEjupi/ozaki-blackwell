@@ -100,3 +100,19 @@ LU-ja double-double me blloqe: panelet te CPU-ja, përditësimet e mbetura (2/3 
 - n = 2048: 0.34 s vs 5.98 s for `__float128` (17.6×), 2.2·10⁻¹⁰. At κ = 10²⁴ both reach ~4–7·10⁻⁷ (κ·u_dd).
 - Error vs x_true is floored by rounding b to double-double (κ·2⁻¹⁰⁶), for the quad solve too.
 - The CPU part (panels, U₁₂, A₂₂ −= P on the host) is now 3.9 of 5.0 s → next: keep A on the GPU, subtract there.
+
+### All on the GPU — Gjithçka te GPU-ja (22-10-2026)
+n = 4096, κ = 10²⁰, nb = 256. Panel, L11⁻¹, solves as double-double kernels on the FP64 units; U12 = L11⁻¹A12 and the
+trailing update as double-double GEMMs on the INT8 tensor cores. Only A, b in and x out cross PCIe.
+Paneli, L11⁻¹ dhe zgjidhjet si kernelë double-double; U12 dhe përditësimi si GEMM double-double te tensor core-t INT8.
+
+| solver | s | err vs x_true | err vs `__float128` |
+|---|---|---|---|
+| FP64 LU (CPU) | 2.95 | 193 | 193 |
+| double-double LU, hybrid (panels on the CPU) | 7.41 | 9.5e-11 | 2.1e-11 |
+| **double-double LU, all on GPU** | **0.68** | 1.1e-10 | 2.5e-11 |
+| `__float128` LU, 24 CPU threads | 55.6 | 8.4e-11 | 0 |
+
+**82× faster than `__float128` at the same accuracy** (was 10×). Phases (`OZ_PROF=1`): INT8 GEMMs 0.22 s, panel 0.28 s
+(4 launches per column: the next target), L11⁻¹ + U12 0.04 s, blocked solve 0.03 s. `OZ_TRSM=1` / `OZ_SOLVE=1` select the
+column-by-column versions (0.42 s / 0.13 s). A one-block pivot+swap+divide kernel was slower (0.44 s) and was dropped.

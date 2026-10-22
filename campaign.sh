@@ -6,7 +6,7 @@ set -u
 O=/opt/ozaki/campaign; mkdir -p $O; cd /opt/ozaki/src
 export PATH=/usr/local/cuda-12.8/bin:$PATH
 g++ -O3 -fopenmp -c bench/solve_ref.cpp -o out_ref.o &&
-  nvcc -O3 -arch=sm_120 -std=c++17 -Xcompiler -fopenmp,-ffp-contract=off -o out_solve bench/solve.cu out_ref.o -lquadmath -lgomp || exit 1
+  nvcc -O3 -arch=sm_120 -std=c++17 --fmad=false -Xcompiler -fopenmp,-ffp-contract=off -o out_solve bench/solve.cu out_ref.o -lquadmath -lgomp || exit 1
 SMI=$(command -v nvidia-smi || echo /usr/lib/wsl/lib/nvidia-smi)
 $SMI --query-gpu=timestamp,power.draw,clocks.sm,temperature.gpu,utilization.gpu --format=csv,noheader -lms 200 >> $O/power.csv 2>&1 &
 trap 'kill $! 2>/dev/null' EXIT
