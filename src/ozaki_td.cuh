@@ -87,7 +87,7 @@ __device__ __forceinline__ void sub_at(U256 &x, unsigned long long d, int sh) { 
 
 template <int NM>
 __global__ void crt_td(const int32_t *Cl, size_t plane, int M, int N, int ldc, const int *sa, const int *sb,
-                       double *Ch, double *Cm, double *Cl_, int ldo) {
+                       double *Ch, double *Cm, double *Cl_, int ldo, int mode) {   // mode 0: C = AB, 1: C -= AB, 2: C = -AB
     int j = blockIdx.x * blockDim.x + threadIdx.x, i = blockIdx.y;
     if (j >= N) return;
     unsigned long long acc[TDL] = {}; long long qf = 0;
@@ -113,7 +113,7 @@ __global__ void crt_td(const int32_t *Cl, size_t plane, int M, int N, int ldc, c
 #pragma unroll
     for (int k = 0; k < TDL; k++) if (v[k]) top = k;
     size_t o = (size_t)i * ldo + j;
-    if (top < 0) { Ch[o] = 0; Cm[o] = 0; Cl_[o] = 0; return; }
+    if (top < 0) { if (mode != 1) { Ch[o] = 0; Cm[o] = 0; Cl_[o] = 0; } return; }
     unsigned w[8] = {};   // limbs top..top-7 as a 256-bit frame whose lowest bit is 2^(32 (top - 7))
 #pragma unroll
     for (int k = 0; k < TDL; k++)
@@ -136,19 +136,32 @@ __global__ void crt_td(const int32_t *Cl, size_t plane, int M, int N, int ldc, c
     }
     dd a = quick_two_sum(out[0], out[1]), b = quick_two_sum(a.lo, out[2]);   // rd pieces -> canonical: |mid| <= ulp(hi)/2
     a = quick_two_sum(a.hi, b.hi);
-    Ch[o] = neg ? -a.hi : a.hi; Cm[o] = neg ? -a.lo : a.lo; Cl_[o] = neg ? -b.lo : b.lo;
+    double r0 = a.hi, r1 = a.lo, r2 = b.lo;
+    if (neg != (mode != 0)) { r0 = -r0; r1 = -r1; r2 = -r2; }
+    if (mode == 1) {   // C + (-AB) in triple-double: exact sums of the parts, then renormalized
+        dd s0 = two_sum(Ch[o], r0), s1 = two_sum(Cm[o], r1);
+        double s2 = Cl_[o] + r2 + s1.lo;
+        dd t = two_sum(s1.hi, s0.lo);
+        s2 += t.lo;
+        dd u = quick_two_sum(s0.hi, t.hi), w = quick_two_sum(u.lo, s2);
+        u = quick_two_sum(u.hi, w.hi);
+        r0 = u.hi; r1 = u.lo; r2 = w.lo;
+    }
+    Ch[o] = r0; Cm[o] = r1; Cl_[o] = r2;
 }
 
-// A = Ah + Am + Al (M x K row-major), B likewise (K x N), C = Ch + Cm + Cl (M x N); p from plan(..., nm <= 49, 160)
+// A = Ah + Am + Al (M x K row-major), B likewise (K x N), C = Ch + Cm + Cl (M x N); p from plan(..., nm <= 49, 160).
+// Leading dimensions lda, ldb, ldo (0: K, N, N) for blocks of larger matrices; mode as in crt_td.
 template <int NM> void tdgemm_t(Plan &p, const double *Ah, const double *Am, const double *Al, const double *Bh, const double *Bm,
-                                const double *Bl, double *Ch, double *Cm, double *Cl) {
+                                const double *Bl, double *Ch, double *Cm, double *Cl, int ldo = 0, int lda = 0, int ldb = 0, int mode = 0) {
     crt_consts_td(p.nm);
-    scales_dd<<<p.M, 256>>>(Ah, p.K, 1, p.K, p.bits, p.sa);
-    scales_dd<<<p.N, 256>>>(Bh, 1, p.N, p.K, p.bits, p.sb);
-    residues_td<NM><<<dim3((p.K + 255) / 256, p.M), 256>>>(Ah, Am, Al, p.K, p.K, 1, p.sa, p.Ar, p.Kp, (size_t)p.Mp * p.Kp);
-    residues_td<NM><<<dim3((p.K + 255) / 256, p.N), 256>>>(Bh, Bm, Bl, p.K, 1, p.N, p.sb, p.Br, p.Kp, (size_t)p.Np * p.Kp);
+    lda = lda ? lda : p.K; ldb = ldb ? ldb : p.N; ldo = ldo ? ldo : p.N;
+    scales_dd<<<p.M, 256>>>(Ah, lda, 1, p.K, p.bits, p.sa);
+    scales_dd<<<p.N, 256>>>(Bh, 1, ldb, p.K, p.bits, p.sb);
+    residues_td<NM><<<dim3((p.K + 255) / 256, p.M), 256>>>(Ah, Am, Al, p.K, lda, 1, p.sa, p.Ar, p.Kp, (size_t)p.Mp * p.Kp);
+    residues_td<NM><<<dim3((p.K + 255) / 256, p.N), 256>>>(Bh, Bm, Bl, p.K, 1, ldb, p.sb, p.Br, p.Kp, (size_t)p.Np * p.Kp);
     gemm_i8<<<dim3(p.Np / BN, p.Mp / BM, NM), THREADS>>>(p.Ar, p.Br, p.Cl, p.Mp, p.Np, p.Kp);
-    crt_td<NM><<<dim3((p.N + 255) / 256, p.M), 256>>>(p.Cl, (size_t)p.Mp * p.Np, p.M, p.N, p.Np, p.sa, p.sb, Ch, Cm, Cl, p.N);
+    crt_td<NM><<<dim3((p.N + 255) / 256, p.M), 256>>>(p.Cl, (size_t)p.Mp * p.Np, p.M, p.N, p.Np, p.sa, p.sb, Ch, Cm, Cl, ldo, mode);
 }
 
 }  // namespace oz
