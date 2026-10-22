@@ -787,5 +787,37 @@ int main(int argc, char **argv) {
         printf("%-44s %9.3f %15.3g %15.3g\n", lab, tdd, err_t(xh.data(), xl.data()), err_q(xh.data(), xl.data()));
         printf("%-44s %9.0fx\n", "  speedup vs __float128 LU", tq / tdd);
     }
+    if (!getenv("OZ_NOCPUDD")) {   // double-double LU on the CPU with the same arithmetic, rows in parallel, SIMD over columns:
+        // the strong software baseline (__float128 is emulated and far slower)
+        std::vector<double> H(Ah), L(Al), yh(bh), yl(bl); std::vector<int> pv(n);
+        double t0 = now();
+        for (int j = 0; j < n; j++) {
+            int p = j; for (int i = j + 1; i < n; i++) if (fabs(H[(size_t)i * n + j]) > fabs(H[(size_t)p * n + j])) p = i;
+            pv[j] = p;
+            if (p != j) { std::swap_ranges(H.begin() + (size_t)j * n, H.begin() + (size_t)j * n + n, H.begin() + (size_t)p * n);
+                          std::swap_ranges(L.begin() + (size_t)j * n, L.begin() + (size_t)j * n + n, L.begin() + (size_t)p * n); }
+            D d{H[(size_t)j * n + j], L[(size_t)j * n + j]};
+            const double *uh = &H[(size_t)j * n], *ul = &L[(size_t)j * n];
+#pragma omp parallel for schedule(static)
+            for (int i = j + 1; i < n; i++) {
+                double *rh_ = &H[(size_t)i * n], *rl_ = &L[(size_t)i * n];
+                D l = dvd({rh_[j], rl_[j]}, d);
+                rh_[j] = l.hi; rl_[j] = l.lo;
+#pragma omp simd
+                for (int c = j + 1; c < n; c++) { D v = sub({rh_[c], rl_[c]}, mul(l, {uh[c], ul[c]})); rh_[c] = v.hi; rl_[c] = v.lo; }
+            }
+        }
+        std::vector<D> z(n); for (int i = 0; i < n; i++) z[i] = {yh[i], yl[i]};
+        for (int j = 0; j < n; j++) std::swap(z[j], z[pv[j]]);
+        for (int i = 0; i < n; i++) for (int k = 0; k < i; k++) z[i] = sub(z[i], mul({H[(size_t)i * n + k], L[(size_t)i * n + k]}, z[k]));
+        for (int i = n - 1; i >= 0; i--) {
+            for (int k = i + 1; k < n; k++) z[i] = sub(z[i], mul({H[(size_t)i * n + k], L[(size_t)i * n + k]}, z[k]));
+            z[i] = dvd(z[i], {H[(size_t)i * n + i], L[(size_t)i * n + i]});
+        }
+        double tc = now() - t0;
+        std::vector<double> zh(n), zl(n); for (int i = 0; i < n; i++) { zh[i] = z[i].hi; zl[i] = z[i].lo; }
+        char lab[64]; snprintf(lab, sizeof lab, "double-double LU, CPU, %d threads (AVX)", thr);
+        printf("%-44s %9.2f %15.3g %15.3g\n", lab, tc, err_t(zh.data(), zl.data()), err_q(zh.data(), zl.data()));
+    }
     printf("%-44s %9.2f %15.3g %15s\n", "__float128 LU (CPU, reference)", tq, err_t(rh.data(), rl.data()), "0");
 }
