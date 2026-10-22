@@ -81,7 +81,8 @@ inline void crt_consts(int nm) {
 }
 
 template <int NM>
-__global__ void crt_dd(const int32_t *Cl, size_t plane, int M, int N, int ldc, const int *sa, const int *sb, double *Ch, double *Cl_, int ldo) {
+__global__ void crt_dd(const int32_t *Cl, size_t plane, int M, int N, int ldc, const int *sa, const int *sb, double *Ch, double *Cl_, int ldo,
+                       int mode) {   // mode 0: C = AB, 1: C -= AB, 2: C = -AB
     int j = blockIdx.x * blockDim.x + threadIdx.x, i = blockIdx.y;
     if (j >= N) return;
     unsigned long long acc[8] = {}; long long qf = 0;
@@ -107,7 +108,7 @@ __global__ void crt_dd(const int32_t *Cl, size_t plane, int M, int N, int ldc, c
 #pragma unroll
     for (int k = 0; k < 8; k++) if (v[k]) top = k;
     size_t o = (size_t)i * ldo + j;
-    if (top < 0) { Ch[o] = 0; Cl_[o] = 0; return; }
+    if (top < 0) { if (mode != 1) { Ch[o] = 0; Cl_[o] = 0; } return; }
     unsigned t4 = 0, t3 = 0, t2 = 0, t1 = 0, t0 = 0;   // limbs top..top-4, by compile-time index only
 #pragma unroll
     for (int k = 0; k < 8; k++)
@@ -119,19 +120,28 @@ __global__ void crt_dd(const int32_t *Cl, size_t plane, int M, int N, int ldc, c
     double lo = fma((double)(H - (unsigned long long)dh), 18446744073709551616.0, (double)Lw);
     int e = 32 * (top - 3) - z - (sa[i] + sb[j]);
     dd y = quick_two_sum(ldexp(dh, e + 64), ldexp(lo, e));
-    Ch[o] = neg ? -y.hi : y.hi; Cl_[o] = neg ? -y.lo : y.lo;
+    if (neg != (mode != 0)) y = {-y.hi, -y.lo};
+    if (mode == 1) {   // C + (-AB), accurate double-double addition
+        dd s = two_sum(Ch[o], y.hi), t = two_sum(Cl_[o], y.lo);
+        s = quick_two_sum(s.hi, s.lo + t.hi);
+        y = quick_two_sum(s.hi, s.lo + t.lo);
+    }
+    Ch[o] = y.hi; Cl_[o] = y.lo;
 }
 
 
-// A = Ah + Al (M x K row-major), B = Bh + Bl (K x N row-major), C = Ch + Cl (M x N); p from plan(..., nm, 106); C has leading dimension ldo (0: N)
-template <int NM> void ddgemm_t(Plan &p, const double *Ah, const double *Al, const double *Bh, const double *Bl, double *Ch, double *Cl, int ldo = 0) {
+// A = Ah + Al (M x K row-major), B = Bh + Bl (K x N row-major), C = Ch + Cl (M x N); p from plan(..., nm, 106).
+// Leading dimensions lda, ldb, ldo (0: K, N, N) let A, B and C be blocks of larger matrices; mode as in crt_dd.
+template <int NM> void ddgemm_t(Plan &p, const double *Ah, const double *Al, const double *Bh, const double *Bl, double *Ch, double *Cl,
+                                int ldo = 0, int lda = 0, int ldb = 0, int mode = 0) {
     crt_consts(p.nm);
-    scales_dd<<<p.M, 256>>>(Ah, p.K, 1, p.K, p.bits, p.sa);
-    scales_dd<<<p.N, 256>>>(Bh, 1, p.N, p.K, p.bits, p.sb);
-    residues_dd<NM><<<dim3((p.K + 255) / 256, p.M), 256>>>(Ah, Al, p.K, p.K, 1, p.sa, p.Ar, p.Kp, (size_t)p.Mp * p.Kp);
-    residues_dd<NM><<<dim3((p.K + 255) / 256, p.N), 256>>>(Bh, Bl, p.K, 1, p.N, p.sb, p.Br, p.Kp, (size_t)p.Np * p.Kp);
+    lda = lda ? lda : p.K; ldb = ldb ? ldb : p.N;
+    scales_dd<<<p.M, 256>>>(Ah, lda, 1, p.K, p.bits, p.sa);
+    scales_dd<<<p.N, 256>>>(Bh, 1, ldb, p.K, p.bits, p.sb);
+    residues_dd<NM><<<dim3((p.K + 255) / 256, p.M), 256>>>(Ah, Al, p.K, lda, 1, p.sa, p.Ar, p.Kp, (size_t)p.Mp * p.Kp);
+    residues_dd<NM><<<dim3((p.K + 255) / 256, p.N), 256>>>(Bh, Bl, p.K, 1, ldb, p.sb, p.Br, p.Kp, (size_t)p.Np * p.Kp);
     gemm_i8<<<dim3(p.Np / BN, p.Mp / BM, NM), THREADS>>>(p.Ar, p.Br, p.Cl, p.Mp, p.Np, p.Kp);   // all moduli in one launch
-    crt_dd<NM><<<dim3((p.N + 255) / 256, p.M), 256>>>(p.Cl, (size_t)p.Mp * p.Np, p.M, p.N, p.Np, p.sa, p.sb, Ch, Cl, ldo ? ldo : p.N);
+    crt_dd<NM><<<dim3((p.N + 255) / 256, p.M), 256>>>(p.Cl, (size_t)p.Mp * p.Np, p.M, p.N, p.Np, p.sa, p.sb, Ch, Cl, ldo ? ldo : p.N, mode);
 }
 
 }  // namespace oz
