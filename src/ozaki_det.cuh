@@ -29,11 +29,13 @@ __device__ uint32_t powm(uint32_t a, uint32_t e, uint32_t p) {
     return r;
 }
 
-// R[z] = A mod p_z, residues in [0, p)
-__global__ void det_init(const int8_t *__restrict__ A, int32_t *__restrict__ R, size_t nn, const uint32_t *__restrict__ P) {
+// R[z] = [A I] mod p_z (n x ld, the identity only when ld = 2n), residues in [0, p)
+__global__ void det_init(const int8_t *__restrict__ A, int32_t *__restrict__ R, int n, int ld, const uint32_t *__restrict__ P) {
     const int p = P[blockIdx.y];
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < nn; i += (size_t)gridDim.x * blockDim.x) {
-        int a = A[i] % p; R[blockIdx.y * nn + i] = a < 0 ? a + p : a;
+    R += (size_t)blockIdx.y * n * ld;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < (size_t)n * ld; i += (size_t)gridDim.x * blockDim.x) {
+        int r = i / ld, c = i % ld, a = c < n ? A[(size_t)r * n + c] % p : c - n == r;
+        R[i] = a < 0 ? a + p : a;
     }
 }
 
@@ -101,13 +103,13 @@ __global__ void __launch_bounds__(THREADS) modgemm(const int8_t *__restrict__ Ap
 }
 
 // The 64 x 64 diagonal block at (j, j): LU without pivoting in shared memory, pivots into det[z], then L^-1 (unit lower)
-// and U^-1 to Linv / Uinv (64 x 64 each, per prime). A zero pivot marks the prime bad.
+// and U^-1 to Linv / Uinv (64 x 64 each, zl apart per prime). A zero pivot marks the prime bad.
 __global__ void __launch_bounds__(256) diag_inv(const int32_t *__restrict__ R, size_t zr, int ld, int32_t *__restrict__ Linv, size_t zl,
                                                 int32_t *__restrict__ Uinv, uint32_t *det, int *bad, const uint32_t *__restrict__ P) {
     __shared__ uint32_t S[DB][DB + 1], inv[DB];
     const int z = blockIdx.x, tid = threadIdx.x;
     const uint32_t p = P[z];
-    R += z * zr; Linv += z * zl; Uinv += (size_t)z * DB * DB;
+    R += z * zr; Linv += z * zl; Uinv += z * zl;
     for (int i = tid; i < DB * DB; i += 256) S[i / DB][i % DB] = R[(size_t)(i / DB) * ld + i % DB];
     __syncthreads();
     for (int t = 0; t < DB; t++) {
@@ -144,21 +146,22 @@ __global__ void __launch_bounds__(256) diag_inv(const int32_t *__restrict__ R, s
     }
 }
 
-// Workspace for one batch of Pb primes, n x n
+// Workspace for one batch of Pb primes: R is n x ld per prime (ld = n for the determinant, 2n for [A I] -> A^-1)
 struct DetWork {
-    int n, Pb;
-    int32_t *R, *Linv, *Uinv;   // R: Pb n^2; Linv: Pb (n/64) 64^2, one per diagonal block; Uinv: Pb 64^2
+    int n, ld, Pb;
+    int32_t *R, *Linv, *Uinv;   // R: Pb n ld; Linv, Uinv: Pb (n/64) 64^2, one per diagonal block
     int8_t *Ap, *B1, *B2;
     uint32_t *P, *det; int *bad;
-    void alloc(int n_, int Pb_) {
-        n = n_; Pb = Pb_;
-        size_t pk = (size_t)Pb * (n + BM) * std::max(n, 2 * DB);   // M or N padded, times 2K with K <= n/2
-        cudaMalloc(&R, (size_t)Pb * n * n * 4); cudaMalloc(&Linv, (size_t)Pb * n * DB * 4);
-        cudaMalloc(&Uinv, (size_t)Pb * DB * DB * 4);
+    void alloc(int n_, int Pb_, int ld_ = 0) {
+        n = n_; ld = ld_ ? ld_ : n_; Pb = Pb_;
+        size_t pk = (size_t)Pb * (ld + BM) * std::max(n, 2 * DB);   // M or N padded, times 2K with K <= n/2
+        cudaMalloc(&R, (size_t)Pb * n * ld * 4); cudaMalloc(&Linv, (size_t)Pb * n * DB * 4); cudaMalloc(&Uinv, (size_t)Pb * n * DB * 4);
         cudaMalloc(&Ap, pk); cudaMalloc(&B1, pk); cudaMalloc(&B2, pk);
         cudaMalloc(&P, Pb * 4); cudaMalloc(&det, Pb * 4); cudaMalloc(&bad, Pb * 4);
     }
     void free_() { cudaFree(R); cudaFree(Linv); cudaFree(Uinv); cudaFree(Ap); cudaFree(B1); cudaFree(B2); cudaFree(P); cudaFree(det); cudaFree(bad); }
+    int32_t *at(int r, int c) const { return R + (size_t)r * ld + c; }
+    size_t zr() const { return (size_t)n * ld; }
 };
 
 inline int rup(int x, int m) { return (x + m - 1) / m * m; }
@@ -181,45 +184,103 @@ inline void mod_xw(DetWork &w, const int32_t *X, size_t zx, int ldx, const int32
     pack_a<<<dim3(std::min(2048, Mpad * K / 1024 + 1), w.Pb), 256>>>(X, zx, ldx, M, K, Mpad, w.Ap, w.P);
     pack_b<<<dim3(Npad / 64, K / 64, w.Pb), 256>>>(W, zw, ldw, K, N, Npad, w.B1, w.B2, w.P);
     det_prof.end(1); det_prof.begin();
-    modgemm<SUB><<<dim3(Npad / BN, Mpad / BM, w.Pb), THREADS>>>(w.Ap, w.B1, w.B2, w.R + (size_t)r * w.n + c, (size_t)w.n * w.n,
-                                                                  w.n, M, N, 2 * K, Mpad, Npad, w.P);
+    modgemm<SUB><<<dim3(Npad / BN, Mpad / BM, w.Pb), THREADS>>>(w.Ap, w.B1, w.B2, w.at(r, c), w.zr(), w.ld, M, N, 2 * K, Mpad,
+                                                                  Npad, w.P);
     det_prof.end(2);
+}
+// the same with both factors inside R
+template <bool SUB>
+inline void mod_rr(DetWork &w, int xr, int xc, int wr, int wc, int M, int N, int K, int r, int c) {
+    mod_xw<SUB>(w, w.at(xr, xc), w.zr(), w.ld, w.at(wr, wc), w.zr(), w.ld, M, N, K, r, c);
 }
 
 inline int half(int wd) { return wd / (2 * DB) * DB; }   // the left part of a split, a multiple of 64
 
 // rows [j, j + h) of columns [c, c + N) := L^-1 (them), L the unit lower triangle of the diagonal block at j
 inline void det_trsm(DetWork &w, int j, int h, int c, int N) {
-    const int n = w.n; const size_t nn = (size_t)n * n, zl = (size_t)n * DB;
-    if (h == DB) { mod_xw<false>(w, w.Linv + (size_t)j * DB, zl, DB, w.R + (size_t)j * n + c, nn, n, DB, N, DB, j, c); return; }
+    if (h == DB) { mod_xw<false>(w, w.Linv + (size_t)j * DB, (size_t)w.n * DB, DB, w.at(j, c), w.zr(), w.ld, DB, N, DB, j, c); return; }
     const int h1 = half(h);
     det_trsm(w, j, h1, c, N);
-    mod_xw<true>(w, w.R + (size_t)(j + h1) * n + j, nn, n, w.R + (size_t)j * n + c, nn, n, h - h1, N, h1, j + h1, c);
+    mod_rr<true>(w, j + h1, j, j, c, h - h1, N, h1, j + h1, c);
     det_trsm(w, j + h1, h - h1, c, N);
+}
+
+// rows [j, j + h) of columns [c, c + N) := U^-1 (them), U the upper triangle of the diagonal block at j
+inline void det_trsm_up(DetWork &w, int j, int h, int c, int N) {
+    if (h == DB) { mod_xw<false>(w, w.Uinv + (size_t)j * DB, (size_t)w.n * DB, DB, w.at(j, c), w.zr(), w.ld, DB, N, DB, j, c); return; }
+    const int h1 = half(h);
+    det_trsm_up(w, j + h1, h - h1, c, N);
+    mod_rr<true>(w, j, j + h1, j + h1, c, h1, N, h - h1, j, c);
+    det_trsm_up(w, j, h1, c, N);
 }
 
 // LU of columns [j, j + wd) over rows [j, n): L below the diagonal blocks, U above, pivots into det
 inline void det_lu(DetWork &w, int j, int wd) {
-    const int n = w.n; const size_t nn = (size_t)n * n, z64 = (size_t)DB * DB;
-    int32_t *R = w.R;
+    const int n = w.n;
     if (wd == DB) {
+        int32_t *Ui = w.Uinv + (size_t)j * DB;
         det_prof.begin();
-        diag_inv<<<w.Pb, 256>>>(R + (size_t)j * n + j, nn, n, w.Linv + (size_t)j * DB, (size_t)n * DB, w.Uinv, w.det, w.bad, w.P);
+        diag_inv<<<w.Pb, 256>>>(w.at(j, j), w.zr(), w.ld, w.Linv + (size_t)j * DB, (size_t)n * DB, Ui, w.det, w.bad, w.P);
         det_prof.end(0);
-        mod_xw<false>(w, R + (size_t)(j + DB) * n + j, nn, n, w.Uinv, z64, DB, n - j - DB, DB, DB, j + DB, j);   // L21 = A21 U^-1
+        mod_xw<false>(w, w.at(j + DB, j), w.zr(), w.ld, Ui, (size_t)n * DB, DB, n - j - DB, DB, DB, j + DB, j);   // L21 = A21 U^-1
         return;
     }
     const int h = half(wd), c = j + h;
     det_lu(w, j, h);
     det_trsm(w, j, h, c, wd - h);
-    mod_xw<true>(w, R + (size_t)c * n + j, nn, n, R + (size_t)j * n + c, nn, n, n - c, wd - h, h, c, c);
+    mod_rr<true>(w, c, j, j, c, n - c, wd - h, h, c, c);
     det_lu(w, c, wd - h);
 }
 
-// det(A) mod each of the Pb primes (n % 64 == 0); results in w.det, bad primes flagged in w.bad
+// det(A) mod each of the Pb primes (n % 64 == 0); results in w.det, bad primes flagged in w.bad.
+// With ld = 2n, R[:, n:2n] ends as A^-1 mod p.
 inline void det_mod_batch(DetWork &w, const int8_t *dA) {
-    det_init<<<dim3(256, w.Pb), 256>>>(dA, w.R, (size_t)w.n * w.n, w.P);
+    det_init<<<dim3(256, w.Pb), 256>>>(dA, w.R, w.n, w.ld, w.P);
     det_lu(w, 0, w.n);
+    if (w.ld == 2 * w.n) { det_trsm(w, 0, w.n, w.n, w.n); det_trsm_up(w, 0, w.n, w.n, w.n); }
+}
+
+// Dixon p-adic lifting with A^-1 mod p: digit x_i = A^-1 r_i mod p, then r_{i+1} = (r_i - A x_i) / p exactly.
+// |r| stays below n 127 + |b|, so every step is two matrix-vector products of small numbers (memory-bound: A^-1 as 16-bit
+// residues and A as int8 are read once per step), and after m steps x = sum x_i p^i = A^-1 b mod p^m.
+__global__ void to_u16(const int32_t *__restrict__ R, int ld, int c0, int n, uint16_t *__restrict__ out) {
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < (size_t)n * n; i += (size_t)gridDim.x * blockDim.x)
+        out[i] = (uint16_t)R[(i / n) * ld + c0 + i % n];
+}
+// one warp per row: x[i] = sum_k Ai[i][k] rm[k] mod p (each product < 2^32, the sum of 2^16 of them < 2^48)
+__global__ void lift_x(const uint16_t *__restrict__ Ai, const uint32_t *__restrict__ rm, uint16_t *__restrict__ x, int n, uint32_t p) {
+    const int lane = threadIdx.x & 31, i = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (i >= n) return;
+    const uint16_t *a = Ai + (size_t)i * n; uint64_t s = 0;
+    for (int k = lane * 8; k < n; k += 256) {
+        uint4 v = *(const uint4 *)&a[k]; uint4 r0 = *(const uint4 *)&rm[k], r1 = *(const uint4 *)&rm[k + 4];
+        s += (uint64_t)(v.x & 0xffff) * r0.x + (uint64_t)(v.x >> 16) * r0.y + (uint64_t)(v.y & 0xffff) * r0.z + (uint64_t)(v.y >> 16) * r0.w
+           + (uint64_t)(v.z & 0xffff) * r1.x + (uint64_t)(v.z >> 16) * r1.y + (uint64_t)(v.w & 0xffff) * r1.z + (uint64_t)(v.w >> 16) * r1.w;
+    }
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if (lane == 0) x[i] = (uint16_t)(s % p);
+}
+// one warp per row: r[i] = (r[i] - sum_k A[i][k] x[k]) / p, rm[i] = r[i] mod p; a remainder != 0 sets *err
+__global__ void lift_r(const int8_t *__restrict__ A, const uint16_t *__restrict__ x, int32_t *__restrict__ r, uint32_t *__restrict__ rm,
+                       int n, int p, int *err) {
+    const int lane = threadIdx.x & 31, i = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (i >= n) return;
+    const int8_t *a = A + (size_t)i * n; long long s = 0;
+    for (int k = lane * 16; k < n; k += 512) {
+        int4 v = *(const int4 *)&a[k]; const int8_t *b = (const int8_t *)&v;
+        uint4 x0 = *(const uint4 *)&x[k], x1 = *(const uint4 *)&x[k + 8];
+        const uint16_t *y0 = (const uint16_t *)&x0, *y1 = (const uint16_t *)&x1;
+        int t = 0;   // 16 products below 2^7 2^16 each: < 2^27
+#pragma unroll
+        for (int q = 0; q < 8; q++) t += b[q] * (int)y0[q] + b[8 + q] * (int)y1[q];
+        s += t;
+    }
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if (lane == 0) {
+        long long t = r[i] - s, q = t / p;
+        if (q * p != t) *err = 1;
+        r[i] = (int32_t)q; int m = (int)(q % p); rm[i] = m < 0 ? m + p : m;
+    }
 }
 
 }  // namespace oz
