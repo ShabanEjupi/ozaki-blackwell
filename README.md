@@ -331,3 +331,12 @@ past it is lifting by matrix products (Storjohann's high-order lifting), the nex
 provuar (i ngushtë brenda 1 biti) e lë det/d me 6 prime. n = 4096: 1,15 s kundrejt 257 s të FLINT-it (224×); n = 8192:
 8,05 s kundrejt 2 861 s (355×); n = 16 384: përcaktor 204 480 bit në 66 s. Zgjidhja e saktë racionale e Ax = b: deri 130×
 FLINT. Energjia: ~50× më pak. Saktë bit për bit.
+
+**Past the bandwidth wall — what the numbers say (read at the source: Pauderis & Storjohann, ISSAC 2012, DoublePlusOneLift).**
+High-order lifting replaces the 13 013 GEMVs by ~log₂(m) levels of three n × n products of small residues
+(‖R‖ < 0.6 n‖A‖ ≈ 2^22, X ≥ 3.61 n²‖A‖ ≈ 2^35), which are tensor-core GEMMs. For int8 inputs at n = 8192 that is
+~13 × 3 × n³ × (4 primes × 4 byte products) ≈ 3·10¹⁴ INT8 MACs, ~3 s at 100 TOPS, against 6.4 s for Dixon at full bandwidth:
+~2×, not an order of magnitude, because here m ≈ 1.6 n. It wins big when m ≫ n log n, i.e. for large entries. The other
+levers are small: 31-bit lifting primes save ~14 % of the bytes per bit, tighter numerator bounds ~6 % of the steps.
+For int8 matrices the digit-by-digit lifting at full bandwidth is close to what this machine allows; the next limits to
+break are size (n = 32 768 needs [A I] out of core: 8 GB of int32 residues) and large entries (where high-order lifting pays).
