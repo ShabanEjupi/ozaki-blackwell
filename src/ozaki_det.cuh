@@ -42,13 +42,23 @@ __global__ void det_init(const int8_t *__restrict__ A, int32_t *__restrict__ R, 
 __device__ __forceinline__ void split(int b, int8_t &lo, int8_t &hi) { lo = (int8_t)b; hi = (int8_t)((b - lo) >> 8); }
 
 // out[r][k], out[r][K + k] = lo, hi byte of bal(X[r][k]); rows >= M are zero (padding to the 128-row tile). 4 k per thread.
-__global__ void pack_a(const int32_t *__restrict__ X, size_t zx, int ld, int M, int K, int Mpad, int8_t *__restrict__ out,
+// residue of an entry: int32 entries are residues already; int64 entries (any integers) are reduced here
+__device__ __forceinline__ int resid(int32_t x, int) { return x; }
+__device__ __forceinline__ int resid(long long x, int p) { int r = (int)(x % p); return r < 0 ? r + p : r; }
+
+template <class T>
+__global__ void pack_a(const T *__restrict__ X, size_t zx, int ld, int M, int K, int Mpad, int8_t *__restrict__ out,
                        const uint32_t *__restrict__ P) {
     const int z = blockIdx.y, p = P[z], K4 = K / 4;
     X += z * zx; out += (size_t)z * Mpad * 2 * K;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < Mpad * K4; i += gridDim.x * blockDim.x) {
         int r = i / K4, k = (i % K4) * 4;
-        int4 x = r < M ? *(const int4 *)&X[(size_t)r * ld + k] : make_int4(0, 0, 0, 0);
+        int4 x = make_int4(0, 0, 0, 0);
+        if (r < M) {
+            const T *s = &X[(size_t)r * ld + k];
+            if constexpr (sizeof(T) == 4) x = *(const int4 *)s;
+            else x = make_int4(resid(s[0], p), resid(s[1], p), resid(s[2], p), resid(s[3], p));
+        }
         char4 lo, hi;
         split(bal(x.x, p), (int8_t &)lo.x, (int8_t &)hi.x); split(bal(x.y, p), (int8_t &)lo.y, (int8_t &)hi.y);
         split(bal(x.z, p), (int8_t &)lo.z, (int8_t &)hi.z); split(bal(x.w, p), (int8_t &)lo.w, (int8_t &)hi.w);
@@ -58,13 +68,14 @@ __global__ void pack_a(const int32_t *__restrict__ X, size_t zx, int ld, int M, 
 
 // W is K x N (row-major, ld); Bt1[c] = [lo(W[:,c]) lo(V[:,c])], Bt2[c] = [hi(W[:,c]) hi(V[:,c])], V = 256 W mod p.
 // One 64 x 64 tile per block, transposed through shared memory: reads along c, writes 16-byte runs along k.
-__global__ void __launch_bounds__(256) pack_b(const int32_t *__restrict__ W, size_t zw, int ld, int K, int N, int Npad,
+template <class T>
+__global__ void __launch_bounds__(256) pack_b(const T *__restrict__ W, size_t zw, int ld, int K, int N, int Npad,
                                               int8_t *__restrict__ B1, int8_t *__restrict__ B2, const uint32_t *__restrict__ P) {
     __shared__ __align__(16) int8_t s[4][64][80];   // wl, wh, vl, vh as [c][k]; rows of 80 bytes: 4-way bank conflicts, not 16
     const int z = blockIdx.z, p = P[z], c0 = blockIdx.x * 64, k0 = blockIdx.y * 64, tid = threadIdx.x;
     W += z * zw; B1 += (size_t)z * Npad * 2 * K; B2 += (size_t)z * Npad * 2 * K;
     for (int e = tid; e < 64 * 64; e += 256) {
-        int k = e / 64, c = e % 64, w = c0 + c < N ? W[(size_t)(k0 + k) * ld + c0 + c] : 0;
+        int k = e / 64, c = e % 64, w = c0 + c < N ? resid(W[(size_t)(k0 + k) * ld + c0 + c], p) : 0;
         int b = bal(w, p), v = bal((int)(((uint32_t)w << 8) % p), p);
         split(b, s[0][c][k], s[1][c][k]); split(v, s[2][c][k], s[3][c][k]);
     }
@@ -176,8 +187,8 @@ struct DetProf {
 inline DetProf det_prof;
 
 // The M x N corner of R at (r, c) (=|-=) X W, X: M x K at (X, ldx, zx), W: K x N at (W, ldw, zw); K % 64 == 0
-template <bool SUB>
-inline void mod_xw(DetWork &w, const int32_t *X, size_t zx, int ldx, const int32_t *W, size_t zw, int ldw, int M, int N, int K,
+template <bool SUB, class TX = int32_t, class TW = int32_t>
+inline void mod_xw(DetWork &w, const TX *X, size_t zx, int ldx, const TW *W, size_t zw, int ldw, int M, int N, int K,
                    int r, int c) {
     if (M <= 0 || N <= 0) return;
     const int Mpad = rup(M, BM), Npad = rup(N, BN);

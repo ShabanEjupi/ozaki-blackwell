@@ -1,5 +1,5 @@
 // det.cu -- exact determinant of an n x n int8 matrix on INT8 tensor cores (src/ozaki_det.cuh) against FLINT fmpz_mat_det.
-// g++ -O3 -c bench/det_flint.cpp -o out_dflint.o && nvcc -O3 -arch=sm_120 -std=c++17 -Xcompiler -fopenmp -o out_det bench/det.cu out_dflint.o -lflint -lgmp -lgomp
+// g++ -O3 -c bench/det_flint.cpp -o out_dflint.o && nvcc -O3 -arch=sm_120 -std=c++17 -Xcompiler -fopenmp -o out_det bench/det.cu out_dflint.o -lflint -lgmp -lgomp -lcusolver -lcublas
 // ./out_det n [primes per batch=32] [flint: 1 compare, 0 skip] [method: 0 multimodular, 1 divisor by p-adic lifting]
 //
 // Method 0: det mod every prime up to the Hadamard bound, one CRT.
@@ -16,6 +16,7 @@
 #include <vector>
 #include <gmp.h>
 #include "../src/ozaki_det.cuh"
+#include "../src/ozaki_detbound.cuh"
 double flint_det(int n, const int8_t *A, int threads, long *bits, std::string *hex);
 double flint_solve(int n, const int8_t *A, const int32_t *b, int threads, const __mpz_struct *num, const mpz_t D, int *ok);
 
@@ -100,9 +101,9 @@ int main(int argc, char **argv) {
     for (int i = 2; i < 65280; i++) if (!comp[i]) for (int k = 2 * i; k < 65280; k += i) comp[k] = 1;
     for (int i = 65279; i > 2; i--) if (!comp[i]) all.push_back(i);
     // the first primes from `from` whose log2 sum reaches `bits` with spares for bad ones, rounded up to a batch
-    auto take = [&](size_t from, double bits) {
+    auto take = [&](size_t from, double bits, int batch) {
         std::vector<uint32_t> pr; double lb = 0;
-        for (size_t i = from; i < all.size() && (lb < bits * (1.0 + 2.5 * n / 65000.0) + 64 || pr.size() % Pb); i++) {
+        for (size_t i = from; i < all.size() && (lb < bits * (1.0 + 2.5 * n / 65000.0) + 64 || pr.size() % batch); i++) {
             pr.push_back(all[i]); lb += log2((double)all[i]);
         }
         return pr;
@@ -111,11 +112,11 @@ int main(int argc, char **argv) {
     int8_t *dA; cudaMalloc(&dA, A.size()); cudaMemcpy(dA, A.data(), A.size(), cudaMemcpyHostToDevice);
     mpz_t D; mpz_init(D);
     const double t0 = now();
-    double t_inv = 0, t_lift = 0, t_rr = 0, t_mod = 0, gb = 0;
+    double t_inv = 0, t_lift = 0, t_rr = 0, t_mod = 0, t_bound = 0, gb = 0, ub = hb; int bprimes = 0;
     long dbits = 0; int good = 0; size_t nprimes = 0, steps = 0;
 
     if (method == 0) {
-        std::vector<uint32_t> pr = take(0, hb + 2), det; std::vector<int> bad, use;
+        std::vector<uint32_t> pr = take(0, hb + 2, Pb), det; std::vector<int> bad, use;
         det_mod_primes(n, Pb, dA, pr, det, bad);
         int nbad = 0; for (int b : bad) nbad += b;
         if (nbad > (int)pr.size() / 2) {
@@ -293,17 +294,22 @@ int main(int argc, char **argv) {
         }
         dbits = mpz_sizeinbase(D, 2); t_rr = now() - t2;
 
-        // 4. c = det / d from as many primes as Hadamard / d needs: |c| < 2^(hb - dbits + 1)
+        // 4. c = det / d from as many primes as the bound / d needs: |c| < 2^(ub - dbits + 1). ub: the proved bound of
+        // src/ozaki_detbound.cuh (a few bits above log2 |det|), or Hadamard (below n = 4096, where cuSOLVER's ~0.3 s setup costs more than the primes it saves; OZ_HADAMARD=1; or FP32 LU finds A singular)
         const double t3 = now();
-        std::vector<uint32_t> pr = take(0, hb - dbits + 3), det; std::vector<int> bad, use;
-        det_mod_primes(n, Pb, dA, pr, det, bad); cudaDeviceSynchronize();
+        if (!getenv("OZ_HADAMARD") && (n >= 4096 || getenv("OZ_BOUND"))) ub = std::min(hb, oz::det_log2_bound(n, A.data(), 20, &bprimes));
+        t_bound = now() - t3;
+        const double need_c = ub - dbits + 3;
+        const int bc = std::min(Pb, (int)ceil(need_c / 15.9) + 2);
+        std::vector<uint32_t> pr = take(0, need_c, bc), det; std::vector<int> bad, use;
+        det_mod_primes(n, bc, dA, pr, det, bad); cudaDeviceSynchronize();
         for (size_t i = 0; i < pr.size(); i++) {
             uint32_t dm = mpz_fdiv_ui(D, pr[i]);
             use.push_back(!bad[i] && dm); good += use.back();
             if (use.back()) det[i] = (uint64_t)det[i] * invm(dm, pr[i]) % pr[i];
         }
         mpz_t c; mpz_init(c); gb = crt(c, pr, det, use); nprimes = pr.size();
-        if (gb < hb - dbits + 3) { printf("NOT ENOUGH GOOD PRIMES\n"); return 1; }
+        if (gb < need_c) { printf("NOT ENOUGH GOOD PRIMES\n"); return 1; }
         mpz_mul(D, D, c); t_mod = now() - t3;
         mpz_clears(Q, xj, num, den, c, nullptr);
     }
@@ -312,8 +318,8 @@ int main(int argc, char **argv) {
     if (err != cudaSuccess) { printf("CUDA: %s\n", cudaGetErrorString(err)); return 1; }
     if (oz::det_prof.on) printf("prof: diag %.3f s  pack %.3f s  gemm %.3f s\n", oz::det_prof.t[0], oz::det_prof.t[1], oz::det_prof.t[2]);
     printf("n=%d method %d  Hadamard %.0f bits  |det| %zu bits  total %.3f s", n, method, hb, mpz_sizeinbase(D, 2), total);
-    if (method) printf("  [A^-1 %.3f  lift %zu steps %.3f  ratrec %.3f (d %ld bits)  det/d: %zu primes %.3f]", t_inv, steps,
-                       t_lift, t_rr, dbits, nprimes, t_mod);
+    if (method) printf("  [A^-1 %.3f  lift %zu steps %.3f  ratrec %.3f (d %ld bits)  bound %.0f bits (%d primes) %.3f  det/d: %zu primes %.3f]",
+                       t_inv, steps, t_lift, t_rr, dbits, ub, bprimes, t_bound, nprimes, t_mod - t_bound);
     else printf("  [%zu primes, %d good]", nprimes, good);
     printf("\n");
     if (cmp) {
