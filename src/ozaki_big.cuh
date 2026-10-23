@@ -19,7 +19,7 @@
 namespace oz {
 
 struct BigPlan {
-    int M, N, K, NL, L, NA, Kr, Kc, D;   // Kr: 4 NL digits padded; Kc = 2L; D: output digits padded
+    int M, N, K, NL, L, NB, NA, Kr, Kc, D;   // NB bytes per residue; Kr: 4 NL digits padded; Kc = NB L; D: output digits padded
     int Mp, Np, Kp;
     std::vector<int> p;
     int *dp, *dinv; double *drp;
@@ -64,51 +64,57 @@ __global__ void __launch_bounds__(64) big_digits(const unsigned *X, int NL, int 
 
 __device__ __forceinline__ int bal(long long c, int p) { int r = (int)(c % p); if (r < 0) r += p; return r > p / 2 ? r - p : r; }
 
-// R [2L][ldr] (lo rows, then hi rows: the residue GEMM runs transposed so that one prime's row is contiguous)
+// balanced r -> NB signed bytes, r = sum_a d[a] 256^a (|d[a]| <= 128; the top one <= 128 for p < 65280 (NB 2), <= 64 for p < 2^23 (NB 3))
+__host__ __device__ __forceinline__ void bsplit(int r, int NB, int *d) {
+    for (int a = 0; a < NB - 1; a++) { int lo = ((r + 128) & 255) - 128; d[a] = lo; r = (r - lo) >> 8; }
+    d[NB - 1] = r;
+}
+
+// R [NB L][ldr] (byte a of the weights in rows a L ..: the residue GEMM runs transposed so that one prime's row is contiguous)
 // -> balanced residues split into byte planes, element r0 + e = (i, k) at i Kp + k
-__global__ void big_res_out(const int32_t *R, size_t ldr, size_t r0, size_t rows, int L, const int *p, int cols, int Kp,
+__global__ void big_res_out(const int32_t *R, size_t ldr, size_t r0, size_t rows, int L, int NB, const int *p, int cols, int Kp,
                             size_t plane, int8_t *P) {
     size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; int l = blockIdx.y;
     if (e >= rows) return;
-    int r = bal((long long)R[(L + l) * ldr + e] * 256 + R[l * ldr + e], p[l]);
-    int lo = ((r + 128) & 255) - 128, hi = (r - lo) >> 8;
+    long long v = 0;
+    for (int a = NB - 1; a >= 0; a--) v = v * 256 + R[((size_t)a * L + l) * ldr + e];
+    int d[3]; bsplit(bal(v, p[l]), NB, d);
     size_t g = r0 + e, pos = g / cols * Kp + g % cols;
-    P[(size_t)l * plane + pos] = (int8_t)lo;
-    P[((size_t)L + l) * plane + pos] = (int8_t)hi;
+    for (int a = 0; a < NB; a++) P[((size_t)a * L + l) * plane + pos] = (int8_t)d[a];
 }
 
-// the four products of a chunk of primes -> t_l = (A B mod p_l) (M/p_l)^-1 mod p_l, two bytes, into T [M N][Kc]
-__global__ void big_t(const int32_t *C, int LC, int lc, size_t pc, int l0, int L, int M, int N, int Np, const int *p, const int *inv, int8_t *T, int Kc) {
-    __shared__ int8_t sl[64][65], sh[64][65];   // 64 columns x up to 64 primes: read along j, written along l
+// the NB^2 byte products of a chunk of primes -> t_l = (A B mod p_l) (M/p_l)^-1 mod p_l, NB bytes, into T [M N][Kc]
+__global__ void big_t(const int32_t *C, int LC, int lc, size_t pc, int l0, int L, int NB, int M, int N, int Np, const int *p, const int *inv, int8_t *T, int Kc) {
+    __shared__ int8_t sd[3][64][65];   // 64 columns x up to 64 primes: read along j, written along l
     const int i = blockIdx.y, j0 = blockIdx.x * 64;
     const size_t s = (size_t)LC * pc;
     for (int x = threadIdx.x; x < 64 * lc; x += blockDim.x) {
         int jl = x & 63, lz = x >> 6, j = j0 + jl, l = l0 + lz;
         if (j >= N) continue;
         size_t o = lz * pc + (size_t)i * Np + j;
-        long long hh = C[o], hl = C[s + o], lh = C[2 * s + o], ll = C[3 * s + o];
-        int c = bal((hh << 16) + ((hl + lh) << 8) + ll, p[l]);
-        int t = bal((long long)c * inv[l], p[l]);
-        int lo = ((t + 128) & 255) - 128;
-        sl[jl][lz] = (int8_t)lo; sh[jl][lz] = (int8_t)((t - lo) >> 8);
+        long long v = 0;
+        for (int a = 0; a < NB; a++) for (int b = 0; b < NB; b++) v += (long long)C[(a * NB + b) * s + o] << (8 * (a + b));
+        int t = bal((long long)bal(v, p[l]) * inv[l], p[l]), d[3];
+        bsplit(t, NB, d);
+        for (int a = 0; a < NB; a++) sd[a][jl][lz] = (int8_t)d[a];
     }
     __syncthreads();
     for (int x = threadIdx.x; x < 64 * lc; x += blockDim.x) {
         int lz = x % lc, jl = x / lc, j = j0 + jl;
         if (j >= N) continue;
         size_t e = (size_t)i * N + j;
-        T[e * Kc + l0 + lz] = sl[jl][lz]; T[e * Kc + L + l0 + lz] = sh[jl][lz];
+        for (int a = 0; a < NB; a++) T[e * Kc + (size_t)a * L + l0 + lz] = sd[a][jl][lz];
     }
 }
 
 // G [rows][D] digits of sum t_l M/p_l -> x = that - q M, NA limbs per element
-__global__ void big_out(const int32_t *G, const int8_t *T, size_t e0, size_t rows, int L, int Kc, int D, const double *rp,
+__global__ void big_out(const int32_t *G, const int8_t *T, size_t e0, size_t rows, int L, int NB, int Kc, int D, const double *rp,
                         const unsigned char *Mb, int NA, unsigned *X) {
     size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (e >= rows) return;
     const int8_t *t = T + (e0 + e) * Kc;
     double qf = 0;
-    for (int l = 0; l < L; l++) qf += (256 * t[L + l] + t[l]) * rp[l];
+    for (int l = 0; l < L; l++) { int v = 0; for (int a = NB - 1; a >= 0; a--) v = v * 256 + t[a * L + l]; qf += v * rp[l]; }
     long long q = llrint(qf), c = 0;
     const int32_t *g = G + e * D;
     unsigned w = 0;
@@ -123,17 +129,21 @@ __global__ void big_out(const int32_t *G, const int8_t *T, size_t e0, size_t row
 inline BigPlan big_plan(int M, int N, int K, int NL) {
     BigPlan b{}; b.M = M; b.N = N; b.K = K; b.NL = NL;
     b.Mp = (M + BM - 1) / BM * BM; b.Np = (N + BN - 1) / BN * BN; b.Kp = (K + BK - 1) / BK * BK;
-    // primes from 65279 down until M > 2^(2 (32 NL - 9) + log2 K + 8); |hi| <= 128 needs p/2 + 128 < 32768
+    // primes from the top down until M > 2^(2 (32 NL - 9) + log2 K + 8). Two bytes per residue (p < 65280: the top byte
+    // stays <= 128) up to ~34 000-bit entries; beyond that three bytes, p < 2^23 (9 products per prime, ~23 bits each)
     double need = 2.0 * (32 * NL - 9) + log2((double)K) + 8, have = 0;
-    std::vector<char> comp(65280, 0);
-    for (int i = 2; i * i < 65280; i++) if (!comp[i]) for (int j = i * i; j < 65280; j += i) comp[j] = 1;
-    for (int x = 65279; x > 255 && (have < need || b.p.size() % 64); x--) if (!comp[x]) { b.p.push_back(x); have += log2((double)x); }
-    if (have < need) { fprintf(stderr, "big: %d-bit entries need more primes than there are below 65280\n", 32 * NL); abort(); }
-    b.L = (int)b.p.size(); b.Kc = 2 * b.L; b.Kr = (4 * NL + BK - 1) / BK * BK;
+    b.NB = need > 60000 ? 3 : 2;
+    const int top = b.NB == 2 ? 65280 : 1 << 23;
+    std::vector<char> comp(top, 0);
+    for (int i = 2; (long long)i * i < top; i++) if (!comp[i]) for (int j = i * i; j < top; j += i) comp[j] = 1;
+    for (int x = top - 1; x > 255 && (have < need || b.p.size() % 128); x--) if (!comp[x]) { b.p.push_back(x); have += log2((double)x); }
+    if (have < need) { fprintf(stderr, "big: %d-bit entries need more primes than there are below %d\n", 32 * NL, top); abort(); }
+    if ((double)b.NB * b.p.size() * 16384 >= 2147483648.0) { fprintf(stderr, "big: the CRT GEMM's int32 sums would overflow\n"); abort(); }
+    b.L = (int)b.p.size(); b.Kc = b.NB * b.L; b.Kr = (4 * NL + BK - 1) / BK * BK;
     mpz_t Mz, Ml; mpz_inits(Mz, Ml, NULL); mpz_set_ui(Mz, 1);
     for (int x : b.p) mpz_mul_ui(Mz, Mz, x);
     b.NA = (int)((mpz_sizeinbase(Mz, 2) + 2 + 31) / 32);
-    b.D = (4 * b.NA + 1 + BN - 1) / BN * BN;
+    b.D = (4 * b.NA + b.NB + BN - 1) / BN * BN;
     std::vector<int> inv(b.L); std::vector<double> rp(b.L);
     std::vector<int8_t> wc((size_t)b.D * b.Kc, 0), br((size_t)b.Kc * b.Kr, 0);
     std::vector<unsigned char> mb(b.D, 0);
@@ -146,15 +156,15 @@ inline BigPlan big_plan(int M, int N, int K, int NL) {
         inv[l] = (int)x; rp[l] = 1.0 / p;
         std::vector<unsigned char> u(4 * b.NA + 8, 0); size_t cnt; mpz_export(u.data(), &cnt, -1, 1, 0, 0, Ml);
         int carry = 0;
-        for (int d = 0; d < 4 * b.NA; d++) {   // balanced bytes of M/p into column l (lo t-byte) and l + L shifted by one (hi)
+        for (int d = 0; d < 4 * b.NA; d++) {   // balanced bytes of M/p into column a L + l, shifted down by a digits (t's byte a)
             int v = u[d] + carry; carry = v >= 128; if (carry) v -= 256;
-            wc[(size_t)d * b.Kc + l] = (int8_t)v;
-            if (d + 1 < b.D) wc[(size_t)(d + 1) * b.Kc + b.L + l] = (int8_t)v;
+            for (int a = 0; a < b.NB; a++) if (d + a < b.D) wc[(size_t)(d + a) * b.Kc + (size_t)a * b.L + l] = (int8_t)v;
         }
         long long c = 1;
-        for (int j = 0; j < 4 * NL; j++) {   // 2^(8 j) mod p, balanced, two bytes
-            int r = (int)c > p / 2 ? (int)c - p : (int)c, lo = ((r + 128) & 255) - 128, hi = (r - lo) >> 8;
-            br[(size_t)l * b.Kr + j] = (int8_t)lo; br[(size_t)(b.L + l) * b.Kr + j] = (int8_t)hi;
+        for (int j = 0; j < 4 * NL; j++) {   // 2^(8 j) mod p, balanced, NB bytes
+            int r = (int)c > p / 2 ? (int)c - p : (int)c, d[3];
+            bsplit(r, b.NB, d);
+            for (int a = 0; a < b.NB; a++) br[((size_t)a * b.L + l) * b.Kr + j] = (int8_t)d[a];
             c = c * 256 % p;
         }
     }
@@ -168,12 +178,12 @@ inline BigPlan big_plan(int M, int N, int K, int NL) {
     size_t rowsX = std::max((size_t)M * K, (size_t)K * N), rowsXp = (rowsX + BM - 1) / BM * BM;
     cudaMalloc(&b.Xd, rowsXp * b.Kr); cudaMemset(b.Xd, 0, rowsXp * b.Kr);
     size_t pa = (size_t)b.Mp * b.Kp, pb = (size_t)b.Np * b.Kp;
-    cudaMalloc(&b.Ar, 2 * b.L * pa); cudaMemset(b.Ar, 0, 2 * b.L * pa);
-    cudaMalloc(&b.Br, 2 * b.L * pb); cudaMemset(b.Br, 0, 2 * b.L * pb);
+    cudaMalloc(&b.Ar, (size_t)b.NB * b.L * pa); cudaMemset(b.Ar, 0, (size_t)b.NB * b.L * pa);
+    cudaMalloc(&b.Br, (size_t)b.NB * b.L * pb); cudaMemset(b.Br, 0, (size_t)b.NB * b.L * pb);
     size_t MNp = ((size_t)M * N + BM - 1) / BM * BM;
     cudaMalloc(&b.T, MNp * b.Kc); cudaMemset(b.T, 0, MNp * b.Kc);
     b.cg_elems = (size_t)640 << 20 >> 2;   // 640 MB of int32 scratch
-    b.LC = std::max(1, std::min(std::min(b.L, 64), (int)(b.cg_elems / (4 * (size_t)b.Mp * b.Np))));
+    b.LC = std::max(1, std::min(std::min(b.L, 64), (int)(b.cg_elems / ((size_t)b.NB * b.NB * b.Mp * b.Np))));
     cudaMalloc(&b.Cg, b.cg_elems * 4);
     return b;
 }
@@ -187,11 +197,11 @@ inline void big_release(BigPlan &b) {
 inline void big_residues(BigPlan &b, const unsigned *X, int rows, int cols, bool trans, int8_t *P, size_t plane) {
     size_t n = (size_t)rows * cols;
     big_digits<<<(n + 63) / 64, 64>>>(X, b.NL, b.Kr, rows, cols, trans, b.Xd);
-    size_t rc = std::max<size_t>(BN, b.cg_elems / (2 * (size_t)b.L) / BN * BN);
+    size_t rc = std::max<size_t>(BN, b.cg_elems / (size_t)b.Kc / BN * BN);
     for (size_t r0 = 0; r0 < n; r0 += rc) {
         size_t m = std::min(rc, n - r0), mp = (m + BN - 1) / BN * BN;
         gemm_i8<<<dim3(mp / BN, b.Kc / BM, 1), THREADS>>>(b.Bres, b.Xd + r0 * b.Kr, b.Cg, b.Kc, (int)mp, b.Kr);
-        big_res_out<<<dim3((m + 255) / 256, b.L), 256>>>(b.Cg, mp, r0, m, b.L, b.dp, cols, b.Kp, plane, P);
+        big_res_out<<<dim3((m + 255) / 256, b.L), 256>>>(b.Cg, mp, r0, m, b.L, b.NB, b.dp, cols, b.Kp, plane, P);
     }
 }
 
@@ -205,18 +215,17 @@ inline void biggemm(BigPlan &b, const unsigned *A, const unsigned *B, unsigned *
     if (prof) cudaEventRecord(ev[1]);
     for (int l0 = 0; l0 < b.L; l0 += b.LC) {
         int lc = std::min(b.LC, b.L - l0);
-        const int prs[4][2] = {{1, 1}, {1, 0}, {0, 1}, {0, 0}};   // hh, hl, lh, ll
-        for (int q = 0; q < 4; q++)
-            gemm_i8<<<dim3(b.Np / BN, b.Mp / BM, lc), THREADS>>>(b.Ar + ((size_t)prs[q][0] * b.L + l0) * pa,
-                                                                 b.Br + ((size_t)prs[q][1] * b.L + l0) * pb, b.Cg + (size_t)q * b.LC * pc, b.Mp, b.Np, b.Kp);
-        big_t<<<dim3((b.N + 63) / 64, b.M), 256>>>(b.Cg, b.LC, lc, pc, l0, b.L, b.M, b.N, b.Np, b.dp, b.dinv, b.T, b.Kc);
+        for (int q = 0; q < b.NB * b.NB; q++)   // byte a of A times byte c of B, slot a NB + c
+            gemm_i8<<<dim3(b.Np / BN, b.Mp / BM, lc), THREADS>>>(b.Ar + ((size_t)(q / b.NB) * b.L + l0) * pa,
+                                                                 b.Br + ((size_t)(q % b.NB) * b.L + l0) * pb, b.Cg + (size_t)q * b.LC * pc, b.Mp, b.Np, b.Kp);
+        big_t<<<dim3((b.N + 63) / 64, b.M), 256>>>(b.Cg, b.LC, lc, pc, l0, b.L, b.NB, b.M, b.N, b.Np, b.dp, b.dinv, b.T, b.Kc);
     }
     if (prof) cudaEventRecord(ev[2]);
     size_t n = (size_t)b.M * b.N, rc = std::max<size_t>(BM, b.cg_elems / b.D / BM * BM);
     for (size_t e0 = 0; e0 < n; e0 += rc) {
         size_t m = std::min(rc, n - e0), mp = (m + BM - 1) / BM * BM;
         gemm_i8<<<dim3(b.D / BN, mp / BM, 1), THREADS>>>(b.T + e0 * b.Kc, b.Wc, b.Cg, (int)mp, b.D, b.Kc);
-        big_out<<<(m + 255) / 256, 256>>>(b.Cg, b.T, e0, m, b.L, b.Kc, b.D, b.drp, b.dMb, b.NA, C);
+        big_out<<<(m + 255) / 256, 256>>>(b.Cg, b.T, e0, m, b.L, b.NB, b.Kc, b.D, b.drp, b.dMb, b.NA, C);
     }
     if (prof) {
         cudaEventRecord(ev[3]); cudaEventSynchronize(ev[3]); float t[3];

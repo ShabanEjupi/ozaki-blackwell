@@ -52,8 +52,8 @@ static void run(int bits, int n, std::mt19937_64 &g) {
         mpz_clears(acc, x, y, NULL);
     }
     double ops = 2.0 * M * N * K;
-    printf("\n%d-bit entries (NL %d), n = %d: %d primes < 2^16 (M ~ 2^%d), %d INT8 GEMMs of n^3 + 2 conversion GEMMs\n",
-           32 * NL - 9, NL, n, pl.L, (int)(pl.NA * 32), 4 * pl.L);
+    printf("\n%d-bit entries (NL %d), n = %d: %d primes, %d bytes each (M ~ 2^%d), %d INT8 GEMMs of n^3 + 2 conversion GEMMs\n",
+           32 * NL - 9, NL, n, pl.L, pl.NB, (int)(pl.NA * 32), pl.NB * pl.NB * pl.L);
     printf("  GPU: %.1f ms = %.3g big multiply-adds/s (plan %.2f s); exact: %d of %d sampled elements wrong\n", ms, ops / 2 / ms * 1e3, tplan, bad, checked);
     if (getenv("OZ_ENERGY")) {   // energy: marks (epoch s) around ~8 s of back-to-back GPU products, then around FLINT, idle gaps between
         auto mark = [](const char *w) { printf("MARK %s %.3f\n", w, std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count()); fflush(stdout); };

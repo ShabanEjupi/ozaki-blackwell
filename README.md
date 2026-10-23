@@ -240,6 +240,12 @@ del i saktë bit për bit kundrejt GMP-së.
 | 4 087 | 512 | 576 | **62 ms** | 16.4 s (265×) | 1.07 s | **17×** |
 | 16 375 | 256 | 2 112 | **90 ms** | 14.0 s (156×) | 1.69 s | **19×** |
 | 32 759 | 256 | 4 352 | **316 ms** | 36.1 s (114×) | 4.56 s | **14×** |
+| 65 527 | 128 | 5 760 (3 bytes) | **313 ms** | 10.6 s (34×) | 3.45 s | **11×** |
+| 131 063 | 128 | 11 520 (3 bytes) | **983 ms** | 29.6 s (30×) | 9.76 s | **10×** |
+
+Above ~60 000 bits of M the residues take three bytes and the primes run up to 2^23 (9 product GEMMs per prime, ~23 bits
+each): 131 063-bit entries (~39 450 decimal digits) are still bit-exact. The ratio to FLINT falls slowly (19× → 10×) because
+the two conversions are n²·P² GEMMs; at n = 128 they dominate. Mbi ~60 000 bit mbetjet marrin 3 bajte (prime < 2^23).
 
 GMP times are a 96² (48² above 8 000 bits) corner of the outputs, scaled; FLINT runs the full product. At 1 015 bits the
 phases are residues ~37 ms · 768 product GEMMs + t ~25 ms · CRT ~20 ms: the conversions (n²·P² work), not the n³ part,
