@@ -272,3 +272,32 @@ Të dy çipat numërohen te të dyja kolonat.
 | 16 375, 256 | 66 ms · 95.3 + 23.3 W · **7.9 J** | 1.62 s · 81.4 + 6.5 W · 142 J | **18×** |
 
 The GPU runs at its ~95 W cap; the host thread that feeds it costs ~20 W of CPU package.
+
+## Exact integer determinant / Përcaktori i saktë (`src/ozaki_det.cuh`, `bench/det.cu`)
+
+The big-integer GEMM above stops scaling near 131 000 bits because its two conversions are n²·P² GEMMs. Here the
+problem is turned around so the conversions disappear: the input is int8, the output one residue per prime, and the only
+big-number work is one scalar CRT on the host. Each LU mod p runs without pivoting (a prime with a vanishing leading minor,
+probability ~n/p, is dropped). It is a recursive LU (Toledo) whose every O(n³) step is a byte-split INT8 GEMM:
+X W = [Xlo Xhi][Wlo; Vlo] + 256 [Xlo Xhi][Whi; Vhi] (mod p), V = 256 W mod p. The 64 × 64 diagonal blocks are inverted
+in shared memory.
+
+Method 1 changes what is computed: A⁻¹ mod p comes from the LU of [A I], Dixon lifting of x = A⁻¹b runs on the GPU (per step one
+16-bit A⁻¹ matvec and one int8 residual matvec, both memory-bound), rational reconstruction of 4 entries (GMP) gives
+d | det, and det / d needs only the primes for Hadamard / d. The result is proved, not probabilistic. Random int8 entries in
+[-127, 127], 24 CPU threads for FLINT 3.0.1:
+
+| n | \|det\| bits | GPU method 0 (all primes) | GPU method 1 (lifting) | FLINT `fmpz_mat_det` | vs FLINT |
+|---|---|---|---|---|---|
+| 1 024 | 10 736 | 0.24 s | **0.069 s** | 3.07 s | **45×** |
+| 2 048 | 22 485 | 1.96 s | **0.273 s** | 28.3 s | **104×** |
+| 4 096 | 47 021 | 21.3 s | **2.35 s** | 282 s | **120×** |
+| 8 192 | 98 139 | — (beyond the primes < 65 280) | **24.4 s** | not run (~40 min by n³) | |
+
+All bit-exact against FLINT. `fmpz_mat_det` is already FLINT's accelerated path (Dixon divisor + modular). Its plain
+multimodular `fmpz_mat_det_modular` takes 347 s at n = 2048, which is 177× method 0 with the same algorithm. At n = 8192
+the time goes to det / d (18 s, 496 primes): Hadamard overestimates |det| by ~6 000 bits, and that slack, not d, sets the prime count.
+
+**SQ** — Problemi u kthye përmbys: asnjë konvertim numrash të mëdhenj, vetëm një CRT skalar. Metoda 1: A⁻¹ mod p, ngritja
+p-adike te GPU-ja, rindërtimi racional jep d | det, pastaj pak prime për det/d. n = 4096: 2,35 s kundrejt 282 s të FLINT-it (120×),
+saktë bit për bit.
