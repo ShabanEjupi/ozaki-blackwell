@@ -189,27 +189,91 @@ int main(int argc, char **argv) {
                 mpz_addmul(out, hi, &pw[k - 1]); mpz_clear(hi);
             };
             std::vector<int> fail(n, 0);
+            double t_conv = now();
+            if (!getenv("OZ_GPUCONV")) {   // Horner by halves on 24 threads: faster than the GEMM below while the powers are built on the host
 #pragma omp parallel for schedule(dynamic, 16)
-            for (int j = 0; j < n; j++) conv(&num[j], j, 0, lg);
-            mpz_t nm, dn, h; mpz_inits(nm, dn, h, nullptr); mpz_fdiv_q_2exp(h, Q, 1);
-            mpz_set_ui(D, 1);
-            for (int pass = 0, again = 1; again && pass < 8; pass++) {   // D grows only when an entry needs a larger denominator
-                again = 0;
+                for (int j = 0; j < n; j++) conv(&num[j], j, 0, lg);
+            } else {   // OZ_GPUCONV=1: one INT8 GEMM (src/ozaki_det.cuh digits_to_a): [lo | h] x [P; 256 P], then carries
+                const int mpad = oz::rup((int)steps, 64), K2 = 2 * mpad, Mpad = oz::rup(n, oz::BM);
+                const int L = (int)(steps * log2((double)p) / 8) + 3, Npad = oz::rup(L + 1, oz::BN);
+                std::vector<int8_t> Bt((size_t)Npad * K2, 0);   // Bt[l][i] = byte l of p^i, Bt[l][mpad + i] = byte l - 1
+                mpz_t S; mpz_init(S);                           // 32768 sum_i p^i
+#pragma omp parallel
+                {
+                    mpz_t q; mpz_init(q); std::vector<uint8_t> by(L + 8);
+#pragma omp for schedule(static)
+                    for (size_t i = 0; i < steps; i++) {
+                        mpz_ui_pow_ui(q, p, i); size_t cnt = 0;
+                        std::fill(by.begin(), by.end(), 0);
+                        mpz_export(by.data(), &cnt, -1, 1, 0, 0, q);
+                        int c = 0;
+                        for (int l = 0; l <= L; l++) {   // balanced bytes: v in [-128, 127], carry up
+                            int v = by[l] + c; c = v > 127; if (c) v -= 256;
+                            Bt[(size_t)l * K2 + i] = (int8_t)v;
+                            if (l + 1 < Npad) Bt[(size_t)(l + 1) * K2 + mpad + i] = (int8_t)v;
+                        }
+                    }
+                    mpz_clear(q);
+                }
+                for (size_t i = steps; i-- > 0;) { mpz_mul_ui(S, S, p); mpz_add_ui(S, S, 1); }
+                mpz_mul_2exp(S, S, 15);
+                int8_t *dAp, *dBt; int32_t *dC; uint8_t *dby; long long *dtop;
+                cudaMalloc(&dAp, (size_t)Mpad * K2); cudaMalloc(&dBt, Bt.size()); cudaMalloc(&dC, (size_t)Mpad * Npad * 4);
+                cudaMalloc(&dby, (size_t)n * Npad); cudaMalloc(&dtop, n * 8);
+                cudaMemset(dAp, 0, (size_t)Mpad * K2);
+                cudaMemcpy(dBt, Bt.data(), Bt.size(), cudaMemcpyHostToDevice);
+                oz::digits_to_a<<<2048, 256>>>(dx, (int)steps, mpad, n, dAp);
+                oz::gemm_i8<<<dim3(Npad / oz::BN, Mpad / oz::BM, 1), oz::THREADS>>>(dAp, dBt, dC, Mpad, Npad, K2);
+                oz::carry_rows<<<(n + 127) / 128, 128>>>(dC, Npad, n, dby, dtop);
+                std::vector<uint8_t> by((size_t)n * Npad); std::vector<long long> top(n);
+                cudaMemcpy(by.data(), dby, by.size(), cudaMemcpyDeviceToHost); cudaMemcpy(top.data(), dtop, n * 8, cudaMemcpyDeviceToHost);
+                cudaFree(dAp); cudaFree(dBt); cudaFree(dC); cudaFree(dby); cudaFree(dtop);
+#pragma omp parallel for
                 for (int j = 0; j < n; j++) {
+                    mpz_t t; mpz_init(t);
+                    mpz_import(&num[j], Npad, -1, 1, 0, 0, &by[(size_t)j * Npad]);
+                    mpz_set_si(t, top[j]); mpz_mul_2exp(t, t, 8 * Npad); mpz_add(&num[j], &num[j], t);
+                    mpz_add(&num[j], &num[j], S); mpz_clear(t);
+                }
+                mpz_clear(S);
+            }
+            t_conv = now() - t_conv;
+            if (getenv("OZ_CONVCHECK")) {   // the GEMM conversion against Horner for a few entries
+                mpz_t y; mpz_init(y);
+                for (int j = 0; j < n; j += n / 4) {
+                    mpz_set_ui(y, 0);
+                    for (size_t i = steps; i-- > 0;) { mpz_mul_ui(y, y, p); mpz_add_ui(y, y, X[i * n + j]); }
+                    printf("  conv check entry %d: %s\n", j, mpz_cmp(y, &num[j]) ? "MISMATCH" : "ok");
+                }
+                mpz_clear(y);
+            }
+            mpz_t nm, dn, h; mpz_inits(nm, dn, h, nullptr); mpz_fdiv_q_2exp(h, Q, 1);
+            // D from entry 0, then every num_j = D x_j mod Q (symmetric) in parallel; an entry whose result is not below
+            // 2^nb needs a larger denominator: reconstruct it, D = lcm, and redo (rare: random b gives D = s_n at once)
+            std::vector<__mpz_struct> y(n); for (auto &v : y) mpz_init(&v);
+            if (!ratrec(nm, dn, &num[0], Q, nb, db)) { printf("RATREC failed at entry 0\n"); return 1; }
+            mpz_set(D, dn);
+            for (int pass = 0; pass < 8; pass++) {
+                std::vector<int> big(n, 0);
+#pragma omp parallel for
+                for (int j = 0; j < n; j++) {
+                    mpz_mul(&y[j], &num[j], D); mpz_mod(&y[j], &y[j], Q); if (mpz_cmp(&y[j], h) > 0) mpz_sub(&y[j], &y[j], Q);
+                    big[j] = (long)mpz_sizeinbase(&y[j], 2) >= nb;
+                }
+                int again = 0;
+                for (int j = 0; j < n; j++) if (big[j]) {   // with the D grown so far it may already fit
                     mpz_mul(nm, &num[j], D); mpz_mod(nm, nm, Q); if (mpz_cmp(nm, h) > 0) mpz_sub(nm, nm, Q);
                     if ((long)mpz_sizeinbase(nm, 2) < nb) continue;
                     if (!ratrec(nm, dn, &num[j], Q, nb, db)) { printf("RATREC failed at entry %d\n", j); return 1; }
                     mpz_lcm(D, D, dn); again = 1;
                 }
+                if (!again) break;
             }
-#pragma omp parallel for
-            for (int j = 0; j < n; j++) {
-                mpz_mul(&num[j], &num[j], D); mpz_mod(&num[j], &num[j], Q); if (mpz_cmp(&num[j], h) > 0) mpz_sub(&num[j], &num[j], Q);
-            }
+            for (int j = 0; j < n; j++) mpz_swap(&num[j], &y[j]);
             t_rr = now() - t2;
             size_t tb = 0; for (auto &v : num) tb += mpz_sizeinbase(&v, 2);
             printf("n=%d solve  x = num / D: D %zu bits, numerators %.1f Mbit in all  total %.3f s  [A^-1 %.3f  lift %zu steps %.3f  "
-                   "to integers + D %.3f]\n", n, mpz_sizeinbase(D, 2), tb / 1e6, now() - t0, t_inv, steps, t_lift, t_rr);
+                   "to integers %.3f + D %.3f]\n", n, mpz_sizeinbase(D, 2), tb / 1e6, now() - t0, t_inv, steps, t_lift, t_conv, t_rr - t_conv);
             if (cmp) {
                 int ok; double ft = flint_solve(n, A.data(), b.data(), 24, num.data(), D, &ok);
                 printf("  FLINT fmpz_mat_solve_dixon_den (24 thr) %.2f s  -> %s  (%.1fx)\n", ft, ok ? "BIT-EXACT" : "MISMATCH", ft / (now() - t0 - ft));

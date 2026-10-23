@@ -297,4 +297,26 @@ __global__ void lift_r(const int8_t *__restrict__ A, const uint16_t *__restrict_
     }
 }
 
+// Base-p digits to integers for all n entries at once, as ONE INT8 GEMM: x_j = sum_i d_ij p^i. Digit d = lo + 256 (h + 128),
+// lo, h signed bytes, so x_j = [lo | h]_j [P; 256 P] + 32768 sum_i p^i, with P[i] = the balanced bytes of p^i (256 P is the
+// same bytes one position up). Accumulators: K2 2^14 < 2^31 for K2 < 131072.
+__global__ void digits_to_a(const uint16_t *__restrict__ X, int m, int mpad, int n, int8_t *__restrict__ out) {
+    for (size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; e < (size_t)n * mpad; e += (size_t)gridDim.x * blockDim.x) {
+        int j = e / mpad, i = e % mpad, d = i < m ? X[(size_t)i * n + j] : 0;
+        int8_t lo = (int8_t)d; int h = i < m ? (d - lo) / 256 - 128 : 0;
+        out[(size_t)j * 2 * mpad + i] = lo; out[(size_t)j * 2 * mpad + mpad + i] = (int8_t)h;
+    }
+}
+// one thread per row: C[j][0..N) (int32 coefficients of 256^l) -> bytes + a final signed carry
+__global__ void carry_rows(const int32_t *__restrict__ C, int N, int rows, uint8_t *__restrict__ out, long long *__restrict__ top) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= rows) return;
+    long long c = 0;
+    for (int l = 0; l < N; l++) {
+        c += C[(size_t)j * N + l];
+        out[(size_t)j * N + l] = (uint8_t)(c & 255); c >>= 8;   // arithmetic shift: floor division, so c & 255 is the digit
+    }
+    top[j] = c;
+}
+
 }  // namespace oz
