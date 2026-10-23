@@ -29,7 +29,7 @@ $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.855~s at $n=8192$, $499
 \texttt{\_\_float128} LU on all 24 CPU threads of the same laptop and with an error as small; at $\kappa=10^{36}$, where FP64
 and double-double have no correct digit, a triple-double LU on the GPU is $32\times$ faster than the same arithmetic on 24 CPU
 threads and $145\times$ faster than MPFR, and is the most accurate of the three. Counting CPU and GPU power, a double-double
-solve uses $\sim$270$\times$ less energy than the quad-precision CPU solve. The laptop is power-bound ($\sim$95~W) under these
+solve uses $\sim$270$\times$ less energy than the quad-precision CPU solve. Leaving 8-bit moduli for primes below $2^{16}$ and $2^{23}$ split into bytes, an \emph{exact} product of integer matrices with entries of 1\,015 to 131\,063 bits costs work linear in the bits, is bit-exact against GMP, and runs $10$--$19\times$ faster than FLINT's multimodular \texttt{fmpz\_mat\_mul} on 24 CPU threads, with $15$--$18\times$ less energy. The laptop is power-bound ($\sim$95~W) under these
 kernels, which shapes what can and cannot be gained.
 \end{abstract}
 
@@ -38,7 +38,7 @@ tensor core-t INT8 janë qindra herë më të shpejtë. Mbi një GPU Blackwell l
 FP64 ($517\times$). Me skemën Ozaki~II (prodhime të sakta të mbetjeve dhe teorema kineze e mbetjeve) ndërtuam shumëzim
 matricash me saktësi FP64, double-double, triple-double dhe arbitrare (deri 424 bit) nga të njëjtat njësi INT8. Te një punë
 reale---$Ax=b$ me $\kappa=10^{20}$---zgjidhja double-double mbaron $499\times$ më shpejt se LU \texttt{\_\_float128} mbi 24 fije
-CPU, me gabim po aq të vogël, dhe me $\sim$270$\times$ më pak energji.
+CPU, me gabim po aq të vogël, dhe me $\sim$270$\times$ më pak energji. Me prime nën $2^{16}$ e $2^{23}$ të ndara në bajte, shumëzimi i \emph{saktë} i matricave me numra të plotë 1\,015--131\,063 bitësh del bit për bit i saktë, $10$--$19\times$ më shpejt se FLINT dhe me $15$--$18\times$ më pak energji.
 
 \section{Introduction}
 The FP64 units of consumer and laptop GPUs are a small fraction of the chip: on our laptop Blackwell part a peak kernel
@@ -191,6 +191,40 @@ At $n\le1024$ a well-vectorized triple-double LU on 24 cores keeps up; the gap o
 tensor-core GEMMs. At $n=4096$ the panels take 0.38~s of the 0.563~s (leaves 0.14~s): the panel, not the GEMM, is now the
 limit.
 
+\section{Thousands of bits, exactly: linear in the bits}\label{sec:big}
+The 49 moduli $\le 256$ cap one Ozaki-II product at $\sim$160-bit inputs, and slicing beyond that costs a number of GEMMs that
+grows with the square of the slices. For wide integers we leave 8-bit moduli: the moduli are primes $p<65\,280$, and each
+balanced residue ($|r|<p/2$) is split into two signed bytes, $r=256h+\ell$. Then $AB \bmod p$ is four exact INT8 GEMMs
+($hh$, $h\ell$, $\ell h$, $\ell\ell$) recombined in 64-bit integers, so \emph{the GEMM work grows linearly with the number of
+bits}. Above $\sim$60\,000 bits of the CRT modulus the residues take three bytes and the primes run up to $2^{23}$ (nine
+products per prime, $\sim$23 bits each). The two conversions are INT8 GEMMs as well, as conversions to and from a residue
+number system are matrix products: the residues are the balanced byte digits of each entry times the bytes of
+$2^{8j} \bmod p$; for the CRT, $t_\ell = r_\ell\,(M/p_\ell)^{-1} \bmod p_\ell$ (bytes) times the bytes of $M/p_\ell$ gives the digits
+of $x+qM$, with $q=\operatorname{round}(\sum_\ell t_\ell/p_\ell)$ from doubles, and $qM$ is taken off while the digits are
+carried. Everything runs on the tensor cores (\texttt{src/ozaki\_big.cuh}, \texttt{bench/big\_test.cu}).
+
+Every product is exact: 256 sampled elements per run agree bit for bit with GMP. The baselines compute the same exact product
+on all 24 CPU threads: GMP inner products (\texttt{mpz\_addmul}), and FLINT's \texttt{fmpz\_mat\_mul}, which is itself
+multimodular with BLAS-style kernels and is the strongest baseline we know of.
+\begin{center}\begin{tabular}{rrrrrrr}\toprule
+entry bits & $n$ & primes (bytes) & GPU & GMP & FLINT & GPU vs FLINT \\\midrule
+1\,015 & 1024 & 192 (2) & 71 ms & 23.0 s & 1.31 s & $18\times$ \\
+4\,087 & 512 & 576 (2) & 62 ms & 16.4 s & 1.07 s & $17\times$ \\
+16\,375 & 256 & 2\,112 (2) & 90 ms & 14.0 s & 1.69 s & $19\times$ \\
+32\,759 & 256 & 4\,352 (2) & 316 ms & 36.1 s & 4.56 s & $14\times$ \\
+65\,527 & 128 & 5\,760 (3) & 313 ms & 10.6 s & 3.45 s & $11\times$ \\
+131\,063 & 128 & 11\,520 (3) & 983 ms & 29.6 s & 9.76 s & $10\times$ \\\bottomrule
+\end{tabular}\end{center}
+GMP times are measured on a corner of the outputs ($96^2$, or $48^2$ above 8\,000 bits) and scaled; FLINT runs the full
+product. The largest entries have $\sim$39\,450 decimal digits. Energy per exact product (RAPL package + \texttt{nvidia-smi},
+both chips counted in both columns): 1\,015 bits, $n=1024$: 8.6~J on the GPU path against 131~J for FLINT ($15\times$);
+16\,375 bits, $n=256$: 7.9~J against 142~J ($18\times$).
+
+The ratio to FLINT falls slowly beyond $\sim$16\,000 bits ($19\times\to10\times$) because the conversions are $n^2P^2$ work
+for $P$-bit entries while the products are $n^3P$: at $n=128$ the conversions dominate. The way past that crossover is a
+subquadratic conversion (a two-level residue system), which we leave for the next version. For scale: one part in a googol
+($10^{-100}$) is $\sim$333 bits, already inside the 424-bit format of the previous section.
+
 \section{Energy}\label{sec:energy}
 Under these kernels the laptop holds $\sim$95~W and the SM clock drops to $\sim$1.8~GHz (2.76~GHz with only the FP64 units busy).
 For GEMM at $n=4096$ (\texttt{bench/energy.cu}, power every 200~ms): native FP64 7.4~GFLOPS/W, Ozaki-II at 16 moduli 53.6
@@ -216,14 +250,14 @@ All measurements are on one laptop model; the CPU references use the same machin
 Ozaki scheme~II~\cite{ozaki2} emulates FP64 GEMM with INT8 and the CRT and reports 7.4--9.8~TFLOPS on an RTX~4090; RIKEN's GEMMul8
 is its public code. Follow-up work covers SGEMM and power efficiency on an RTX~5080~\cite{ozaki2sgemm}, FP8 and FP4
 variants~\cite{fp8,fp4a,fp4b}, fused kernels reaching 81\% of INT8 peak on Blackwell~\cite{emugemm} and complex
-GEMM~\cite{cgemm}. Ozaki-II mentions an extension beyond FP64 as possible; we found no implementation or measurement of a
+GEMM~\cite{cgemm}. Multimodular exact integer matrix multiplication is classical (FLINT; conversions to and from a residue system written as matrix products by Doliskani, Giorgi, Lebreton and Schost~\cite{dgls}); what is new here is running it, conversions included, on INT8 tensor cores with byte-split residues. Ozaki-II mentions an extension beyond FP64 as possible; we found no implementation or measurement of a
 double-double or wider GEMM built this way, nor of linear solves at these condition numbers on this class of hardware.
 \emph{(References to be re-checked at their source before submission.)}
 
 \section{Conclusion}
 On a laptop GPU whose FP64 units are 517 times slower than its INT8 tensor cores, precision becomes a software parameter:
 the same INT8 GEMMs yield FP64, double-double, triple-double and wider products, and an ill-conditioned dense solve that needs
-quad precision finishes $499\times$ sooner than on the laptop's own CPU, with $\sim$270$\times$ less energy. The next steps are
+quad precision finishes $499\times$ sooner than on the laptop's own CPU, with $\sim$270$\times$ less energy. Exact integer products of up to 131\,063-bit entries come from the same units, $10$--$19\times$ faster than FLINT. The next steps are
 the panel (now the bound of the triple-double solve), CUDA graphs for its launches, and out-of-core sizes beyond the GPU's 12~GB.
 
 \begin{thebibliography}{9}
@@ -235,5 +269,6 @@ multiplication using an integer modular technique. arXiv:2504.08009 (title to be
 \bibitem{fp4b} arXiv:2609.24519 (FP4 limbs; title to be verified).
 \bibitem{emugemm} arXiv:2606.25453 (EmuGEMM, fused kernels on Blackwell; title to be verified).
 \bibitem{cgemm} arXiv:2512.08321 (complex GEMM by the CRT; title to be verified).
+\bibitem{dgls} J.~Doliskani, P.~Giorgi, R.~Lebreton, \'E.~Schost. Simultaneous conversions with the residue number system using linear algebra. ACM TOMS (2018; to be verified).
 \end{thebibliography}
 \end{document}
