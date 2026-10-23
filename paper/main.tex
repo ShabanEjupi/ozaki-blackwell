@@ -29,7 +29,7 @@ $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.855~s at $n=8192$, $499
 \texttt{\_\_float128} LU on all 24 CPU threads of the same laptop and with an error as small; at $\kappa=10^{36}$, where FP64
 and double-double have no correct digit, a triple-double LU on the GPU is $32\times$ faster than the same arithmetic on 24 CPU
 threads and $145\times$ faster than MPFR, and is the most accurate of the three. Counting CPU and GPU power, a double-double
-solve uses $\sim$270$\times$ less energy than the quad-precision CPU solve. Leaving 8-bit moduli for primes below $2^{16}$ and $2^{23}$ split into bytes, an \emph{exact} product of integer matrices with entries of 1\,015 to 131\,063 bits costs work linear in the bits, is bit-exact against GMP, and runs $10$--$19\times$ faster than FLINT's multimodular \texttt{fmpz\_mat\_mul} on 24 CPU threads, with $15$--$18\times$ less energy. The laptop is power-bound ($\sim$95~W) under these
+solve uses $\sim$270$\times$ less energy than the quad-precision CPU solve. Leaving 8-bit moduli for primes below $2^{16}$ and $2^{23}$ split into bytes, an \emph{exact} product of integer matrices with entries of 1\,015 to 131\,063 bits costs work linear in the bits, is bit-exact against GMP, and runs $10$--$19\times$ faster than FLINT's multimodular \texttt{fmpz\_mat\_mul} on 24 CPU threads, with $15$--$18\times$ less energy. Turning the problem around---int8 in, residues out---the exact determinant of an int8 matrix comes $224\times$ sooner than FLINT at $n=4096$ and $355\times$ at $n=8192$ (98\,139 bits), with a proved bound on $|\det A|$ tight to one bit, and $n=16\,384$ (204\,480 bits) takes 66~s. The laptop is power-bound ($\sim$95~W) under these
 kernels, which shapes what can and cannot be gained.
 \end{abstract}
 
@@ -38,7 +38,7 @@ tensor core-t INT8 janë qindra herë më të shpejtë. Mbi një GPU Blackwell l
 FP64 ($517\times$). Me skemën Ozaki~II (prodhime të sakta të mbetjeve dhe teorema kineze e mbetjeve) ndërtuam shumëzim
 matricash me saktësi FP64, double-double, triple-double dhe arbitrare (deri 424 bit) nga të njëjtat njësi INT8. Te një punë
 reale---$Ax=b$ me $\kappa=10^{20}$---zgjidhja double-double mbaron $499\times$ më shpejt se LU \texttt{\_\_float128} mbi 24 fije
-CPU, me gabim po aq të vogël, dhe me $\sim$270$\times$ më pak energji. Me prime nën $2^{16}$ e $2^{23}$ të ndara në bajte, shumëzimi i \emph{saktë} i matricave me numra të plotë 1\,015--131\,063 bitësh del bit për bit i saktë, $10$--$19\times$ më shpejt se FLINT dhe me $15$--$18\times$ më pak energji.
+CPU, me gabim po aq të vogël, dhe me $\sim$270$\times$ më pak energji. Me prime nën $2^{16}$ e $2^{23}$ të ndara në bajte, shumëzimi i \emph{saktë} i matricave me numra të plotë 1\,015--131\,063 bitësh del bit për bit i saktë, $10$--$19\times$ më shpejt se FLINT dhe me $15$--$18\times$ më pak energji. Përcaktori i saktë i një matrice int8 del $224\times$ më shpejt se FLINT te $n=4096$ dhe $355\times$ te $n=8192$, me një kufi të provuar të ngushtë brenda një biti.
 
 \section{Introduction}
 The FP64 units of consumer and laptop GPUs are a small fraction of the chip: on our laptop Blackwell part a peak kernel
@@ -262,16 +262,22 @@ that is how tight the bound is, never whether it holds. Measured: 47\,021 bits a
 \texttt{fmpz\_mat\_det\_modular} takes 347~s at $n=2048$, $177\times$ our all-primes LU with the same algorithm.
 \begin{center}\begin{tabular}{rrrrrr}\toprule
 $n$ & $|\det A|$ bits & GPU, all primes & GPU, lifting + bound & FLINT \texttt{fmpz\_mat\_det} & vs FLINT \\\midrule
-1\,024 & 10\,736 & 0.24 s & 0.069 s & 3.07 s & $45\times$ \\
-2\,048 & 22\,485 & 1.96 s & 0.273 s & 28.3 s & $104\times$ \\
-4\,096 & 47\,021 & 21.3 s & 2.35 s & 282 s & $120\times$ \\
-8\,192 & 98\,139 & --- & 13.1 s & (running) & \\\bottomrule
+1\,024 & 10\,736 & 0.25 s & 0.073 s & 2.89 s & $40\times$ \\
+2\,048 & 22\,485 & 1.96 s & 0.293 s & 24.9 s & $85\times$ \\
+4\,096 & 47\,021 & 21.3 s & 1.15 s & 257 s & $224\times$ \\
+8\,192 & 98\,139 & --- & 8.05 s & 2\,861 s & $355\times$ \\
+16\,384 & 204\,480 & --- & 65.9 s & --- & \\\bottomrule
 \end{tabular}\end{center}
-The exact rational solution of $Ax=b$ (same lifting; all $n$ entries back to integers with Horner by halves on the CPU; one
-common denominator) takes 1.58~s at $n=4096$ (192.6~Mbit of numerators) and 8.4~s at $n=8192$ (804~Mbit). At $n=1024$ it is
-$20\times$ FLINT's \texttt{fmpz\_mat\_solve\_dixon\_den}. At $n=8192$ the lifting is the cost: 13\,013 steps, each reading
-$A^{-1}$ (16 bits per entry) and $A$, at $\sim$415~GB/s, the memory bandwidth of the laptop. That limit is physical for
-digit-by-digit lifting; moving past it needs a lifting built on matrix products (Storjohann's high-order lifting), which is the next step.
+At $n=8192$ FLINT ran while some GPU runs shared the CPU; the leading digits agree, and $n=8192, 16\,384$ are also checked
+modulo four primes used nowhere else. The exact rational solution of $Ax=b$ (same lifting; all $n$ entries back to
+integers by Horner in halves on 24 threads; one common denominator) is bit-exact against FLINT's
+\texttt{fmpz\_mat\_solve\_dixon\_den}: 0.064~s against 2.33~s at $n=1024$ ($36\times$), 0.145~s against 18.9~s at $n=2048$
+($130\times$), 1.62~s against 145~s at $n=4096$ ($90\times$, 192.6~Mbit of numerators), and 7.5~s at $n=8192$ (804~Mbit).
+Energy per determinant at $n=2048$, both chips counted: $\sim$40~J on the GPU path (process start-up included; $\sim$23~J for the
+computation alone) against $\sim$2\,030~J for FLINT, $\sim$50$\times$ less. At $n=8192$ the lifting is the cost: 13\,013 steps,
+each reading $A^{-1}$ (16 bits per entry) and $A$, at $\sim$100\% of the read bandwidth we measure on this GPU ($\sim$410~GB/s).
+That limit is physical for digit-by-digit lifting; moving past it needs lifting built on matrix products (Storjohann's
+high-order lifting), the next step.
 \section{Energy}\label{sec:energy}
 Under these kernels the laptop holds $\sim$95~W and the SM clock drops to $\sim$1.8~GHz (2.76~GHz with only the FP64 units busy).
 For GEMM at $n=4096$ (\texttt{bench/energy.cu}, power every 200~ms): native FP64 7.4~GFLOPS/W, Ozaki-II at 16 moduli 53.6
@@ -304,7 +310,7 @@ double-double or wider GEMM built this way, nor of linear solves at these condit
 \section{Conclusion}
 On a laptop GPU whose FP64 units are 517 times slower than its INT8 tensor cores, precision becomes a software parameter:
 the same INT8 GEMMs yield FP64, double-double, triple-double and wider products, and an ill-conditioned dense solve that needs
-quad precision finishes $499\times$ sooner than on the laptop's own CPU, with $\sim$270$\times$ less energy. Exact integer products of up to 131\,063-bit entries come from the same units, $10$--$19\times$ faster than FLINT. The next steps are
+quad precision finishes $499\times$ sooner than on the laptop's own CPU, with $\sim$270$\times$ less energy. Exact integer products of up to 131\,063-bit entries come from the same units, $10$--$19\times$ faster than FLINT. Exact determinants and exact rational solutions of int8 systems, where no big number has to enter the GPU, come 0-\times than FLINT. The next steps are
 the panel (now the bound of the triple-double solve), CUDA graphs for its launches, and out-of-core sizes beyond the GPU's 12~GB.
 
 \begin{thebibliography}{9}
