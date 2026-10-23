@@ -212,7 +212,7 @@ entry bits & $n$ & primes (bytes) & GPU & GMP & FLINT & GPU vs FLINT \\\midrule
 4\,087 & 512 & 576 (2) & 62 ms & 16.4 s & 1.07 s & $17\times$ \\
 16\,375 & 256 & 2\,112 (2) & 90 ms & 14.0 s & 1.69 s & $19\times$ \\
 4\,087 & 1024 & 640 (2) & 341 ms & 125 s & 6.10 s & $18\times$ \\
-16\,375 & 512 & 2\,176 (2) & 417 ms & 104 s & 6.33 s & $15\times$ \\
+16\,375 & 512 & 2\,112 (2) & 363 ms & 104 s & 6.33 s & $17\times$ \\
 32\,759 & 256 & 4\,352 (2) & 316 ms & 36.1 s & 4.56 s & $14\times$ \\
 65\,527 & 128 & 5\,760 (3) & 313 ms & 10.6 s & 3.45 s & $11\times$ \\
 131\,063 & 128 & 11\,520 (3) & 983 ms & 29.6 s & 9.76 s & $10\times$ \\\bottomrule
@@ -222,7 +222,7 @@ product. The largest entries have $\sim$39\,450 decimal digits. Energy per exact
 both chips counted in both columns): 1\,015 bits, $n=1024$: 8.6~J on the GPU path against 131~J for FLINT ($15\times$);
 16\,375 bits, $n=256$: 7.9~J against 142~J ($18\times$).
 
-Doubling $n$ at fixed width does not raise the ratio either (16\,375 bits: $19\times$ at $n=256$, $15\times$ at $n=512$): even at $n=512$ the conversion GEMMs ($\sim 1.9\cdot10^{13}$ INT8 operations) dwarf the 8\,704 product GEMMs ($\sim 2.3\cdot10^{12}$). The ratio to FLINT falls slowly beyond $\sim$16\,000 bits ($19\times\to10\times$) because the conversions are $n^2P^2$ work
+Doubling $n$ at fixed width does not raise the ratio either (16\,375 bits: $19\times$ at $n=256$, $17\times$ at $n=512$): even at $n=512$ the conversion GEMMs ($\sim 1.9\cdot10^{13}$ INT8 operations) dwarf the 8\,704 product GEMMs ($\sim 2.3\cdot10^{12}$). The ratio to FLINT falls slowly beyond $\sim$16\,000 bits ($19\times\to10\times$) because the conversions are $n^2P^2$ work
 for $P$-bit entries while the products are $n^3P$: at $n=128$ the conversions dominate. The way past that crossover is a
 subquadratic conversion (a two-level residue system), which we leave for the next version. For scale: one part in a googol
 ($10^{-100}$) is $\sim$333 bits, already inside the 424-bit format of the previous section.
