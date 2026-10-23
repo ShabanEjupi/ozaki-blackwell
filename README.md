@@ -273,31 +273,61 @@ Të dy çipat numërohen te të dyja kolonat.
 
 The GPU runs at its ~95 W cap; the host thread that feeds it costs ~20 W of CPU package.
 
-## Exact integer determinant / Përcaktori i saktë (`src/ozaki_det.cuh`, `bench/det.cu`)
+## Exact integer determinant and exact Ax = b / Përcaktori dhe zgjidhja e saktë (`src/ozaki_det.cuh`, `src/ozaki_detbound.cuh`, `bench/det.cu`)
 
-The big-integer GEMM above stops scaling near 131 000 bits because its two conversions are n²·P² GEMMs. Here the
-problem is turned around so the conversions disappear: the input is int8, the output one residue per prime, and the only
-big-number work is one scalar CRT on the host. Each LU mod p runs without pivoting (a prime with a vanishing leading minor,
-probability ~n/p, is dropped). It is a recursive LU (Toledo) whose every O(n³) step is a byte-split INT8 GEMM:
-X W = [Xlo Xhi][Wlo; Vlo] + 256 [Xlo Xhi][Whi; Vhi] (mod p), V = 256 W mod p. The 64 × 64 diagonal blocks are inverted
-in shared memory.
+The big-integer GEMM above stops scaling near 131 000 bits because its two conversions are n²·P² GEMMs. Here the problem
+is turned around so the conversions disappear: the input is int8, the output one residue per prime (or a vector of
+p-adic digits), and the big-number work is a few scalar or vector steps on the host.
 
-Method 1 changes what is computed: A⁻¹ mod p comes from the LU of [A I], Dixon lifting of x = A⁻¹b runs on the GPU (per step one
-16-bit A⁻¹ matvec and one int8 residual matvec, both memory-bound), rational reconstruction of 4 entries (GMP) gives
-d | det, and det / d needs only the primes for Hadamard / d. The result is proved, not probabilistic. Random int8 entries in
-[-127, 127], 24 CPU threads for FLINT 3.0.1:
+- **LU mod thousands of primes** (method 0): recursive LU (Toledo) without pivoting for a batch of primes < 65 280 at
+  once; every O(n³) step is X W mod p = [Xlo Xhi][Wlo; Vlo] + 256 [Xlo Xhi][Whi; Vhi], V = 256 W mod p: two INT8 GEMMs of
+  depth 2K, one reduction in the epilogue. 64 × 64 diagonal blocks are inverted in shared memory. A prime with a vanishing
+  leading minor (~n/p) is dropped. Structured matrices (a zero leading minor over Z) get U·A·L with random unit triangular
+  U, L, entries in [0, 127] (Kaltofen–Saunders), the same residues for every prime.
+- **Divisor by lifting** (method 1): A⁻¹ mod p from the LU of [A I]; Dixon lifting on the GPU (per step one 16-bit A⁻¹
+  matvec + one int8 residual matvec); rational reconstruction of 4 entries (GMP) gives d | det; det / d from a few primes.
+- **A proved bound tight to one bit** (`ozaki_detbound.cuh`, n ≥ 4096): Hadamard leaves ~0.72 n bits of slack on a random
+  matrix (5 900 at n = 8192 = hundreds of primes for det / d). FP32 LU with pivoting (cuSOLVER) → integer triangular
+  X_L = round(2^s L⁻¹), X_U = round(2^s U⁻¹ diag(u)) (determinants = products of diagonals, exactly); B = X_L·PA·X_U
+  **exactly** (the same modular INT8 GEMMs, int64 operands reduced while packing, Garner to 128 bits); Hadamard on B with
+  upward rounding. Floating point decides only how tight it is, never whether it holds. Measured: 47 021 vs |det| 47 021
+  bits (n = 4096), 98 140 vs 98 139 (8192), 204 491 vs 204 480 (16 384). It runs on its own thread and stream, overlapping
+  the lifting. In spirit close to Ogita's verified determinants.
+- **Exact rational solve** (method 2): the same lifting, all n entries to integers (Horner by halves, 24 threads), one
+  common denominator.
 
-| n | \|det\| bits | GPU method 0 (all primes) | GPU method 1 (lifting) | FLINT `fmpz_mat_det` | vs FLINT |
+Random int8 entries in [-127, 127]; FLINT 3.0.1 on 24 CPU threads; CPU idle during every FLINT run unless noted.
+
+| n | \|det\| bits | GPU method 0 (all primes) | **GPU method 1** | FLINT `fmpz_mat_det` | vs FLINT |
 |---|---|---|---|---|---|
-| 1 024 | 10 736 | 0.24 s | **0.069 s** | 3.07 s | **45×** |
-| 2 048 | 22 485 | 1.96 s | **0.273 s** | 28.3 s | **104×** |
-| 4 096 | 47 021 | 21.3 s | **2.35 s** | 282 s | **120×** |
-| 8 192 | 98 139 | — (beyond the primes < 65 280) | **24.4 s** | not run (~40 min by n³) | |
+| 1 024 | 10 736 | 0.25 s | **0.073 s** | 2.89 s | **40×** |
+| 2 048 | 22 485 | 1.96–2.4 s | **0.293 s** | 24.9 s | **85×** |
+| 4 096 | 47 021 | 21.3 s | **1.15 s** | 257 s | **224×** |
+| 8 192 | 98 139 | — (primes < 65 280 run out) | **8.05 s** | 2 861 s ¹ | **355×** |
+| 16 384 | 204 480 | — | **65.9 s** | not run (~6 h by n³) | |
 
-All bit-exact against FLINT. `fmpz_mat_det` is already FLINT's accelerated path (Dixon divisor + modular). Its plain
-multimodular `fmpz_mat_det_modular` takes 347 s at n = 2048, which is 177× method 0 with the same algorithm. At n = 8192
-the time goes to det / d (18 s, 496 primes): Hadamard overestimates |det| by ~6 000 bits, and that slack, not d, sets the prime count.
+¹ while the GPU runs of this table shared the CPU now and then; the leading hex digits agree (`4d609fe9397eb725`).
+All rows bit-exact against FLINT; n = 8192 and 16 384 also checked modulo 4 primes used nowhere else (`OZ_CHECK=1`).
+`fmpz_mat_det` is already FLINT's accelerated path (a Dixon divisor, then primes); its plain multimodular
+`fmpz_mat_det_modular` takes 347 s at n = 2048 (177× method 0, the same algorithm).
 
-**SQ** — Problemi u kthye përmbys: asnjë konvertim numrash të mëdhenj, vetëm një CRT skalar. Metoda 1: A⁻¹ mod p, ngritja
-p-adike te GPU-ja, rindërtimi racional jep d | det, pastaj pak prime për det/d. n = 4096: 2,35 s kundrejt 282 s të FLINT-it (120×),
-saktë bit për bit.
+| exact Ax = b, n | numerators (all) | GPU method 2 | FLINT `fmpz_mat_solve_dixon_den` | vs FLINT |
+|---|---|---|---|---|
+| 1 024 | 11.0 Mbit | **0.064 s** | 2.33 s | **36×** |
+| 2 048 | 46.0 Mbit | **0.145 s** | 18.9 s | **130×** |
+| 4 096 | 192.6 Mbit | **1.62 s** | 145 s | **90×** |
+| 8 192 | 804 Mbit | **7.52 s** | not run | |
+
+Energy per determinant, n = 2048 (`bench/energy_det_host.sh`: RAPL package from Windows 1 s, nvidia-smi 100 ms, both
+chips in both columns): 20 GPU determinants in 11.05 s, process start-up included, at 53.7 W GPU + 19.5 W CPU =
+**~40 J each** (~23 J counting only the 0.31 s of computation); FLINT 25.9 s at 72.1 W CPU + 6.5 W GPU = **~2 030 J**:
+**~50× less energy** (~90× for the computation alone).
+
+Where the time goes at n = 8192: lifting 6.9 s = 13 013 steps reading A⁻¹ (16 bit) and A (8 bit), at ~100 % of the
+measured read bandwidth (~410 GB/s, `cudaMemcpy`/read kernel). That limit is physical for digit-by-digit lifting; the way
+past it is lifting by matrix products (Storjohann's high-order lifting), the next step.
+
+**SQ** — Problemi u kthye përmbys: asnjë konvertim numrash të mëdhenj. Ngritja p-adike te GPU-ja jep d | det, një kufi i
+provuar (i ngushtë brenda 1 biti) e lë det/d me 6 prime. n = 4096: 1,15 s kundrejt 257 s të FLINT-it (224×); n = 8192:
+8,05 s kundrejt 2 861 s (355×); n = 16 384: përcaktor 204 480 bit në 66 s. Zgjidhja e saktë racionale e Ax = b: deri 130×
+FLINT. Energjia: ~50× më pak. Saktë bit për bit.

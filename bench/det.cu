@@ -328,7 +328,8 @@ int main(int argc, char **argv) {
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) { printf("CUDA: %s\n", cudaGetErrorString(err)); return 1; }
     if (oz::det_prof.on) printf("prof: diag %.3f s  pack %.3f s  gemm %.3f s\n", oz::det_prof.t[0], oz::det_prof.t[1], oz::det_prof.t[2]);
-    printf("n=%d method %d  Hadamard %.0f bits  |det| %zu bits  total %.3f s", n, method, hb, mpz_sizeinbase(D, 2), total);
+    { char *hx = mpz_get_str(nullptr, 16, D); printf("n=%d method %d  head %.16s", n, method, hx); free(hx); }
+    printf("  Hadamard %.0f bits  |det| %zu bits  total %.3f s", hb, mpz_sizeinbase(D, 2), total);
     if (method) printf("  [A^-1 %.3f  lift %zu steps %.3f  ratrec %.3f (d %ld bits)  bound %.0f bits (%d primes) %.3f, waited %.3f  det/d: %zu primes %.3f]",
                        t_inv, steps, t_lift, t_rr, dbits, ub, bprimes, t_bth, t_bound, nprimes, t_mod - t_bound);
     else printf("  [%zu primes, %d good]", nprimes, good);
