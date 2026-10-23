@@ -242,6 +242,12 @@ del i saktë bit për bit kundrejt GMP-së.
 | 32 759 | 256 | 4 352 | **316 ms** | 36.1 s (114×) | 4.56 s | **14×** |
 | 65 527 | 128 | 5 760 (3 bytes) | **313 ms** | 10.6 s (34×) | 3.45 s | **11×** |
 | 131 063 | 128 | 11 520 (3 bytes) | **983 ms** | 29.6 s (30×) | 9.76 s | **10×** |
+| 4 087 | 1024 | 640 | **341 ms** | 125 s (368×) | 6.10 s | **18×** |
+| 16 375 | 512 | 2 176 | **417 ms** | 104 s (250×) | 6.33 s | **15×** |
+
+Doubling n at fixed bits does not raise the ratio (16 375 bits: 19× at n = 256, 15× at n = 512): even there the two
+conversion GEMMs (~1.9·10¹³ INT8 ops at 16 375 bits, n = 512) dwarf the 8 704 product GEMMs (~2.3·10¹² ops). The conversions
+are the whole remaining cost; a two-level residue system (subquadratic in P) is the next step.
 
 Above ~60 000 bits of M the residues take three bytes and the primes run up to 2^23 (9 product GEMMs per prime, ~23 bits
 each): 131 063-bit entries (~39 450 decimal digits) are still bit-exact. The ratio to FLINT falls slowly (19× → 10×) because
