@@ -258,10 +258,10 @@ that is how tight the bound is, never whether it holds. Measured: 47\,021 bits a
 98\,140 against 98\,139 at $n=8192$. $\det A/d$ then needs 6 primes instead of 224 and 496.
 
 \paragraph{Results.} Random int8 matrices, FLINT~3.0.1 on all 24 CPU threads; every result bit-exact against FLINT.
-\texttt{fmpz\_mat\_det} is already FLINT's accelerated path (a Dixon divisor, then primes). Its plain multimodular
+FLINT's \texttt{fmpz\_mat\_det} is already its accelerated path (a Dixon divisor, then primes). Its plain multimodular
 \texttt{fmpz\_mat\_det\_modular} takes 347~s at $n=2048$, $177\times$ our all-primes LU with the same algorithm.
-\begin{center}\begin{tabular}{rrrrrr}\toprule
-$n$ & $|\det A|$ bits & GPU, all primes & GPU, lifting + bound & FLINT \texttt{fmpz\_mat\_det} & vs FLINT \\\midrule
+\begin{center}\small\begin{tabular}{rrrrrr}\toprule
+$n$ & $|\det A|$ bits & GPU, all primes & GPU, lifting + bound & FLINT & vs FLINT \\\midrule
 1\,024 & 10\,736 & 0.25 s & 0.073 s & 2.89 s & $40\times$ \\
 2\,048 & 22\,485 & 1.96 s & 0.293 s & 24.9 s & $85\times$ \\
 4\,096 & 47\,021 & 21.3 s & 1.15 s & 257 s & $224\times$ \\
