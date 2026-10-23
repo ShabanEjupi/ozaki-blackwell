@@ -21,9 +21,9 @@ int main(int argc, char **argv) {
     std::vector<char> comp(65280, 0); std::vector<uint32_t> pr;   // primes downwards from 65279
     for (int i = 2; i < 65280; i++) if (!comp[i]) for (int k = 2 * i; k < 65280; k += i) comp[k] = 1;
     double lb = 0; const double need = hb + 2;   // the sign, and a bit of slack
-    for (int i = 65279; i > 2 && lb < need * 1.02 + 16 * 16; i--) if (!comp[i]) { pr.push_back(i); lb += log2((double)i); }
+    for (int i = 65279; i > 2 && lb < need * (1.0 + 2.5 * n / 65000.0) + 256; i--) if (!comp[i]) { pr.push_back(i); lb += log2((double)i); }
     if (lb < need) { printf("n=%d needs %.0f bits, the primes < 65280 give %.0f\n", n, need, lb); return 1; }
-    while (pr.size() % Pb) pr.pop_back();
+    for (int i = (int)pr.back() - 1; pr.size() % Pb && i > 2; i--) if (!comp[i]) pr.push_back(i);   // fill the last batch
 
     int8_t *dA; cudaMalloc(&dA, A.size()); cudaMemcpy(dA, A.data(), A.size(), cudaMemcpyHostToDevice);
     oz::DetWork w; w.alloc(n, Pb);
@@ -56,6 +56,7 @@ int main(int argc, char **argv) {
     }
     mpz_fdiv_q_2exp(t, M, 1); if (mpz_cmp(x, t) > 0) mpz_sub(x, x, M);
     double crt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (oz::det_prof.on) printf("prof: diag %.3f s  pack %.3f s  gemm %.3f s\n", oz::det_prof.t[0], oz::det_prof.t[1], oz::det_prof.t[2]);
     printf("n=%d  Hadamard %.0f bits  primes %zu (%d good, %.0f bits)  GPU %.3f s  CRT %.3f s  |det| %zu bits\n", n, hb,
            pr.size(), good, gb, ms / 1e3, crt, mpz_sizeinbase(x, 2));
     if (gb < need) { printf("NOT ENOUGH GOOD PRIMES\n"); return 1; }
