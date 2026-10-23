@@ -227,6 +227,51 @@ for $P$-bit entries while the products are $n^3P$: at $n=128$ the conversions do
 subquadratic conversion (a two-level residue system), which we leave for the next version. For scale: one part in a googol
 ($10^{-100}$) is $\sim$333 bits, already inside the 424-bit format of the previous section.
 
+
+\section{Changing the problem: exact determinants and exact solutions}\label{sec:det}
+The ratio of the previous section falls with the bits because large numbers must enter and leave the residue system. Many
+exact computations produce huge numbers from small inputs: the determinant of an $n\times n$ int8 matrix has $\sim$0.72 bits per
+row less than Hadamard's bound, about 47\,000 bits at $n=4096$, and the rational solution of $Ax=b$ has $n$ numerators of that
+size. There the conversions vanish: the input is int8, each prime returns one residue (or a vector of digits), and the only
+big-number step is on the host (\texttt{src/ozaki\_det.cuh}, \texttt{bench/det.cu}).
+
+\paragraph{LU modulo thousands of primes.} For primes $p<65\,280$ and residues $X, W$, with $X=X_\ell+256X_h$ in balanced bytes and
+$V=256W \bmod p$, $XW \equiv [X_\ell\,X_h][W_\ell;V_\ell] + 256\,[X_\ell\,X_h][W_h;V_h] \pmod p$: two INT8 GEMMs of depth $2K$,
+reduced once in the epilogue. A recursive LU (Toledo) without pivoting runs for a batch of primes at once, every $O(n^3)$ step
+such a product. Its 64-column leaves invert their $64\times64$ diagonal blocks in shared memory. A prime with a vanishing
+leading minor (probability $\sim n/p$) is dropped. Structured matrices, whose leading minors vanish over $\mathbb Z$, are
+preconditioned as $UAL$ with random unit triangular $U, L$ (Kaltofen--Saunders) whose entries in $[0,127]$ are the same residues for every prime.
+
+\paragraph{A divisor by $p$-adic lifting.} (The divisor-then-primes hybrid is classical on CPUs~\cite{pan}; FLINT uses it.) $A^{-1}\bmod p$ comes from the LU of $[A\;I]$. Dixon lifting runs on the GPU, one
+16-bit and one int8 matrix--vector product per step: $x_i=A^{-1}r_i \bmod p$, $r_{i+1}=(r_i-Ax_i)/p$. Rational reconstruction of a
+few entries of $x=A^{-1}b$ gives $d$, which divides $\det A$ and for random $b$ is almost always the largest invariant factor.
+Then $\det A/d$ needs only enough primes to exceed a bound on $|\det A|/d$.
+
+\paragraph{A proved bound tight to one bit.} Hadamard's bound leaves $\sim0.72n$ bits of slack on a random matrix (5\,900 at
+$n=8192$), i.e.\ hundreds of primes for $\det A/d$. We replace it by a certificate in the spirit of Ogita's verified
+determinants~\cite{ogita}. FP32 LU with partial pivoting gives $PA\approx LU$. $X_L=\lfloor2^sL^{-1}\rceil$ (unit diagonal,
+so exactly $2^s$) and $X_U=\lfloor2^sU^{-1}\operatorname{diag}(u)\rceil$ are integer triangular matrices, so their determinants
+are products of their diagonals. $B=X_L\,PA\,X_U$ is computed \emph{exactly} (the same modular INT8 GEMMs, int64 operands
+reduced while packing, Garner to 128 bits), and Hadamard's inequality on $B$, accumulated with upward rounding, bounds
+$|\det A| = |\det B|/(2^{sn}\,|\det X_U|)$. Floating point only decides how close $B$ is to $2^{2s}\operatorname{diag}(u)$,
+that is how tight the bound is, never whether it holds. Measured: 47\,021 bits against $|\det A|$ of 47\,021 bits at $n=4096$,
+98\,140 against 98\,139 at $n=8192$. $\det A/d$ then needs 6 primes instead of 224 and 496.
+
+\paragraph{Results.} Random int8 matrices, FLINT~3.0.1 on all 24 CPU threads; every result bit-exact against FLINT.
+\texttt{fmpz\_mat\_det} is already FLINT's accelerated path (a Dixon divisor, then primes). Its plain multimodular
+\texttt{fmpz\_mat\_det\_modular} takes 347~s at $n=2048$, $177\times$ our all-primes LU with the same algorithm.
+\begin{center}\begin{tabular}{rrrrrr}\toprule
+$n$ & $|\det A|$ bits & GPU, all primes & GPU, lifting + bound & FLINT \texttt{fmpz\_mat\_det} & vs FLINT \\\midrule
+1\,024 & 10\,736 & 0.24 s & 0.069 s & 3.07 s & $45\times$ \\
+2\,048 & 22\,485 & 1.96 s & 0.273 s & 28.3 s & $104\times$ \\
+4\,096 & 47\,021 & 21.3 s & 2.35 s & 282 s & $120\times$ \\
+8\,192 & 98\,139 & --- & 13.1 s & (running) & \\\bottomrule
+\end{tabular}\end{center}
+The exact rational solution of $Ax=b$ (same lifting; all $n$ entries back to integers with Horner by halves on the CPU; one
+common denominator) takes 1.58~s at $n=4096$ (192.6~Mbit of numerators) and 8.4~s at $n=8192$ (804~Mbit). At $n=1024$ it is
+$20\times$ FLINT's \texttt{fmpz\_mat\_solve\_dixon\_den}. At $n=8192$ the lifting is the cost: 13\,013 steps, each reading
+$A^{-1}$ (16 bits per entry) and $A$, at $\sim$415~GB/s, the memory bandwidth of the laptop. That limit is physical for
+digit-by-digit lifting; moving past it needs a lifting built on matrix products (Storjohann's high-order lifting), which is the next step.
 \section{Energy}\label{sec:energy}
 Under these kernels the laptop holds $\sim$95~W and the SM clock drops to $\sim$1.8~GHz (2.76~GHz with only the FP64 units busy).
 For GEMM at $n=4096$ (\texttt{bench/energy.cu}, power every 200~ms): native FP64 7.4~GFLOPS/W, Ozaki-II at 16 moduli 53.6
@@ -275,5 +320,7 @@ multiplication using an integer modular technique. arXiv:2504.08009 (title to be
 \bibitem{ozamx} arXiv:2609.27831 (Ozaki scheme II is fast on CPUs too: multiple-precision matrix multiplication on Intel AMX-INT8 and Arm SVE2-i8mm; to be verified).
 \bibitem{vdhm} J.~van der Hoeven, M.~Mezzarobba. Integer matrix multiplication at various precisions using AMX and IFMA (preprint, 2026; texmacs.org/joris/amx; to be verified).
 \bibitem{bglm} J.~Berthomieu, S.~Graillat, D.~Lesnoff, T.~Mary. Modular matrix multiplication over large finite fields in floating point, CPU and GPU. arXiv:2601.07508 (to be verified).
+\bibitem{ogita} T.~Ogita. Accurate and verified numerical computation of the matrix determinant. Int.~J.\ Reliability and Safety 6 (2012) 242--254 (also an exact determinant of integer matrices; to be read in full).
+\bibitem{pan} B.~D.~Saunders, Z.~Wan and others. Towards an exact adaptive algorithm for the determinant of a rational matrix. arXiv:0706.0014 (the Dixon-divisor-then-primes hybrid on CPUs; authors to be verified).
 \end{thebibliography}
 \end{document}
