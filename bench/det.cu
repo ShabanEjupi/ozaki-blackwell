@@ -106,7 +106,7 @@ int main(int argc, char **argv) {
         // 1. A^-1 mod p from the LU of [A I]
         oz::DetWork w; w.alloc(n, 1, 2 * n);
         uint32_t p = 0; size_t pi = 0;
-        for (; pi < all.size(); pi++) {
+        for (; pi < 8; pi++) {   // 8 primes failing = a leading minor that vanishes over Z (or det 0): needs preconditioning
             uint32_t one = 1; int zero = 0; p = all[pi];
             cudaMemcpy(w.P, &p, 4, cudaMemcpyHostToDevice); cudaMemcpy(w.det, &one, 4, cudaMemcpyHostToDevice);
             cudaMemcpy(w.bad, &zero, 4, cudaMemcpyHostToDevice);
@@ -114,6 +114,7 @@ int main(int argc, char **argv) {
             int bad; cudaMemcpy(&bad, w.bad, 4, cudaMemcpyDeviceToHost);
             if (!bad) break;
         }
+        if (pi == 8) { printf("n=%d: no LU without pivoting for 8 primes (singular or a zero leading minor); not handled yet\n", n); return 2; }
         uint16_t *Ai; cudaMalloc(&Ai, (size_t)n * n * 2);
         oz::to_u16<<<1024, 256>>>(w.R, w.ld, n, n, Ai);
         cudaDeviceSynchronize(); w.free_(); t_inv = now() - t0;
