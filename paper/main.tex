@@ -252,7 +252,7 @@ All measurements are on one laptop model; the CPU references use the same machin
 Ozaki scheme~II~\cite{ozaki2} emulates FP64 GEMM with INT8 and the CRT and reports 7.4--9.8~TFLOPS on an RTX~4090; RIKEN's GEMMul8
 is its public code. Follow-up work covers SGEMM and power efficiency on an RTX~5080~\cite{ozaki2sgemm}, FP8 and FP4
 variants~\cite{fp8,fp4a,fp4b}, fused kernels reaching 81\% of INT8 peak on Blackwell~\cite{emugemm} and complex
-GEMM~\cite{cgemm}. Multimodular exact integer matrix multiplication is classical (FLINT; conversions to and from a residue system written as matrix products by Doliskani, Giorgi, Lebreton and Schost~\cite{dgls}); what is new here is running it, conversions included, on INT8 tensor cores with byte-split residues. Ozaki-II mentions an extension beyond FP64 as possible; we found no implementation or measurement of a
+GEMM~\cite{cgemm}. Multimodular exact integer matrix multiplication is classical (FLINT; conversions to and from a residue system written as matrix products by Doliskani, Giorgi, Lebreton and Schost~\cite{dgls}); Close in spirit: Ozaki-II for multiple-precision GEMM on CPU INT8 units (AMX, SVE2-i8mm)~\cite{ozamx}; integer matrix products at various precisions on AMX and IFMA by van der Hoeven and Mezzarobba~\cite{vdhm}; modular products over large prime fields on GPUs by Berthomieu, Graillat, Lesnoff and Mary~\cite{bglm}; EmuGEMM already fuses the modular reduction into the GEMM epilogue~\cite{emugemm}. What we have not found is exact integer GEMM of $10^3$--$10^5$-bit entries on GPU INT8 tensor cores, conversions included, measured against FLINT (to be confirmed by reading these works in full). what is new here is running it, conversions included, on INT8 tensor cores with byte-split residues. Ozaki-II mentions an extension beyond FP64 as possible; we found no implementation or measurement of a
 double-double or wider GEMM built this way, nor of linear solves at these condition numbers on this class of hardware.
 \emph{(References to be re-checked at their source before submission.)}
 
@@ -272,5 +272,8 @@ multiplication using an integer modular technique. arXiv:2504.08009 (title to be
 \bibitem{emugemm} arXiv:2606.25453 (EmuGEMM, fused kernels on Blackwell; title to be verified).
 \bibitem{cgemm} arXiv:2512.08321 (complex GEMM by the CRT; title to be verified).
 \bibitem{dgls} J.~Doliskani, P.~Giorgi, R.~Lebreton, \'E.~Schost. Simultaneous conversions with the residue number system using linear algebra. ACM TOMS (2018; to be verified).
+\bibitem{ozamx} arXiv:2609.27831 (Ozaki scheme II is fast on CPUs too: multiple-precision matrix multiplication on Intel AMX-INT8 and Arm SVE2-i8mm; to be verified).
+\bibitem{vdhm} J.~van der Hoeven, M.~Mezzarobba. Integer matrix multiplication at various precisions using AMX and IFMA (preprint, 2026; texmacs.org/joris/amx; to be verified).
+\bibitem{bglm} J.~Berthomieu, S.~Graillat, D.~Lesnoff, T.~Mary. Modular matrix multiplication over large finite fields in floating point, CPU and GPU. arXiv:2601.07508 (to be verified).
 \end{thebibliography}
 \end{document}
