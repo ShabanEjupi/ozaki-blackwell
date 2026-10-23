@@ -1,7 +1,8 @@
 // ozaki_big.cuh -- exact big-integer GEMM C = A B (entries of thousands of bits) on INT8 tensor cores, linear in the bits.
 // The 49 moduli <= 256 cap Ozaki-II at ~160-bit inputs and slicing beyond that costs ~S^2 GEMMs. Here the moduli are
-// primes < 65280 (thousands of them, ~70 000 bits of M): a balanced residue r (|r| < 32640) is split into two bytes,
-// r = 256 h + l, and A B mod p is four INT8 GEMMs (hh, hl, lh, ll). The number of primes grows linearly with the bits,
+// primes < 65280: a balanced residue r (|r| < 32640) is split into two bytes, r = 256 h + l, and A B mod p is four INT8
+// GEMMs (hh, hl, lh, ll); above ~60 000 bits of M, three bytes and primes < 2^23 (nine GEMMs per prime, ~23 bits each).
+// The number of primes grows linearly with the bits,
 // so the GEMM work does too, while a CPU multiplying the entries pays M(P) per product (Karatsuba / Toom).
 // The two conversions are INT8 GEMMs as well (conversions as matrix products, as in Doliskani-Giorgi-Lebreton-Schost):
 //   residues: digits x_j (balanced bytes) times c_(l,j) = 2^(8 j) mod p_l (split in two bytes) -> r_l
@@ -208,7 +209,8 @@ inline void big_residues(BigPlan &b, const unsigned *X, int rows, int cols, bool
 // C = A B exactly: A M x K, B K x N, NL limbs per entry in; NA limbs per entry out (two's complement)
 inline void biggemm(BigPlan &b, const unsigned *A, const unsigned *B, unsigned *C) {
     static const bool prof = getenv("OZ_PROF");
-    cudaEvent_t ev[5]; if (prof) for (auto &x : ev) { cudaEventCreate(&x); } if (prof) cudaEventRecord(ev[0]);
+    static cudaEvent_t ev[4];
+    if (prof) { if (!ev[0]) for (auto &x : ev) cudaEventCreate(&x); cudaEventRecord(ev[0]); }
     size_t pa = (size_t)b.Mp * b.Kp, pb = (size_t)b.Np * b.Kp, pc = (size_t)b.Mp * b.Np;
     big_residues(b, A, b.M, b.K, false, b.Ar, pa);
     big_residues(b, B, b.N, b.K, true, b.Br, pb);   // B^T: N x K
