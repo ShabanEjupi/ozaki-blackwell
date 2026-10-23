@@ -27,9 +27,9 @@ __device__ __forceinline__ void load_tile(int8_t *s, const int8_t *g, int ld, in
     }
 }
 
-__global__ void __launch_bounds__(THREADS) gemm_i8(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt,
-                                                    int32_t *__restrict__ C, int M, int N, int K) {
-    A += (size_t)blockIdx.z * M * K; Bt += (size_t)blockIdx.z * N * K; C += (size_t)blockIdx.z * M * N;   // z = modulus: one launch for all planes
+// the block's 128 x 128 tile of A Bt; epi(row, col, c00, c01, c10, c11) gets (row, col..col+1) and (row + 8, col..col+1)
+template <class Epi>
+__device__ __forceinline__ void gemm_i8_tile(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int K, Epi epi) {
     __shared__ __align__(128) int8_t sA[STAGES][BM * BK], sB[STAGES][BN * BK];   // 3 x 16 KB = the 48 KB static limit
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = (warp >> 2) * 64, wn = (warp & 3) * 32;   // this warp's corner inside the block tile
@@ -91,9 +91,17 @@ __global__ void __launch_bounds__(THREADS) gemm_i8(const int8_t *__restrict__ A,
 #pragma unroll
         for (int nj = 0; nj < 4; nj++) {
             int row = blockIdx.y * BM + wm + mi * 16 + g, col = blockIdx.x * BN + wn + nj * 8 + q * 2;
-            *(int2 *)&C[(size_t)row * N + col] = make_int2(acc[mi][nj][0], acc[mi][nj][1]);
-            *(int2 *)&C[(size_t)(row + 8) * N + col] = make_int2(acc[mi][nj][2], acc[mi][nj][3]);
+            epi(row, col, acc[mi][nj][0], acc[mi][nj][1], acc[mi][nj][2], acc[mi][nj][3]);
         }
+}
+
+__global__ void __launch_bounds__(THREADS) gemm_i8(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt,
+                                                    int32_t *__restrict__ C, int M, int N, int K) {
+    A += (size_t)blockIdx.z * M * K; Bt += (size_t)blockIdx.z * N * K; C += (size_t)blockIdx.z * M * N;   // z = modulus: one launch for all planes
+    gemm_i8_tile(A, Bt, K, [&](int row, int col, int c00, int c01, int c10, int c11) {
+        *(int2 *)&C[(size_t)row * N + col] = make_int2(c00, c01);
+        *(int2 *)&C[(size_t)(row + 8) * N + col] = make_int2(c10, c11);
+    });
 }
 
 }  // namespace oz

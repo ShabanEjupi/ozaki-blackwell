@@ -71,6 +71,28 @@ __host__ __device__ __forceinline__ void bsplit(int r, int NB, int *d) {
     d[NB - 1] = r;
 }
 
+// row of byte a of prime l in the residue weights: for NB = 2 a prime's two rows are rows g and g + 8 of one m16 tile, so
+// one thread of the GEMM's epilogue holds both sums; NB = 3 keeps a L + l
+__host__ __device__ __forceinline__ int big_wrow(int NB, int L, int a, int l) { return NB == 2 ? 16 * (l / 8) + l % 8 + 8 * a : a * L + l; }
+
+// NB = 2 residues straight from the GEMM's accumulators: W [2L][Kr] (big_wrow order) times the digit rows of Xd
+__global__ void __launch_bounds__(THREADS) big_res_fused(const int8_t *W, const int8_t *Xd, int Kr, size_t rows, int L, const int *p,
+                                                         int cols, int Kp, size_t plane, int8_t *P) {
+    gemm_i8_tile(W, Xd, Kr, [&](int row, int col, int lo0, int lo1, int hi0, int hi1) {
+        const int l = row / 16 * 8 + row % 16, pl = p[l];   // row % 16 < 8: the lo row; row + 8 is the hi row
+        const int lo[2] = {lo0, lo1}, hi[2] = {hi0, hi1};
+#pragma unroll
+        for (int c = 0; c < 2; c++) {
+            size_t g = (size_t)col + c;
+            if (g >= rows) continue;
+            int d[3]; bsplit(bal((long long)hi[c] * 256 + lo[c], pl), 2, d);
+            size_t pos = g / cols * Kp + g % cols;
+            P[(size_t)l * plane + pos] = (int8_t)d[0];
+            P[((size_t)L + l) * plane + pos] = (int8_t)d[1];
+        }
+    });
+}
+
 // R [NB L][ldr] (byte a of the weights in rows a L ..: the residue GEMM runs transposed so that one prime's row is contiguous)
 // -> balanced residues split into byte planes, element r0 + e = (i, k) at i Kp + k
 __global__ void big_res_out(const int32_t *R, size_t ldr, size_t r0, size_t rows, int L, int NB, const int *p, int cols, int Kp,
@@ -78,7 +100,7 @@ __global__ void big_res_out(const int32_t *R, size_t ldr, size_t r0, size_t rows
     size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; int l = blockIdx.y;
     if (e >= rows) return;
     long long v = 0;
-    for (int a = NB - 1; a >= 0; a--) v = v * 256 + R[((size_t)a * L + l) * ldr + e];
+    for (int a = NB - 1; a >= 0; a--) v = v * 256 + R[(size_t)big_wrow(NB, L, a, l) * ldr + e];
     int d[3]; bsplit(bal(v, p[l]), NB, d);
     size_t g = r0 + e, pos = g / cols * Kp + g % cols;
     for (int a = 0; a < NB; a++) P[((size_t)a * L + l) * plane + pos] = (int8_t)d[a];
@@ -137,7 +159,7 @@ inline BigPlan big_plan(int M, int N, int K, int NL) {
     const int top = b.NB == 2 ? 65280 : 1 << 23;
     std::vector<char> comp(top, 0);
     for (int i = 2; (long long)i * i < top; i++) if (!comp[i]) for (int j = i * i; j < top; j += i) comp[j] = 1;
-    for (int x = top - 1; x > 255 && (have < need || b.p.size() % 128); x--) if (!comp[x]) { b.p.push_back(x); have += log2((double)x); }
+    for (int x = top - 1; x > 255 && (have < need || b.p.size() % (b.NB == 2 ? 64 : 128)); x--) if (!comp[x]) { b.p.push_back(x); have += log2((double)x); }
     if (have < need) { fprintf(stderr, "big: %d-bit entries need more primes than there are below %d\n", 32 * NL, top); abort(); }
     if ((double)b.NB * b.p.size() * 16384 >= 2147483648.0) { fprintf(stderr, "big: the CRT GEMM's int32 sums would overflow\n"); abort(); }
     b.L = (int)b.p.size(); b.Kc = b.NB * b.L; b.Kr = (4 * NL + BK - 1) / BK * BK;
@@ -165,7 +187,7 @@ inline BigPlan big_plan(int M, int N, int K, int NL) {
         for (int j = 0; j < 4 * NL; j++) {   // 2^(8 j) mod p, balanced, NB bytes
             int r = (int)c > p / 2 ? (int)c - p : (int)c, d[3];
             bsplit(r, b.NB, d);
-            for (int a = 0; a < b.NB; a++) br[((size_t)a * b.L + l) * b.Kr + j] = (int8_t)d[a];
+            for (int a = 0; a < b.NB; a++) br[(size_t)big_wrow(b.NB, b.L, a, l) * b.Kr + j] = (int8_t)d[a];
             c = c * 256 % p;
         }
     }
@@ -198,6 +220,11 @@ inline void big_release(BigPlan &b) {
 inline void big_residues(BigPlan &b, const unsigned *X, int rows, int cols, bool trans, int8_t *P, size_t plane) {
     size_t n = (size_t)rows * cols;
     big_digits<<<(n + 63) / 64, 64>>>(X, b.NL, b.Kr, rows, cols, trans, b.Xd);
+    if (b.NB == 2 && !getenv("OZ_UNFUSED")) {   // the reduction in the GEMM's epilogue: no int32 matrix in memory
+        size_t np = (n + BN - 1) / BN * BN;
+        big_res_fused<<<dim3(np / BN, b.Kc / BM), THREADS>>>(b.Bres, b.Xd, b.Kr, n, b.L, b.dp, cols, b.Kp, plane, P);
+        return;
+    }
     size_t rc = std::max<size_t>(BN, b.cg_elems / (size_t)b.Kc / BN * BN);
     for (size_t r0 = 0; r0 < n; r0 += rc) {
         size_t m = std::min(rc, n - r0), mp = (m + BN - 1) / BN * BN;

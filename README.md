@@ -243,10 +243,12 @@ del i saktë bit për bit kundrejt GMP-së.
 | 65 527 | 128 | 5 760 (3 bytes) | **313 ms** | 10.6 s (34×) | 3.45 s | **11×** |
 | 131 063 | 128 | 11 520 (3 bytes) | **983 ms** | 29.6 s (30×) | 9.76 s | **10×** |
 | 4 087 | 1024 | 640 | **341 ms** | 125 s (368×) | 6.10 s | **18×** |
-| 16 375 | 512 | 2 176 | **417 ms** | 104 s (250×) | 6.33 s | **15×** |
+| 16 375 | 512 | 2 112 | **363 ms** (residues fused, below) | 104 s (287×) | 6.33 s | **17×** |
 
 Doubling n at fixed bits does not raise the ratio (16 375 bits: 19× at n = 256, 15× at n = 512): even there the two
-conversion GEMMs (~1.9·10¹³ INT8 ops at 16 375 bits, n = 512) dwarf the 8 704 product GEMMs (~2.3·10¹² ops). The conversions
+conversion GEMMs (~1.9·10¹³ INT8 ops at 16 375 bits, n = 512) dwarf the 8 704 product GEMMs (~2.3·10¹² ops). With the residue reduction fused into the GEMM epilogue (a prime's two weight rows are rows g and g + 8 of one m16 tile, so
+one thread holds both sums and no int32 matrix goes to memory; `OZ_UNFUSED=1` turns it off): 16 375 bits, n = 512
+403 → 363 ms; 1 015 bits, n = 1024 83 → 73 ms (the GPU is power-bound; runs vary by ~5 %). The conversions
 are the whole remaining cost; a two-level residue system (subquadratic in P) is the next step.
 
 Above ~60 000 bits of M the residues take three bytes and the primes run up to 2^23 (9 product GEMMs per prime, ~23 bits
