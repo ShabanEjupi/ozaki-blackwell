@@ -20,9 +20,12 @@ double flint_det(int n, const int8_t *A, int threads, long *bits, std::string *h
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 // det mod the primes pr (a multiple of Pb of them), bad ones flagged
+static const int32_t *gU = nullptr, *gL = nullptr;   // the preconditioner, once it is needed
+
 static void det_mod_primes(int n, int Pb, const int8_t *dA, const std::vector<uint32_t> &pr, std::vector<uint32_t> &det,
                            std::vector<int> &bad) {
     oz::DetWork w; w.alloc(n, Pb);
+    w.preU = gU; w.preL = gL;
     det.resize(pr.size()); bad.resize(pr.size());
     std::vector<uint32_t> one(Pb, 1); std::vector<int> zero(Pb, 0);
     for (size_t b = 0; b < pr.size(); b += Pb) {
@@ -65,9 +68,22 @@ static bool ratrec(mpz_t num, mpz_t den, const mpz_t X, const mpz_t Q, long nb, 
 
 int main(int argc, char **argv) {
     const int n = atoi(argv[1]), Pb = argc > 2 ? atoi(argv[2]) : 32, cmp = argc > 3 ? atoi(argv[3]) : 1,
-              method = argc > 4 ? atoi(argv[4]) : 1;
+              method = argc > 4 ? atoi(argv[4]) : 1, kind = argc > 5 ? atoi(argv[5]) : 0;
     std::vector<int8_t> A((size_t)n * n); uint64_t s = 12345;   // the same LCG as det_flint.cpp's main
     for (auto &a : A) { s = s * 6364136223846793005ull + 1442695040888963407ull; a = (int8_t)((s >> 33) % 255 - 127); }
+    if (kind == 1) A[0] = 0;                                                         // a zero 1 x 1 leading minor
+    if (kind == 2) for (int k = 0; k < n; k++) A[(size_t)(n - 1) * n + k] = A[k];   // singular: last row = first row
+    // U unit upper, L unit lower, entries in [0, 127] off the diagonal: the same residues for every prime
+    auto make_pre = [&] {
+        std::vector<int32_t> U((size_t)n * n, 0), L((size_t)n * n, 0); uint64_t q = 999;
+        for (int i = 0; i < n; i++) for (int k = 0; k < n; k++) {
+            q = q * 6364136223846793005ull + 1442695040888963407ull; int v = (int)((q >> 33) % 128);
+            if (i < k) U[(size_t)i * n + k] = v; else if (i > k) L[(size_t)i * n + k] = v; else U[(size_t)i * n + k] = L[(size_t)i * n + k] = 1;
+        }
+        int32_t *dU, *dL; cudaMalloc(&dU, U.size() * 4); cudaMalloc(&dL, L.size() * 4);
+        cudaMemcpy(dU, U.data(), U.size() * 4, cudaMemcpyHostToDevice); cudaMemcpy(dL, L.data(), L.size() * 4, cudaMemcpyHostToDevice);
+        gU = dU; gL = dL;
+    };
 
     double hr = 0, hc = 0, cmin = 1e300;   // Hadamard over rows and over columns: log2 |det| <= min of the two
     std::vector<double> cn(n, 0);
@@ -98,7 +114,14 @@ int main(int argc, char **argv) {
 
     if (method == 0) {
         std::vector<uint32_t> pr = take(0, hb + 2), det; std::vector<int> bad, use;
-        det_mod_primes(n, Pb, dA, pr, det, bad); cudaDeviceSynchronize(); t_mod = now() - t0;
+        det_mod_primes(n, Pb, dA, pr, det, bad);
+        int nbad = 0; for (int b : bad) nbad += b;
+        if (nbad > (int)pr.size() / 2) {
+            make_pre(); det_mod_primes(n, Pb, dA, pr, det, bad);
+            nbad = 0; for (int b : bad) nbad += b;
+            if (nbad > (int)pr.size() / 2) { printf("n=%d: det = 0 (most preconditioned primes fail; probabilistic)\n", n); return 0; }
+        }
+        cudaDeviceSynchronize(); t_mod = now() - t0;
         for (int b : bad) { use.push_back(!b); good += !b; }
         gb = crt(D, pr, det, use); nprimes = pr.size();
         if (gb < hb + 2) { printf("NOT ENOUGH GOOD PRIMES\n"); return 1; }
@@ -106,7 +129,10 @@ int main(int argc, char **argv) {
         // 1. A^-1 mod p from the LU of [A I]
         oz::DetWork w; w.alloc(n, 1, 2 * n);
         uint32_t p = 0; size_t pi = 0;
-        for (; pi < 8; pi++) {   // 8 primes failing = a leading minor that vanishes over Z (or det 0): needs preconditioning
+        bool singular = false;
+        for (;; pi++) {   // 4 plain primes failing = a zero leading minor over Z, or det 0: precondition and try 8 more
+            if (pi == 4 && !gU) { make_pre(); w.preU = gU; w.preL = gL; }
+            if (pi == 12) { singular = true; break; }
             uint32_t one = 1; int zero = 0; p = all[pi];
             cudaMemcpy(w.P, &p, 4, cudaMemcpyHostToDevice); cudaMemcpy(w.det, &one, 4, cudaMemcpyHostToDevice);
             cudaMemcpy(w.bad, &zero, 4, cudaMemcpyHostToDevice);
@@ -114,7 +140,11 @@ int main(int argc, char **argv) {
             int bad; cudaMemcpy(&bad, w.bad, 4, cudaMemcpyDeviceToHost);
             if (!bad) break;
         }
-        if (pi == 8) { printf("n=%d: no LU without pivoting for 8 primes (singular or a zero leading minor); not handled yet\n", n); return 2; }
+        if (singular) {   // Monte Carlo, not proved: U A L had a zero pivot modulo 8 primes
+            printf("n=%d: det = 0 (8 preconditioned primes all fail; probabilistic)\n", n);
+            if (cmp) { long fb; std::string fh; flint_det(n, A.data(), 24, &fb, &fh); printf("  FLINT: %s\n", fh.c_str()); }
+            return 0;
+        }
         uint16_t *Ai; cudaMalloc(&Ai, (size_t)n * n * 2);
         oz::to_u16<<<1024, 256>>>(w.R, w.ld, n, n, Ai);
         cudaDeviceSynchronize(); w.free_(); t_inv = now() - t0;

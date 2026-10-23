@@ -150,11 +150,12 @@ __global__ void __launch_bounds__(256) diag_inv(const int32_t *__restrict__ R, s
 struct DetWork {
     int n, ld, Pb;
     int32_t *R, *Linv, *Uinv;   // R: Pb n ld; Linv, Uinv: Pb (n/64) 64^2, one per diagonal block
+    const int32_t *preU = nullptr, *preL = nullptr;   // unit upper / lower n x n, entries in [0, 127]: det(U A L) = det A
     int8_t *Ap, *B1, *B2;
     uint32_t *P, *det; int *bad;
     void alloc(int n_, int Pb_, int ld_ = 0) {
         n = n_; ld = ld_ ? ld_ : n_; Pb = Pb_;
-        size_t pk = (size_t)Pb * (ld + BM) * std::max(n, 2 * DB);   // M or N padded, times 2K with K <= n/2
+        size_t pk = (size_t)Pb * (ld + BM) * 2 * std::max(n, DB);   // M or N padded, times 2K with K <= n (the preconditioner)
         cudaMalloc(&R, (size_t)Pb * n * ld * 4); cudaMalloc(&Linv, (size_t)Pb * n * DB * 4); cudaMalloc(&Uinv, (size_t)Pb * n * DB * 4);
         cudaMalloc(&Ap, pk); cudaMalloc(&B1, pk); cudaMalloc(&B2, pk);
         cudaMalloc(&P, Pb * 4); cudaMalloc(&det, Pb * 4); cudaMalloc(&bad, Pb * 4);
@@ -235,9 +236,22 @@ inline void det_lu(DetWork &w, int j, int wd) {
 // det(A) mod each of the Pb primes (n % 64 == 0); results in w.det, bad primes flagged in w.bad.
 // With ld = 2n, R[:, n:2n] ends as A^-1 mod p.
 inline void det_mod_batch(DetWork &w, const int8_t *dA) {
-    det_init<<<dim3(256, w.Pb), 256>>>(dA, w.R, w.n, w.ld, w.P);
-    det_lu(w, 0, w.n);
-    if (w.ld == 2 * w.n) { det_trsm(w, 0, w.n, w.n, w.n); det_trsm_up(w, 0, w.n, w.n, w.n); }
+    const int n = w.n;
+    det_init<<<dim3(256, w.Pb), 256>>>(dA, w.R, n, w.ld, w.P);
+    // A zero leading minor over Z (a structured matrix) fails every prime without pivoting; U A L has generic rank profile
+    // with high probability (Kaltofen-Saunders). The entries are the same small integers for every prime, so zw = 0.
+    if (w.preU) {
+        mod_xw<false>(w, w.at(0, 0), w.zr(), w.ld, w.preL, 0, n, n, n, n, 0, 0);
+        mod_xw<false>(w, w.preU, 0, n, w.at(0, 0), w.zr(), w.ld, n, n, n, 0, 0);
+    }
+    det_lu(w, 0, n);
+    if (w.ld == 2 * n) {
+        det_trsm(w, 0, n, n, n); det_trsm_up(w, 0, n, n, n);
+        if (w.preU) {   // (U A L)^-1 = L^-1 A^-1 U^-1, so A^-1 = L (U A L)^-1 U
+            mod_xw<false>(w, w.at(0, n), w.zr(), w.ld, w.preU, 0, n, n, n, n, 0, n);
+            mod_xw<false>(w, w.preL, 0, n, w.at(0, n), w.zr(), w.ld, n, n, n, 0, n);
+        }
+    }
 }
 
 // Dixon p-adic lifting with A^-1 mod p: digit x_i = A^-1 r_i mod p, then r_{i+1} = (r_i - A x_i) / p exactly.
