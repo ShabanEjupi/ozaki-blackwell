@@ -1,5 +1,5 @@
 // det.cu -- exact determinant of an n x n int8 matrix on INT8 tensor cores (src/ozaki_det.cuh) against FLINT fmpz_mat_det.
-// g++ -O3 -c bench/det_flint.cpp -o out_dflint.o && nvcc -O3 -arch=sm_120 -std=c++17 -Xcompiler -fopenmp -o out_det bench/det.cu out_dflint.o -lflint -lgmp -lgomp -lcusolver -lcublas
+// g++ -O3 -c bench/det_flint.cpp -o out_dflint.o && nvcc -O3 -arch=sm_120 -std=c++17 --default-stream per-thread -Xcompiler -fopenmp -o out_det bench/det.cu out_dflint.o -lflint -lgmp -lgomp -lcusolver -lcublas
 // ./out_det n [primes per batch=32] [flint: 1 compare, 0 skip] [method: 0 multimodular, 1 divisor by p-adic lifting]
 //
 // Method 0: det mod every prime up to the Hadamard bound, one CRT.
@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <string>
+#include <thread>
 #include <vector>
 #include <gmp.h>
 #include "../src/ozaki_det.cuh"
@@ -112,7 +113,8 @@ int main(int argc, char **argv) {
     int8_t *dA; cudaMalloc(&dA, A.size()); cudaMemcpy(dA, A.data(), A.size(), cudaMemcpyHostToDevice);
     mpz_t D; mpz_init(D);
     const double t0 = now();
-    double t_inv = 0, t_lift = 0, t_rr = 0, t_mod = 0, t_bound = 0, gb = 0, ub = hb; int bprimes = 0;
+    double t_inv = 0, t_lift = 0, t_rr = 0, t_mod = 0, t_bound = 0, gb = 0, ub = hb, t_bth = 0; int bprimes = 0;
+    std::thread bth;
     long dbits = 0; int good = 0; size_t nprimes = 0, steps = 0;
 
     if (method == 0) {
@@ -129,6 +131,9 @@ int main(int argc, char **argv) {
         gb = crt(D, pr, det, use); nprimes = pr.size();
         if (gb < hb + 2) { printf("NOT ENOUGH GOOD PRIMES\n"); return 1; }
     } else {
+        // 0. the proved bound on log2 |det| (step 4 needs it) on its own thread and stream, overlapping steps 1-3
+        if (method == 1 && !getenv("OZ_HADAMARD") && (n >= 4096 || getenv("OZ_BOUND")))
+            bth = std::thread([&] { const double tb = now(); ub = std::min(hb, oz::det_log2_bound(n, dA, 20, &bprimes)); t_bth = now() - tb; });
         // 1. A^-1 mod p from the LU of [A I]
         oz::DetWork w; w.alloc(n, 1, 2 * n);
         uint32_t p = 0; size_t pi = 0;
@@ -144,6 +149,7 @@ int main(int argc, char **argv) {
             if (!bad) break;
         }
         if (singular) {   // Monte Carlo, not proved: U A L had a zero pivot modulo 8 primes
+            if (bth.joinable()) bth.join();
             printf("n=%d: det = 0 (8 preconditioned primes all fail; probabilistic)\n", n);
             if (cmp) { long fb; std::string fh; flint_det(n, A.data(), 24, &fb, &fh); printf("  FLINT: %s\n", fh.c_str()); }
             return 0;
@@ -297,8 +303,8 @@ int main(int argc, char **argv) {
         // 4. c = det / d from as many primes as the bound / d needs: |c| < 2^(ub - dbits + 1). ub: the proved bound of
         // src/ozaki_detbound.cuh (a few bits above log2 |det|), or Hadamard (below n = 4096, where cuSOLVER's ~0.3 s setup costs more than the primes it saves; OZ_HADAMARD=1; or FP32 LU finds A singular)
         const double t3 = now();
-        if (!getenv("OZ_HADAMARD") && (n >= 4096 || getenv("OZ_BOUND"))) ub = std::min(hb, oz::det_log2_bound(n, A.data(), 20, &bprimes));
-        t_bound = now() - t3;
+        if (bth.joinable()) bth.join();
+        t_bound = now() - t3;   // the wait for the bound thread; t_bth is its own time
         const double need_c = ub - dbits + 3;
         const int bc = std::min(Pb, (int)ceil(need_c / 15.9) + 2);
         std::vector<uint32_t> pr = take(0, need_c, bc), det; std::vector<int> bad, use;
@@ -318,8 +324,8 @@ int main(int argc, char **argv) {
     if (err != cudaSuccess) { printf("CUDA: %s\n", cudaGetErrorString(err)); return 1; }
     if (oz::det_prof.on) printf("prof: diag %.3f s  pack %.3f s  gemm %.3f s\n", oz::det_prof.t[0], oz::det_prof.t[1], oz::det_prof.t[2]);
     printf("n=%d method %d  Hadamard %.0f bits  |det| %zu bits  total %.3f s", n, method, hb, mpz_sizeinbase(D, 2), total);
-    if (method) printf("  [A^-1 %.3f  lift %zu steps %.3f  ratrec %.3f (d %ld bits)  bound %.0f bits (%d primes) %.3f  det/d: %zu primes %.3f]",
-                       t_inv, steps, t_lift, t_rr, dbits, ub, bprimes, t_bound, nprimes, t_mod - t_bound);
+    if (method) printf("  [A^-1 %.3f  lift %zu steps %.3f  ratrec %.3f (d %ld bits)  bound %.0f bits (%d primes) %.3f, waited %.3f  det/d: %zu primes %.3f]",
+                       t_inv, steps, t_lift, t_rr, dbits, ub, bprimes, t_bth, t_bound, nprimes, t_mod - t_bound);
     else printf("  [%zu primes, %d good]", nprimes, good);
     printf("\n");
     if (cmp) {

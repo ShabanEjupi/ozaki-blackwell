@@ -24,12 +24,31 @@ __global__ void bound_build_x(const float *__restrict__ LU, const float *__restr
     }
 }
 // rows of X_L and columns of X_U: their L1 norms (rounded up) bound |B_ij| <= |X_L[i]|_1 127 |X_U[:,j]|_1
-__global__ void bound_l1(const long long *__restrict__ XL, const long long *__restrict__ XU, int n, double *rl, double *cu) {
+__global__ void bound_l1(const long long *__restrict__ XL, const long long *__restrict__ XU, int n, double *rl, double *cu,
+                         long long *du) {
+    const int lane = threadIdx.x & 31, w = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (w < n) {   // a warp per row of X_L (coalesced)
+        double a = 0;
+        for (int k = lane; k <= w; k += 32) a = __dadd_ru(a, __ll2double_ru(llabs(XL[(size_t)w * n + k])));
+        for (int o = 16; o; o >>= 1) a = __dadd_ru(a, __shfl_xor_sync(0xffffffffu, a, o));
+        if (lane == 0) rl[w] = a;
+    }
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= n) return;
-    double a = 0, b = 0;
-    for (int k = 0; k <= t; k++) { a = __dadd_ru(a, __ll2double_ru(llabs(XL[(size_t)t * n + k]))); b = __dadd_ru(b, __ll2double_ru(llabs(XU[(size_t)k * n + t]))); }
-    rl[t] = a; cu[t] = b;
+    if (t < n) {   // a thread per column of X_U (rows read across threads: coalesced)
+        double b = 0;
+        for (int k = 0; k <= t; k++) b = __dadd_ru(b, __ll2double_ru(llabs(XU[(size_t)k * n + t])));
+        cu[t] = b; du[t] = XU[(size_t)t * n + t];
+    }
+}
+__global__ void bound_prep(const int8_t *__restrict__ A, int n, float *__restrict__ LU, float *__restrict__ Li, float *__restrict__ Ui) {
+    for (size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; e < (size_t)n * n; e += (size_t)gridDim.x * blockDim.x) {
+        const int i = e % n, k = e / n;   // column-major (i, k)
+        LU[e] = A[(size_t)i * n + k]; Li[e] = Ui[e] = i == k;
+    }
+}
+__global__ void bound_rows_perm(const int8_t *__restrict__ A, const int *__restrict__ ord, int n, int8_t *__restrict__ PA) {
+    for (size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; e < (size_t)n * n; e += (size_t)gridDim.x * blockDim.x)
+        PA[e] = A[(size_t)ord[e / n] * n + e % n];
 }
 
 struct Garner { int P; uint32_t q[7]; uint32_t inv[7][7]; unsigned long long pre_lo[8], pre_hi[8]; };   // pre = prod_{t<k} q_t
@@ -60,39 +79,48 @@ __global__ void __launch_bounds__(256) bound_rows(const int32_t *__restrict__ R,
 
 // A: n x n int8 on the host. Returns a proved upper bound on log2 |det A|, or +inf when FP32 LU finds A singular
 // (the caller then keeps Hadamard). *bits_B: the exact size of B's entries, *primes: how many primes that took.
-inline double det_log2_bound(int n, const int8_t *A, int s = 20, int *primes = nullptr) {
+// dA: A on the device. Every launch goes to this host thread's default stream (build with --default-stream per-thread),
+// so the bound can run on its own thread while the lifting runs on another.
+inline double det_log2_bound(int n, const int8_t *dA, int s = 20, int *primes = nullptr) {
+    const bool prof = getenv("OZ_PROF"); auto T = std::chrono::steady_clock::now();
+    auto lap = [&](const char *what) {
+        if (!prof) return;
+        cudaStreamSynchronize(cudaStreamPerThread); auto t = std::chrono::steady_clock::now();
+        printf("  bound %-10s %.3f s\n", what, std::chrono::duration<double>(t - T).count()); T = t;
+    };
     cusolverDnHandle_t sh; cublasHandle_t bh; cusolverDnCreate(&sh); cublasCreate(&bh);
-    std::vector<float> Af((size_t)n * n), I((size_t)n * n, 0.f);
-    for (int i = 0; i < n; i++) { I[(size_t)i * n + i] = 1.f; for (int k = 0; k < n; k++) Af[i + (size_t)k * n] = A[(size_t)i * n + k]; }
+    cusolverDnSetStream(sh, cudaStreamPerThread); cublasSetStream(bh, cudaStreamPerThread);
+    const size_t nn = (size_t)n * n;
     float *dLU, *dLi, *dUi, *dwork; int *dpiv, *dinfo, lw = 0;
-    cudaMalloc(&dLU, Af.size() * 4); cudaMalloc(&dLi, Af.size() * 4); cudaMalloc(&dUi, Af.size() * 4);
+    cudaMalloc(&dLU, nn * 4); cudaMalloc(&dLi, nn * 4); cudaMalloc(&dUi, nn * 4);
     cudaMalloc(&dpiv, n * 4); cudaMalloc(&dinfo, 4);
-    cudaMemcpy(dLU, Af.data(), Af.size() * 4, cudaMemcpyHostToDevice);
+    bound_prep<<<2048, 256>>>(dA, n, dLU, dLi, dUi);
     cusolverDnSgetrf_bufferSize(sh, n, n, dLU, n, &lw); cudaMalloc(&dwork, (size_t)lw * 4);
+    lap("setup");
     cusolverDnSgetrf(sh, n, n, dLU, n, dwork, dpiv, dinfo);
+    lap("sgetrf");
     int info; cudaMemcpy(&info, dinfo, 4, cudaMemcpyDeviceToHost);
     double ub = INFINITY;
     if (info == 0) {
-        cudaMemcpy(dLi, I.data(), I.size() * 4, cudaMemcpyHostToDevice); cudaMemcpy(dUi, I.data(), I.size() * 4, cudaMemcpyHostToDevice);
         const float one = 1.f;
         cublasStrsm(bh, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N, CUBLAS_DIAG_UNIT, n, n, &one, dLU, n, dLi, n);
         cublasStrsm(bh, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, n, n, &one, dLU, n, dUi, n);
-        long long *XL, *XU; double *drl, *dcu;
+        long long *XL, *XU; double *drl, *dcu; long long *ddu; cudaMalloc(&ddu, n * 8);
         cudaMalloc(&XL, (size_t)n * n * 8); cudaMalloc(&XU, (size_t)n * n * 8); cudaMalloc(&drl, n * 8); cudaMalloc(&dcu, n * 8);
         bound_build_x<<<2048, 256>>>(dLU, dLi, dUi, n, s, XL, XU);
-        bound_l1<<<(n + 127) / 128, 128>>>(XL, XU, n, drl, dcu);
+        bound_l1<<<(n + 7) / 8, 256>>>(XL, XU, n, drl, dcu, ddu);
+        lap("trsm+x");
         cudaFree(dLi); cudaFree(dUi); cudaFree(dwork);
         std::vector<double> rl(n), cu(n); std::vector<long long> du(n);
         cudaMemcpy(rl.data(), drl, n * 8, cudaMemcpyDeviceToHost); cudaMemcpy(cu.data(), dcu, n * 8, cudaMemcpyDeviceToHost);
-        for (int j = 0; j < n; j++) cudaMemcpy(&du[j], XU + (size_t)j * n + j, 8, cudaMemcpyDeviceToHost);
+        cudaMemcpy(du.data(), ddu, n * 8, cudaMemcpyDeviceToHost); cudaFree(ddu);
         double mr = 0, mc = 0; for (int i = 0; i < n; i++) { mr = std::max(mr, rl[i]); mc = std::max(mc, cu[i]); }
+        lap("l1+diag");
         const double bb = log2(mr) + log2(127.0) + log2(mc) + 2;   // |B_ij| < 2^bb, and the sign
         // PA: LAPACK's ipiv is a sequence of row swaps (1-based)
         std::vector<int> piv(n), ord(n); cudaMemcpy(piv.data(), dpiv, n * 4, cudaMemcpyDeviceToHost);
         for (int i = 0; i < n; i++) ord[i] = i;
         for (int i = 0; i < n; i++) std::swap(ord[i], ord[piv[i] - 1]);
-        std::vector<int8_t> PA((size_t)n * n);
-        for (int i = 0; i < n; i++) std::copy(A + (size_t)ord[i] * n, A + (size_t)ord[i] * n + n, &PA[(size_t)i * n]);
         int P = 0; double pb = 0; Garner g{}; g.pre_lo[0] = 1;
         for (uint32_t q = 65279; pb < bb + 1 && P < 7; q--) {
             bool pr = true; for (uint32_t t = 2; t * t <= q && pr; t++) pr = q % t;
@@ -109,15 +137,20 @@ inline double det_log2_bound(int n, const int8_t *A, int s = 20, int *primes = n
                     g.inv[u][k] = (uint32_t)r;
                 }
             }
-            int8_t *dPA; cudaMalloc(&dPA, PA.size()); cudaMemcpy(dPA, PA.data(), PA.size(), cudaMemcpyHostToDevice);
+            lap("PA host");
+            int8_t *dPA; int *dord; cudaMalloc(&dPA, nn); cudaMalloc(&dord, n * 4);
+            cudaMemcpy(dord, ord.data(), n * 4, cudaMemcpyHostToDevice);
+            bound_rows_perm<<<2048, 256>>>(dA, dord, n, dPA); cudaFree(dord);
             DetWork w; w.alloc(n, P);
             cudaMemcpy(w.P, g.q, P * 4, cudaMemcpyHostToDevice);
             det_init<<<dim3(256, P), 256>>>(dPA, w.R, n, n, w.P);
             mod_xw<false, long long, int32_t>(w, XL, 0, n, w.R, w.zr(), n, n, n, n, 0, 0);   // T = X_L PA
             mod_xw<false, int32_t, long long>(w, w.R, w.zr(), n, XU, 0, n, n, n, n, 0, 0);   // B = T X_U
+            lap("modgemm");
             double *dsq; cudaMalloc(&dsq, n * 8);
             bound_rows<<<n, 256>>>(w.R, w.zr(), n, g, dsq);
             std::vector<double> sq(n); cudaMemcpy(sq.data(), dsq, n * 8, cudaMemcpyDeviceToHost);
+            lap("rows");
             double lg = 0;
             for (int i = 0; i < n; i++) lg += 0.5 * log2(sq[i]);
             for (int j = 0; j < n; j++) lg -= log2((double)llabs(du[j]));
