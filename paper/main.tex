@@ -310,7 +310,7 @@ double-double or wider GEMM built this way, nor of linear solves at these condit
 \section{Conclusion}
 On a laptop GPU whose FP64 units are 517 times slower than its INT8 tensor cores, precision becomes a software parameter:
 the same INT8 GEMMs yield FP64, double-double, triple-double and wider products, and an ill-conditioned dense solve that needs
-quad precision finishes $499\times$ sooner than on the laptop's own CPU, with $\sim$270$\times$ less energy. Exact integer products of up to 131\,063-bit entries come from the same units, $10$--$19\times$ faster than FLINT. Exact determinants and exact rational solutions of int8 systems, where no big number has to enter the GPU, come 0-\times than FLINT. The next steps are
+quad precision finishes $499\times$ sooner than on the laptop's own CPU, with $\sim$270$\times$ less energy. Exact integer products of up to 131\,063-bit entries come from the same units, $10$--$19\times$ faster than FLINT. Exact determinants and exact rational solutions of int8 systems, where no big number has to enter the GPU, come $85$--$355\times$ faster than FLINT. The next steps are
 the panel (now the bound of the triple-double solve), CUDA graphs for its launches, and out-of-core sizes beyond the GPU's 12~GB.
 
 \begin{thebibliography}{9}
