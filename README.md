@@ -220,3 +220,30 @@ wide-integer accumulation, Q doubles peeled. Errors vs an exact 2400-bit MPFR su
 Residues cut once into 16-bit chunks (32-bit multiply-adds per modulus): td residues 57 → 19 ms at n = 4096.
 Honest limits: the INT8 GEMMs are power-bound on this laptop (~95 W); cost grows ~p² with precision, as MPFR's does at
 these sizes, so the ratio to MPFR does not grow without bound — it is largest against software emulation of each width.
+
+## Exact big-integer GEMM, thousands of bits / GEMM e saktë me numra të plotë mijëra-bitësh (23-10-2026, `src/ozaki_big.cuh`, `bench/big_test.cu`)
+
+**EN** — The 49 moduli ≤ 256 cap one Ozaki-II GEMM at ~160-bit inputs, and slicing beyond that costs ~S² GEMMs. Here the
+moduli are primes < 65 280 (up to 4 352 of them, M ≈ 2^66 464): each balanced residue is split into two bytes, so A·B mod p
+is four INT8 GEMMs, and **the GEMM work grows linearly with the bits**. Both conversions are INT8 GEMMs too (residues =
+digits × (2^8j mod p); CRT = t_l × the bytes of M/p_l, then q·M taken off per element), so everything runs on the tensor
+cores. Every result is **bit-exact** (256 sampled elements per run against GMP). CPU = 24 threads, the same exact product.
+FLINT's `fmpz_mat_mul` is itself multimodular with BLAS kernels: the strongest baseline we know of.
+
+**SQ** — Modulet ≤ 256 e kufizojnë një GEMM Ozaki-II në ~160 bit. Këtu modulet janë prime < 65 280 (deri në 4 352), çdo mbetje
+ndahet në dy bajte → 4 GEMM INT8 për prim: puna rritet *linearisht* me bit-et. Edhe konvertimet janë GEMM INT8. Çdo rezultat
+del i saktë bit për bit kundrejt GMP-së.
+
+| entry bits | n | primes | GPU | GMP mpz (24 thr) | FLINT fmpz_mat_mul (24 thr) | vs FLINT |
+|---|---|---|---|---|---|---|
+| 1 015 | 1024 | 192 | **71 ms** | 23.0 s (324×) | 1.31 s | **18×** |
+| 4 087 | 512 | 576 | **62 ms** | 16.4 s (265×) | 1.07 s | **17×** |
+| 16 375 | 256 | 2 112 | **90 ms** | 14.0 s (156×) | 1.69 s | **19×** |
+| 32 759 | 256 | 4 352 | **316 ms** | 36.1 s (114×) | 4.56 s | **14×** |
+
+GMP times are a 96² (48² above 8 000 bits) corner of the outputs, scaled; FLINT runs the full product. At 1 015 bits the
+phases are residues ~37 ms · 768 product GEMMs + t ~25 ms · CRT ~20 ms: the conversions (n²·P² work), not the n³ part,
+dominate at these sizes — next: residues and CRT reads/writes fully coalesced, larger n.
+
+Scale, honestly: one part in a googol (10^-100) is ~333 bits, already inside the 424-bit format above; a «googol-tuple»
+number (10^100 doubles) cannot exist (more than the atoms in the universe). What does scale is cost: linear in bits here.
