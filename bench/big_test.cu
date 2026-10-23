@@ -8,6 +8,7 @@
 #include <random>
 #include <vector>
 #include <omp.h>
+#include <unistd.h>
 #include "../src/ozaki_big.cuh"
 #ifdef HAVE_FLINT
 double flint_gemm(int n, int NL, const unsigned *A, const unsigned *B, int threads);   // big_flint.cpp
@@ -54,6 +55,18 @@ static void run(int bits, int n, std::mt19937_64 &g) {
     printf("\n%d-bit entries (NL %d), n = %d: %d primes < 2^16 (M ~ 2^%d), %d INT8 GEMMs of n^3 + 2 conversion GEMMs\n",
            32 * NL - 9, NL, n, pl.L, (int)(pl.NA * 32), 4 * pl.L);
     printf("  GPU: %.1f ms = %.3g big multiply-adds/s (plan %.2f s); exact: %d of %d sampled elements wrong\n", ms, ops / 2 / ms * 1e3, tplan, bad, checked);
+    if (getenv("OZ_ENERGY")) {   // energy: marks (epoch s) around ~8 s of back-to-back GPU products, then around FLINT, idle gaps between
+        auto mark = [](const char *w) { printf("MARK %s %.3f\n", w, std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count()); fflush(stdout); };
+        int reps = std::max(1, (int)(8000 / ms));
+        mark("gpu-start"); for (int r = 0; r < reps; r++) oz::biggemm(pl, dA, dB, dC); cudaDeviceSynchronize(); mark("gpu-end");
+        printf("  GPU %d products in the window\n", reps);
+#ifdef HAVE_FLINT
+        sleep(4); mark("flint-start"); double tf = 0; int fr = 0; while (tf < 8) { tf += flint_gemm(n, NL, A.data(), B.data(), omp_get_max_threads()); fr++; } mark("flint-end");
+        printf("  FLINT %d products, %.2f s each\n", fr, tf / fr);
+#endif
+        oz::big_release(pl); cudaFree(dA); cudaFree(dB); cudaFree(dC); return;
+    }
+    if (getenv("OZ_GPUONLY")) { oz::big_release(pl); cudaFree(dA); cudaFree(dB); cudaFree(dC); return; }
     {   // GMP mpz inner products, every core, on an nc^3 corner, scaled to n^3
         int nc = std::min(n, bits > 8000 ? 48 : 96);
         double tg0 = now();

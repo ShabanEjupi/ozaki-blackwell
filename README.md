@@ -247,3 +247,14 @@ dominate at these sizes — next: residues and CRT reads/writes fully coalesced,
 
 Scale, honestly: one part in a googol (10^-100) is ~333 bits, already inside the 424-bit format above; a «googol-tuple»
 number (10^100 doubles) cannot exist (more than the atoms in the universe). What does scale is cost: linear in bits here.
+
+### Energy per exact product / Energjia për prodhim të saktë (`OZ_ENERGY=1 out_big`, RAPL package 1 s + nvidia-smi 100 ms)
+Both chips counted in both columns (CPU package + GPU board), means over the busy segments of the power traces.
+Të dy çipat numërohen te të dyja kolonat.
+
+| entry bits, n | GPU path: time · GPU + CPU W · energy | FLINT, 24 threads: time · CPU + GPU W · energy | less energy |
+|---|---|---|---|
+| 1 015, 1024 | 80 ms · 88.1 + 19.2 W · **8.6 J** | 1.45 s · 81.3 + 9.2 W · 131 J | **15×** |
+| 16 375, 256 | 66 ms · 95.3 + 23.3 W · **7.9 J** | 1.62 s · 81.4 + 6.5 W · 142 J | **18×** |
+
+The GPU runs at its ~95 W cap; the host thread that feeds it costs ~20 W of CPU package.
