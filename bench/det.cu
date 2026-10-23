@@ -8,6 +8,7 @@
 // Hadamard / d (a few thousand bits instead of ~50 000) and needs only that many primes. Deterministic and proved: the
 // randomness of b only decides how large d comes out.
 #include <cstdio>
+#include <functional>
 #include <cstdlib>
 #include <chrono>
 #include <cmath>
@@ -16,6 +17,7 @@
 #include <gmp.h>
 #include "../src/ozaki_det.cuh"
 double flint_det(int n, const int8_t *A, int threads, long *bits, std::string *hex);
+double flint_solve(int n, const int8_t *A, const int32_t *b, int threads, const __mpz_struct *num, const mpz_t D, int *ok);
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -170,6 +172,50 @@ int main(int argc, char **argv) {
         cudaMemcpy(X.data(), dx, X.size() * 2, cudaMemcpyDeviceToHost); cudaMemcpy(&err, derr, 4, cudaMemcpyDeviceToHost);
         t_lift = now() - t1;
         if (err) { printf("LIFTING: inexact division\n"); return 1; }
+
+        if (method == 2) {   // the exact rational solution x = num / D of A x = b, every entry
+            const double t2 = now();
+            int lg = 0; while ((1ull << lg) < steps) lg++;
+            std::vector<__mpz_struct> pw(lg + 1);   // p^(2^k)
+            for (int k = 0; k <= lg; k++) { mpz_init(&pw[k]); if (k) mpz_mul(&pw[k], &pw[k - 1], &pw[k - 1]); else mpz_set_ui(&pw[k], p); }
+            std::vector<__mpz_struct> num(n); for (auto &v : num) mpz_init(&v);
+            mpz_t Q; mpz_init(Q); mpz_ui_pow_ui(Q, p, steps);
+            // x_j = sum_i X[i][j] p^i by halves (subquadratic), then num_j = D x_j mod Q, symmetric, |num_j| < 2^nb
+            std::function<void(mpz_t, int, size_t, int)> conv = [&](mpz_t out, int j, size_t i0, int k) {
+                if (i0 >= steps) { mpz_set_ui(out, 0); return; }
+                if (k == 0) { mpz_set_ui(out, X[i0 * n + j]); return; }
+                mpz_t hi; mpz_init(hi);
+                conv(out, j, i0, k - 1); conv(hi, j, i0 + ((size_t)1 << (k - 1)), k - 1);
+                mpz_addmul(out, hi, &pw[k - 1]); mpz_clear(hi);
+            };
+            std::vector<int> fail(n, 0);
+#pragma omp parallel for schedule(dynamic, 16)
+            for (int j = 0; j < n; j++) conv(&num[j], j, 0, lg);
+            mpz_t nm, dn, h; mpz_inits(nm, dn, h, nullptr); mpz_fdiv_q_2exp(h, Q, 1);
+            mpz_set_ui(D, 1);
+            for (int pass = 0, again = 1; again && pass < 8; pass++) {   // D grows only when an entry needs a larger denominator
+                again = 0;
+                for (int j = 0; j < n; j++) {
+                    mpz_mul(nm, &num[j], D); mpz_mod(nm, nm, Q); if (mpz_cmp(nm, h) > 0) mpz_sub(nm, nm, Q);
+                    if ((long)mpz_sizeinbase(nm, 2) < nb) continue;
+                    if (!ratrec(nm, dn, &num[j], Q, nb, db)) { printf("RATREC failed at entry %d\n", j); return 1; }
+                    mpz_lcm(D, D, dn); again = 1;
+                }
+            }
+#pragma omp parallel for
+            for (int j = 0; j < n; j++) {
+                mpz_mul(&num[j], &num[j], D); mpz_mod(&num[j], &num[j], Q); if (mpz_cmp(&num[j], h) > 0) mpz_sub(&num[j], &num[j], Q);
+            }
+            t_rr = now() - t2;
+            size_t tb = 0; for (auto &v : num) tb += mpz_sizeinbase(&v, 2);
+            printf("n=%d solve  x = num / D: D %zu bits, numerators %.1f Mbit in all  total %.3f s  [A^-1 %.3f  lift %zu steps %.3f  "
+                   "to integers + D %.3f]\n", n, mpz_sizeinbase(D, 2), tb / 1e6, now() - t0, t_inv, steps, t_lift, t_rr);
+            if (cmp) {
+                int ok; double ft = flint_solve(n, A.data(), b.data(), 24, num.data(), D, &ok);
+                printf("  FLINT fmpz_mat_solve_dixon_den (24 thr) %.2f s  -> %s  (%.1fx)\n", ft, ok ? "BIT-EXACT" : "MISMATCH", ft / (now() - t0 - ft));
+            }
+            return 0;
+        }
 
         // 3. a few entries of x back to integers (Horner in p), rational reconstruction, d = lcm of their denominators
         const double t2 = now();
