@@ -132,8 +132,12 @@ int main(int argc, char **argv) {
         if (gb < hb + 2) { printf("NOT ENOUGH GOOD PRIMES\n"); return 1; }
     } else {
         // 0. the proved bound on log2 |det| (step 4 needs it) on its own thread and stream, overlapping steps 1-3
-        if (method == 1 && !getenv("OZ_HADAMARD") && (n >= 4096 || getenv("OZ_BOUND")))
-            bth = std::thread([&] { const double tb = now(); ub = std::min(hb, oz::det_log2_bound(n, dA, 20, &bprimes)); t_bth = now() - tb; });
+        // (above n = 8192 it waits until the [A I] workspace is freed: both do not fit in 12 GB together)
+        auto start_bound = [&] {
+            if (method == 1 && !getenv("OZ_HADAMARD") && (n >= 4096 || getenv("OZ_BOUND")))
+                bth = std::thread([&] { const double tb = now(); ub = std::min(hb, oz::det_log2_bound(n, dA, 20, &bprimes)); t_bth = now() - tb; });
+        };
+        if (n <= 8192) start_bound();
         // 1. A^-1 mod p from the LU of [A I]
         oz::DetWork w; w.alloc(n, 1, 2 * n);
         uint32_t p = 0; size_t pi = 0;
@@ -157,6 +161,7 @@ int main(int argc, char **argv) {
         uint16_t *Ai; cudaMalloc(&Ai, (size_t)n * n * 2);
         oz::to_u16<<<1024, 256>>>(w.R, w.ld, n, n, Ai);
         cudaDeviceSynchronize(); w.free_(); t_inv = now() - t0;
+        if (n > 8192) start_bound();
 
         // 2. lifting: enough digits to reconstruct num / den with |num| <= Hc |b| / min col, den <= H
         std::vector<int32_t> b(n); std::vector<uint32_t> bm(n); double bn = 0; uint64_t sb = 777;
@@ -328,6 +333,12 @@ int main(int argc, char **argv) {
                        t_inv, steps, t_lift, t_rr, dbits, ub, bprimes, t_bth, t_bound, nprimes, t_mod - t_bound);
     else printf("  [%zu primes, %d good]", nprimes, good);
     printf("\n");
+    if (getenv("OZ_CHECK")) {   // where FLINT would take hours: det mod 4 primes used nowhere above, against D mod q
+        std::vector<uint32_t> cq(all.begin() + 3000, all.begin() + 3004), cd; std::vector<int> cb;   // ~32 000, far below the ones used
+        det_mod_primes(n, 4, dA, cq, cd, cb);
+        for (int k = 0; k < 4; k++)
+            printf("  check mod %u: %s\n", cq[k], cb[k] ? "prime dropped (zero pivot)" : mpz_fdiv_ui(D, cq[k]) == cd[k] ? "ok" : "MISMATCH");
+    }
     if (cmp) {
         long fb; std::string fh; double ft = flint_det(n, A.data(), 24, &fb, &fh);
         char *gh = mpz_get_str(nullptr, 16, D);

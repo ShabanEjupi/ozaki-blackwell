@@ -54,7 +54,7 @@ __global__ void bound_rows_perm(const int8_t *__restrict__ A, const int *__restr
 struct Garner { int P; uint32_t q[7]; uint32_t inv[7][7]; unsigned long long pre_lo[8], pre_hi[8]; };   // pre = prod_{t<k} q_t
 
 // one block per row i: B_ij from its residues (Garner, 128-bit, symmetric), sum_j B_ij^2 rounded up into sq[i]
-__global__ void __launch_bounds__(256) bound_rows(const int32_t *__restrict__ R, size_t zr, int n, Garner g, double *sq) {
+__global__ void __launch_bounds__(256) bound_rows(const uint16_t *__restrict__ R, size_t zr, int n, Garner g, double *sq) {
     const int i = blockIdx.x;
     const unsigned __int128 M = (unsigned __int128)g.pre_hi[g.P] << 64 | g.pre_lo[g.P];
     double acc = 0;
@@ -110,7 +110,7 @@ inline double det_log2_bound(int n, const int8_t *dA, int s = 20, int *primes = 
         bound_build_x<<<2048, 256>>>(dLU, dLi, dUi, n, s, XL, XU);
         bound_l1<<<(n + 7) / 8, 256>>>(XL, XU, n, drl, dcu, ddu);
         lap("trsm+x");
-        cudaFree(dLi); cudaFree(dUi); cudaFree(dwork);
+        cudaFree(dLi); cudaFree(dUi); cudaFree(dwork); cudaFree(dLU); dLU = nullptr;
         std::vector<double> rl(n), cu(n); std::vector<long long> du(n);
         cudaMemcpy(rl.data(), drl, n * 8, cudaMemcpyDeviceToHost); cudaMemcpy(cu.data(), dcu, n * 8, cudaMemcpyDeviceToHost);
         cudaMemcpy(du.data(), ddu, n * 8, cudaMemcpyDeviceToHost); cudaFree(ddu);
@@ -141,14 +141,20 @@ inline double det_log2_bound(int n, const int8_t *dA, int s = 20, int *primes = 
             int8_t *dPA; int *dord; cudaMalloc(&dPA, nn); cudaMalloc(&dord, n * 4);
             cudaMemcpy(dord, ord.data(), n * 4, cudaMemcpyHostToDevice);
             bound_rows_perm<<<2048, 256>>>(dA, dord, n, dPA); cudaFree(dord);
-            DetWork w; w.alloc(n, P);
-            cudaMemcpy(w.P, g.q, P * 4, cudaMemcpyHostToDevice);
-            det_init<<<dim3(256, P), 256>>>(dPA, w.R, n, n, w.P);
-            mod_xw<false, long long, int32_t>(w, XL, 0, n, w.R, w.zr(), n, n, n, n, 0, 0);   // T = X_L PA
-            mod_xw<false, int32_t, long long>(w, w.R, w.zr(), n, XU, 0, n, n, n, n, 0, 0);   // B = T X_U
+            // one prime at a time (n = 16384 fits in 12 GB): B mod q kept as 16-bit residues
+            uint16_t *Bres; cudaMalloc(&Bres, nn * 2 * P);
+            DetWork w; w.alloc(n, 1);
+            for (int k = 0; k < P; k++) {
+                cudaMemcpy(w.P, &g.q[k], 4, cudaMemcpyHostToDevice);
+                det_init<<<dim3(256, 1), 256>>>(dPA, w.R, n, n, w.P);
+                mod_xw<false, long long, int32_t>(w, XL, 0, n, w.R, w.zr(), n, n, n, n, 0, 0);   // T = X_L PA
+                mod_xw<false, int32_t, long long>(w, w.R, w.zr(), n, XU, 0, n, n, n, n, 0, 0);   // B = T X_U
+                to_u16<<<2048, 256>>>(w.R, n, 0, n, Bres + k * nn);
+            }
+            w.free_();
             lap("modgemm");
             double *dsq; cudaMalloc(&dsq, n * 8);
-            bound_rows<<<n, 256>>>(w.R, w.zr(), n, g, dsq);
+            bound_rows<<<n, 256>>>(Bres, nn, n, g, dsq); cudaFree(Bres);
             std::vector<double> sq(n); cudaMemcpy(sq.data(), dsq, n * 8, cudaMemcpyDeviceToHost);
             lap("rows");
             double lg = 0;
@@ -156,7 +162,7 @@ inline double det_log2_bound(int n, const int8_t *dA, int s = 20, int *primes = 
             for (int j = 0; j < n; j++) lg -= log2((double)llabs(du[j]));
             lg -= (double)s * n;
             ub = lg + 1 + 1e-9 * n;   // rounding of the logs (relative 2^-52 each) is far inside one bit
-            w.free_(); cudaFree(dPA); cudaFree(dsq);
+            cudaFree(dPA); cudaFree(dsq);
             if (primes) *primes = P;
         }
         cudaFree(XL); cudaFree(XU); cudaFree(drl); cudaFree(dcu);
