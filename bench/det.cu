@@ -78,8 +78,8 @@ int main(int argc, char **argv) {
     if (L > 1 && method == 2) { printf("OZ_PLANES: methods 0 and 1 (FLINT's solve check takes int8)\n"); return 1; }
     std::vector<int8_t> A((size_t)L * n * n); uint64_t s = 12345;   // the same LCG as det_flint.cpp's main; plane 0 = the int8 matrix
     for (auto &a : A) { s = s * 6364136223846793005ull + 1442695040888963407ull; a = (int8_t)((s >> 33) % 255 - 127); }
-    if (kind == 1) A[0] = 0;                                                         // a zero 1 x 1 leading minor
-    if (kind == 2) for (int k = 0; k < n; k++) A[(size_t)(n - 1) * n + k] = A[k];   // singular: last row = first row
+    if (kind == 1) for (int j = 0; j < L; j++) A[(size_t)j * n * n] = 0;   // a zero 1 x 1 leading minor (every plane)
+    if (kind == 2) for (int j = 0; j < L; j++) for (int k = 0; k < n; k++) A[(size_t)j * n * n + (size_t)(n - 1) * n + k] = A[(size_t)j * n * n + k];   // singular: last row = first row
     // U unit upper, L unit lower, entries in [0, 127] off the diagonal: the same residues for every prime
     auto make_pre = [&] {
         std::vector<int32_t> U((size_t)n * n, 0), L((size_t)n * n, 0); uint64_t q = 999;
