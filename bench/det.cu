@@ -409,7 +409,7 @@ int main(int argc, char **argv) {
             std::vector<uint32_t> cq(all.begin() + at, all.begin() + at + cb_), cd; std::vector<int> cb;
             det_mod_primes(n, cb_, dA, cq, cd, cb);
             for (int k = 0; k < cb_; k++) {
-                if (cb[k]) continue;
+                if (cb[k] || ok >= 4) continue;
                 ok++; printf("  check mod %u: %s\n", cq[k], mpz_fdiv_ui(D, cq[k]) == cd[k] ? "ok" : "MISMATCH");
             }
         }
