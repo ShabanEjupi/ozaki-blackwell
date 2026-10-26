@@ -12,6 +12,7 @@
 // X W = [Xlo Xhi] [Wlo; Vlo] + 256 [Xlo Xhi] [Whi; Vhi] (mod p): two INT8 GEMMs of depth 2K, reduced once in the epilogue.
 #pragma once
 #include <cstdint>
+#include <cstdio>
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -45,6 +46,7 @@ __device__ __forceinline__ void split(int b, int8_t &lo, int8_t &hi) { lo = (int
 // residue of an entry: int32 entries are residues already; int64 entries (any integers) are reduced here
 __device__ __forceinline__ int resid(int32_t x, int) { return x; }
 __device__ __forceinline__ int resid(long long x, int p) { int r = (int)(x % p); return r < 0 ? r + p : r; }
+__device__ __forceinline__ int resid(int8_t x, int p) { int r = x % p; return r < 0 ? r + p : r; }
 
 template <class T>
 __global__ void pack_a(const T *__restrict__ X, size_t zx, int ld, int M, int K, int Mpad, int8_t *__restrict__ out,
@@ -87,19 +89,19 @@ __global__ void __launch_bounds__(256) pack_b(const T *__restrict__ W, size_t zw
     }
 }
 
-// SUB: R -= X W (mod p); else R = X W (mod p). R points at the M x N output corner of prime 0, zr apart per prime.
-template <bool SUB>
+// MODE 0: R = X W, 1: R -= X W, 2: R += X W (mod p). R points at the M x N output corner of prime 0, zr apart per prime.
+template <int MODE>
 __global__ void __launch_bounds__(THREADS) modgemm(const int8_t *__restrict__ Ap, const int8_t *__restrict__ B1,
                                                     const int8_t *__restrict__ B2, int32_t *R, size_t zr, int ld, int M, int N,
                                                     int K2, int Mpad, int Npad, const uint32_t *__restrict__ P) {
     const int z = blockIdx.z, p = P[z];
     Ap += (size_t)z * Mpad * K2; B1 += (size_t)z * Npad * K2; B2 += (size_t)z * Npad * K2; R += z * zr;
-    // pass 0: R = R - G1 (SUB) or G1; |G1| <= K2 128^2 <= 2^26 (K <= 2048), so int32 holds it next to a residue.
+    // pass 0: R = G1, R - G1 or R + G1; |G1| <= K2 128^2 <= 2^29 (K <= 16384), so int32 holds it next to a residue.
     // pass 1: R = (R -+ 256 (G2 mod p)) mod p, in [0, p); every thread rereads exactly the elements it wrote in pass 0.
     // One call site in a loop: two calls would each get their own 48 KB of shared tiles.
     auto fin = [&](int32_t *r, int g, int pass) {
-        if (pass == 0) { *r = SUB ? *r - g : g; return; }
-        int v = SUB ? *r - 256 * (g % p) : *r + 256 * (g % p);
+        if (pass == 0) { *r = MODE == 0 ? g : MODE == 1 ? *r - g : *r + g; return; }
+        int v = MODE == 1 ? *r - 256 * (g % p) : *r + 256 * (g % p);
         v %= p; *r = v < 0 ? v + p : v;
     };
 #pragma unroll 1
@@ -158,15 +160,20 @@ __global__ void __launch_bounds__(256) diag_inv(const int32_t *__restrict__ R, s
 }
 
 // Workspace for one batch of Pb primes: R is n x ld per prime (ld = n for the determinant, 2n for [A I] -> A^-1)
+// kc: the deepest K one packed product takes; deeper ones run in K-chunks (R = X1 W1, R += X2 W2, ...). Below n = 16384
+// kc = n (one chunk, the packing buffers hold any K <= n); above, kc = 2048 keeps the three buffers at ~0.8 GB instead of
+// ~13 GB at n = 32768. A chunked product must not write over its own X or W -- only the K = 64 leaves do, in one chunk.
 struct DetWork {
-    int n, ld, Pb;
+    int n, ld, Pb, kc;
     int32_t *R, *Linv, *Uinv;   // R: Pb n ld; Linv, Uinv: Pb (n/64) 64^2, one per diagonal block
     const int32_t *preU = nullptr, *preL = nullptr;   // unit upper / lower n x n, entries in [0, 127]: det(U A L) = det A
     int8_t *Ap, *B1, *B2;
     uint32_t *P, *det; int *bad;
     void alloc(int n_, int Pb_, int ld_ = 0) {
         n = n_; ld = ld_ ? ld_ : n_; Pb = Pb_;
-        size_t pk = (size_t)Pb * (ld + BM) * 2 * std::max(n, DB);   // M or N padded, times 2K with K <= n (the preconditioner)
+        const char *e = getenv("OZ_KCAP");
+        kc = std::min(std::max(n, DB), std::max(DB, (e ? atoi(e) : n <= 16384 ? n : 2048) / DB * DB));
+        size_t pk = (size_t)Pb * (std::max(n, ld) + BM) * 2 * kc;   // M or N padded, times 2K with K <= kc
         cudaMalloc(&R, (size_t)Pb * n * ld * 4); cudaMalloc(&Linv, (size_t)Pb * n * DB * 4); cudaMalloc(&Uinv, (size_t)Pb * n * DB * 4);
         cudaMalloc(&Ap, pk); cudaMalloc(&B1, pk); cudaMalloc(&B2, pk);
         cudaMalloc(&P, Pb * 4); cudaMalloc(&det, Pb * 4); cudaMalloc(&bad, Pb * 4);
@@ -192,13 +199,18 @@ inline void mod_xw(DetWork &w, const TX *X, size_t zx, int ldx, const TW *W, siz
                    int r, int c) {
     if (M <= 0 || N <= 0) return;
     const int Mpad = rup(M, BM), Npad = rup(N, BN);
-    det_prof.begin();
-    pack_a<<<dim3(std::min(2048, Mpad * K / 1024 + 1), w.Pb), 256>>>(X, zx, ldx, M, K, Mpad, w.Ap, w.P);
-    pack_b<<<dim3(Npad / 64, K / 64, w.Pb), 256>>>(W, zw, ldw, K, N, Npad, w.B1, w.B2, w.P);
-    det_prof.end(1); det_prof.begin();
-    modgemm<SUB><<<dim3(Npad / BN, Mpad / BM, w.Pb), THREADS>>>(w.Ap, w.B1, w.B2, w.at(r, c), w.zr(), w.ld, M, N, 2 * K, Mpad,
-                                                                  Npad, w.P);
-    det_prof.end(2);
+    for (int k0 = 0; k0 < K; k0 += w.kc) {
+        const int k = std::min(w.kc, K - k0);
+        det_prof.begin();
+        pack_a<<<dim3(std::min(2048, Mpad * k / 1024 + 1), w.Pb), 256>>>(X + k0, zx, ldx, M, k, Mpad, w.Ap, w.P);
+        pack_b<<<dim3(Npad / 64, k / 64, w.Pb), 256>>>(W + (size_t)k0 * ldw, zw, ldw, k, N, Npad, w.B1, w.B2, w.P);
+        det_prof.end(1); det_prof.begin();
+        dim3 g(Npad / BN, Mpad / BM, w.Pb);
+        if (SUB) modgemm<1><<<g, THREADS>>>(w.Ap, w.B1, w.B2, w.at(r, c), w.zr(), w.ld, M, N, 2 * k, Mpad, Npad, w.P);
+        else if (k0) modgemm<2><<<g, THREADS>>>(w.Ap, w.B1, w.B2, w.at(r, c), w.zr(), w.ld, M, N, 2 * k, Mpad, Npad, w.P);
+        else modgemm<0><<<g, THREADS>>>(w.Ap, w.B1, w.B2, w.at(r, c), w.zr(), w.ld, M, N, 2 * k, Mpad, Npad, w.P);
+        det_prof.end(2);
+    }
 }
 // the same with both factors inside R
 template <bool SUB>
@@ -248,6 +260,7 @@ inline void det_lu(DetWork &w, int j, int wd) {
 // With ld = 2n, R[:, n:2n] ends as A^-1 mod p.
 inline void det_mod_batch(DetWork &w, const int8_t *dA) {
     const int n = w.n;
+    if (w.preU && w.kc < n) { fprintf(stderr, "the preconditioner multiplies in place with K = n: needs kc = n\n"); exit(1); }
     det_init<<<dim3(256, w.Pb), 256>>>(dA, w.R, n, w.ld, w.P);
     // A zero leading minor over Z (a structured matrix) fails every prime without pivoting; U A L has generic rank profile
     // with high probability (Kaltofen-Saunders). The entries are the same small integers for every prime, so zw = 0.
@@ -272,8 +285,15 @@ __global__ void to_u16(const int32_t *__restrict__ R, int ld, int c0, int n, uin
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < (size_t)n * n; i += (size_t)gridDim.x * blockDim.x)
         out[i] = (uint16_t)R[(i / n) * ld + c0 + i % n];
 }
-// one warp per row: x[i] = sum_k Ai[i][k] rm[k] mod p (each product < 2^32, the sum of 2^16 of them < 2^48)
-__global__ void lift_x(const uint16_t *__restrict__ Ai, const uint32_t *__restrict__ rm, uint16_t *__restrict__ x, int n, uint32_t p) {
+// rows x cols of R at column c0 (row stride ld) -> 16-bit, compact
+__global__ void to_u16_rc(const int32_t *__restrict__ R, int ld, int c0, int rows, int cols, uint16_t *__restrict__ out) {
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < (size_t)rows * cols; i += (size_t)gridDim.x * blockDim.x)
+        out[i] = (uint16_t)R[(i / cols) * ld + c0 + i % cols];
+}
+// one warp per row: x[i] = sum_k Ai[i][k] rm[k] mod p (each product < 2^32, the sum of 2^16 of them < 2^48);
+// hist (optional): x[0..3] also kept there, for when only 4 entries of every digit are needed later
+__global__ void lift_x(const uint16_t *__restrict__ Ai, const uint32_t *__restrict__ rm, uint16_t *__restrict__ x, int n, uint32_t p,
+                       uint16_t *__restrict__ hist = nullptr) {
     const int lane = threadIdx.x & 31, i = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (i >= n) return;
     const uint16_t *a = Ai + (size_t)i * n; uint64_t s = 0;
@@ -283,7 +303,7 @@ __global__ void lift_x(const uint16_t *__restrict__ Ai, const uint32_t *__restri
            + (uint64_t)(v.z & 0xffff) * r1.x + (uint64_t)(v.z >> 16) * r1.y + (uint64_t)(v.w & 0xffff) * r1.z + (uint64_t)(v.w >> 16) * r1.w;
     }
     for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
-    if (lane == 0) x[i] = (uint16_t)(s % p);
+    if (lane == 0) { x[i] = (uint16_t)(s % p); if (hist && i < 4) hist[i] = x[i]; }
 }
 // one warp per row: r[i] = (r[i] - sum_k A[i][k] x[k]) / p, rm[i] = r[i] mod p; a remainder != 0 sets *err
 __global__ void lift_r(const int8_t *__restrict__ A, const uint16_t *__restrict__ x, int32_t *__restrict__ r, uint32_t *__restrict__ rm,

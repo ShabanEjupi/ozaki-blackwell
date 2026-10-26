@@ -43,7 +43,7 @@ __global__ void bound_l1(const long long *__restrict__ XL, const long long *__re
 __global__ void bound_prep(const int8_t *__restrict__ A, int n, float *__restrict__ LU, float *__restrict__ Li, float *__restrict__ Ui) {
     for (size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; e < (size_t)n * n; e += (size_t)gridDim.x * blockDim.x) {
         const int i = e % n, k = e / n;   // column-major (i, k)
-        LU[e] = A[(size_t)i * n + k]; Li[e] = Ui[e] = i == k;
+        LU[e] = A[(size_t)i * n + k]; if (Li) Li[e] = Ui[e] = i == k;
     }
 }
 __global__ void bound_rows_perm(const int8_t *__restrict__ A, const int *__restrict__ ord, int n, int8_t *__restrict__ PA) {
@@ -52,6 +52,43 @@ __global__ void bound_rows_perm(const int8_t *__restrict__ A, const int *__restr
 }
 
 struct Garner { int P; uint32_t q[7]; uint32_t inv[7][7]; unsigned long long pre_lo[8], pre_hi[8]; };   // pre = prod_{t<k} q_t
+
+// the primes below 65280 whose product exceeds 2^(bb + 1), with Garner's constants; 0 when 7 (~112 bits) are not enough
+inline int garner_for(double bb, Garner &g) {
+    int P = 0; double pb = 0; g = Garner{}; g.pre_lo[0] = 1;
+    for (uint32_t q = 65279; pb < bb + 1 && P < 7; q--) {
+        bool pr = true; for (uint32_t t = 2; t * t <= q && pr; t++) pr = q % t;
+        if (pr) { g.q[P++] = q; pb += log2((double)q); }
+    }
+    if (pb < bb + 1) return 0;
+    g.P = P;
+    for (int k = 0; k < P; k++) {
+        unsigned __int128 pre = (unsigned __int128)g.pre_hi[k] << 64 | g.pre_lo[k], nx = pre * g.q[k];
+        g.pre_lo[k + 1] = (unsigned long long)nx; g.pre_hi[k + 1] = (unsigned long long)(nx >> 64);
+        for (int u = 0; u < k; u++) {   // q_u^-1 mod q_k
+            uint64_t r = 1, a = g.q[u] % g.q[k], e = g.q[k] - 2;
+            for (; e; e >>= 1, a = a * a % g.q[k]) if (e & 1) r = r * a % g.q[k];
+            g.inv[u][k] = (uint32_t)r;
+        }
+    }
+    return P;
+}
+
+// column-major n x w panel of the identity's columns [j0, j0 + w)
+__global__ void bound_ident(float *__restrict__ I, int n, int j0, int w) {
+    for (size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; e < (size_t)n * w; e += (size_t)gridDim.x * blockDim.x)
+        I[e] = e % n == j0 + e / n;
+}
+// the columns [j0, j0 + w) of X_L (upper = 0) or X_U (upper = 1) from the matching panel of L^-1 or U^-1 (column-major),
+// row-major n x w as in bound_build_x
+__global__ void bound_x_panel(const float *__restrict__ LU, const float *__restrict__ Pn, int n, int j0, int w, int s, int upper,
+                              long long *__restrict__ X) {
+    for (size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; e < (size_t)n * w; e += (size_t)gridDim.x * blockDim.x) {
+        const int i = e / w, c = e % w, k = j0 + c;
+        const double v = Pn[i + (size_t)c * n];
+        X[e] = upper ? (i <= k ? llrint(ldexp(v * LU[k + (size_t)k * n], s)) : 0) : (k < i ? llrint(ldexp(v, s)) : k == i ? 1ll << s : 0);
+    }
+}
 
 // one block per row i: B_ij from its residues (Garner, 128-bit, symmetric), sum_j B_ij^2 rounded up into sq[i]
 __global__ void __launch_bounds__(256) bound_rows(const uint16_t *__restrict__ R, size_t zr, int n, Garner g, double *sq) {
@@ -77,11 +114,118 @@ __global__ void __launch_bounds__(256) bound_rows(const uint16_t *__restrict__ R
     if (threadIdx.x == 0) sq[i] = red[0];
 }
 
+// x rounded up to a double
+inline double ru_double(unsigned __int128 x) { double d = (double)x; return (unsigned __int128)d < x ? nextafter(d, INFINITY) : d; }
+
+// The same bound for n where nothing n x n in float or int64 fits next to another on 12 GB (n = 32768: 4 GB per float
+// matrix, 8.6 GB per int64 one). X_L and X_U are built in column panels (trsm against identity panels) and kept on the
+// host; per prime q, T = X_L PA mod q in row panels (T int32 on the GPU), then B = T X_U in column panels to the host as
+// 16-bit residues; then Garner and the row sums in row panels. The L1 norms are summed exactly (128-bit) on the host.
+inline double det_log2_bound_panels(int n, const int8_t *dA, int s, int *primes) {
+    const bool prof = getenv("OZ_PROF"); auto T0 = std::chrono::steady_clock::now();
+    auto lap = [&](const char *what) {
+        if (!prof) return;
+        cudaStreamSynchronize(cudaStreamPerThread); auto t = std::chrono::steady_clock::now();
+        printf("  bound %-10s %.3f s\n", what, std::chrono::duration<double>(t - T0).count()); T0 = t;
+    };
+    const int wb = std::min(n, 4096);
+    const size_t nn = (size_t)n * n;
+    cusolverDnHandle_t sh; cublasHandle_t bh; cusolverDnCreate(&sh); cublasCreate(&bh);
+    cusolverDnSetStream(sh, cudaStreamPerThread); cublasSetStream(bh, cudaStreamPerThread);
+    float *dLU, *dwork, *dPn; int *dpiv, *dinfo, lw = 0; long long *dX;
+    cudaMalloc(&dLU, nn * 4); cudaMalloc(&dpiv, n * 4); cudaMalloc(&dinfo, 4);
+    bound_prep<<<2048, 256>>>(dA, n, dLU, nullptr, nullptr);
+    cusolverDnSgetrf_bufferSize(sh, n, n, dLU, n, &lw); cudaMalloc(&dwork, (size_t)lw * 4);
+    cusolverDnSgetrf(sh, n, n, dLU, n, dwork, dpiv, dinfo);
+    int info; cudaMemcpy(&info, dinfo, 4, cudaMemcpyDeviceToHost);
+    cudaFree(dwork); cudaFree(dinfo);
+    lap("sgetrf");
+    if (info) { cudaFree(dLU); cudaFree(dpiv); cusolverDnDestroy(sh); cublasDestroy(bh); return INFINITY; }
+    std::vector<long long> XL(nn), XU(nn);
+    cudaMalloc(&dPn, (size_t)n * wb * 4); cudaMalloc(&dX, (size_t)n * wb * 8);
+    const float one = 1.f;
+    for (int j0 = 0; j0 < n; j0 += wb) {
+        const int w = std::min(wb, n - j0);
+        for (int up = 0; up < 2; up++) {
+            bound_ident<<<2048, 256>>>(dPn, n, j0, w);
+            cublasStrsm(bh, CUBLAS_SIDE_LEFT, up ? CUBLAS_FILL_MODE_UPPER : CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
+                        up ? CUBLAS_DIAG_NON_UNIT : CUBLAS_DIAG_UNIT, n, w, &one, dLU, n, dPn, n);
+            bound_x_panel<<<2048, 256>>>(dLU, dPn, n, j0, w, s, up, dX);
+            cudaMemcpy2D((up ? XU : XL).data() + j0, (size_t)n * 8, dX, (size_t)w * 8, (size_t)w * 8, n, cudaMemcpyDeviceToHost);
+        }
+    }
+    cudaFree(dPn); cudaFree(dX); cudaFree(dLU); cusolverDnDestroy(sh); cublasDestroy(bh);
+    lap("trsm+x");
+    double mr = 0, mc = 0;
+    std::vector<long long> du(n);
+#pragma omp parallel for reduction(max : mr)
+    for (int i = 0; i < n; i++) {
+        unsigned __int128 a = 0;
+        for (int k = 0; k <= i; k++) a += (unsigned long long)llabs(XL[(size_t)i * n + k]);
+        mr = std::max(mr, ru_double(a));
+    }
+#pragma omp parallel for reduction(max : mc)
+    for (int j0 = 0; j0 < n; j0 += 64) {
+        unsigned __int128 b[64] = {};
+        for (int i = 0; i < std::min(n, j0 + 64); i++)
+            for (int c = 0; c < 64; c++) b[c] += (unsigned long long)llabs(XU[(size_t)i * n + j0 + c]);
+        for (int c = 0; c < 64; c++) { mc = std::max(mc, ru_double(b[c])); du[j0 + c] = XU[(size_t)(j0 + c) * n + j0 + c]; }
+    }
+    lap("l1+diag");
+    const double bb = log2(mr) + log2(127.0) + log2(mc) + 2;
+    Garner g; const int P = garner_for(bb, g);
+    if (!P) { cudaFree(dpiv); return INFINITY; }
+    std::vector<int> piv(n), ord(n); cudaMemcpy(piv.data(), dpiv, n * 4, cudaMemcpyDeviceToHost); cudaFree(dpiv);
+    for (int i = 0; i < n; i++) ord[i] = i;
+    for (int i = 0; i < n; i++) std::swap(ord[i], ord[piv[i] - 1]);
+    int8_t *dPA; int *dord; cudaMalloc(&dPA, nn); cudaMalloc(&dord, n * 4);
+    cudaMemcpy(dord, ord.data(), n * 4, cudaMemcpyHostToDevice);
+    bound_rows_perm<<<2048, 256>>>(dA, dord, n, dPA); cudaFree(dord);
+    std::vector<uint16_t> Bh(nn * P);
+    {
+        DetWork wt, wp; wt.alloc(n, 1); wp.alloc(n, 1, wb);   // T = X_L PA mod q (n x n); one column panel of B (n x wb)
+        long long *dXp; uint16_t *dBu; cudaMalloc(&dXp, (size_t)n * wb * 8); cudaMalloc(&dBu, (size_t)n * wb * 2);
+        for (int k = 0; k < P; k++) {
+            cudaMemcpy(wt.P, &g.q[k], 4, cudaMemcpyHostToDevice); cudaMemcpy(wp.P, &g.q[k], 4, cudaMemcpyHostToDevice);
+            for (int i0 = 0; i0 < n; i0 += wb) {
+                const int h = std::min(wb, n - i0);
+                cudaMemcpy(dXp, XL.data() + (size_t)i0 * n, (size_t)h * n * 8, cudaMemcpyHostToDevice);
+                mod_xw<false, long long, int8_t>(wt, dXp, 0, n, dPA, 0, n, h, n, n, i0, 0);
+            }
+            for (int j0 = 0; j0 < n; j0 += wb) {
+                const int w = std::min(wb, n - j0);
+                cudaMemcpy2D(dXp, (size_t)w * 8, XU.data() + j0, (size_t)n * 8, (size_t)w * 8, n, cudaMemcpyHostToDevice);
+                mod_xw<false, int32_t, long long>(wp, wt.R, wt.zr(), n, dXp, 0, w, n, w, n, 0, 0);
+                to_u16_rc<<<2048, 256>>>(wp.R, wp.ld, 0, n, w, dBu);
+                cudaMemcpy2D(Bh.data() + k * nn + j0, (size_t)n * 2, dBu, (size_t)w * 2, (size_t)w * 2, n, cudaMemcpyDeviceToHost);
+            }
+        }
+        wt.free_(); wp.free_(); cudaFree(dXp); cudaFree(dBu); cudaFree(dPA);
+    }
+    lap("modgemm");
+    uint16_t *dR; double *dsq; cudaMalloc(&dR, (size_t)P * wb * n * 2); cudaMalloc(&dsq, n * 8);
+    for (int i0 = 0; i0 < n; i0 += wb) {
+        const int h = std::min(wb, n - i0);
+        for (int k = 0; k < P; k++)
+            cudaMemcpy(dR + (size_t)k * wb * n, Bh.data() + k * nn + (size_t)i0 * n, (size_t)h * n * 2, cudaMemcpyHostToDevice);
+        bound_rows<<<h, 256>>>(dR, (size_t)wb * n, n, g, dsq + i0);
+    }
+    std::vector<double> sq(n); cudaMemcpy(sq.data(), dsq, n * 8, cudaMemcpyDeviceToHost); cudaFree(dR); cudaFree(dsq);
+    lap("rows");
+    double lg = 0;
+    for (int i = 0; i < n; i++) lg += 0.5 * log2(sq[i]);
+    for (int j = 0; j < n; j++) lg -= log2((double)llabs(du[j]));
+    lg -= (double)s * n;
+    if (primes) *primes = P;
+    return lg + 1 + 1e-9 * n;
+}
+
 // A: n x n int8 on the host. Returns a proved upper bound on log2 |det A|, or +inf when FP32 LU finds A singular
 // (the caller then keeps Hadamard). *bits_B: the exact size of B's entries, *primes: how many primes that took.
 // dA: A on the device. Every launch goes to this host thread's default stream (build with --default-stream per-thread),
 // so the bound can run on its own thread while the lifting runs on another.
 inline double det_log2_bound(int n, const int8_t *dA, int s = 20, int *primes = nullptr) {
+    if (n > 16384 || getenv("OZ_PANEL") || getenv("OZ_KCAP")) return det_log2_bound_panels(n, dA, s, primes);   // in place with K = n below
     const bool prof = getenv("OZ_PROF"); auto T = std::chrono::steady_clock::now();
     auto lap = [&](const char *what) {
         if (!prof) return;
@@ -121,22 +265,8 @@ inline double det_log2_bound(int n, const int8_t *dA, int s = 20, int *primes = 
         std::vector<int> piv(n), ord(n); cudaMemcpy(piv.data(), dpiv, n * 4, cudaMemcpyDeviceToHost);
         for (int i = 0; i < n; i++) ord[i] = i;
         for (int i = 0; i < n; i++) std::swap(ord[i], ord[piv[i] - 1]);
-        int P = 0; double pb = 0; Garner g{}; g.pre_lo[0] = 1;
-        for (uint32_t q = 65279; pb < bb + 1 && P < 7; q--) {
-            bool pr = true; for (uint32_t t = 2; t * t <= q && pr; t++) pr = q % t;
-            if (pr) { g.q[P++] = q; pb += log2((double)q); }
-        }
-        if (pb >= bb + 1) {
-            g.P = P;
-            for (int k = 0; k < P; k++) {
-                unsigned __int128 pre = (unsigned __int128)g.pre_hi[k] << 64 | g.pre_lo[k], nx = pre * g.q[k];
-                g.pre_lo[k + 1] = (unsigned long long)nx; g.pre_hi[k + 1] = (unsigned long long)(nx >> 64);
-                for (int u = 0; u < k; u++) {   // q_u^-1 mod q_k
-                    uint64_t r = 1, a = g.q[u] % g.q[k], e = g.q[k] - 2;
-                    for (; e; e >>= 1, a = a * a % g.q[k]) if (e & 1) r = r * a % g.q[k];
-                    g.inv[u][k] = (uint32_t)r;
-                }
-            }
+        Garner g{}; const int P = garner_for(bb, g);
+        if (P) {
             lap("PA host");
             int8_t *dPA; int *dord; cudaMalloc(&dPA, nn); cudaMalloc(&dord, n * 4);
             cudaMemcpy(dord, ord.data(), n * 4, cudaMemcpyHostToDevice);

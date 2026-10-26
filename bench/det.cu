@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
             if (method == 1 && !getenv("OZ_HADAMARD") && (n >= 4096 || getenv("OZ_BOUND")))
                 bth = std::thread([&] { const double tb = now(); ub = std::min(hb, oz::det_log2_bound(n, dA, 20, &bprimes)); t_bth = now() - tb; });
         };
-        if (n <= 8192) start_bound();
+        if (n <= 8192) start_bound();   // above 16384 it runs after the lifting: 12 GB hold one of the two
         // 1. A^-1 mod p from the LU of [A I]
         oz::DetWork w; w.alloc(n, 1, 2 * n);
         uint32_t p = 0; size_t pi = 0;
@@ -158,10 +158,23 @@ int main(int argc, char **argv) {
             if (cmp) { long fb; std::string fh; flint_det(n, A.data(), 24, &fb, &fh); printf("  FLINT: %s\n", fh.c_str()); }
             return 0;
         }
-        uint16_t *Ai; cudaMalloc(&Ai, (size_t)n * n * 2);
-        oz::to_u16<<<1024, 256>>>(w.R, w.ld, n, n, Ai);
-        cudaDeviceSynchronize(); w.free_(); t_inv = now() - t0;
-        if (n > 8192) start_bound();
+        uint16_t *Ai;
+        if (n <= 16384) {
+            cudaMalloc(&Ai, (size_t)n * n * 2);
+            oz::to_u16<<<1024, 256>>>(w.R, w.ld, n, n, Ai);
+            cudaDeviceSynchronize(); w.free_();
+        } else {   // [A I] (8.6 GB at 32768) and a 16-bit A^-1 beside it do not fit: through the host, 4096 rows at a time
+            std::vector<uint16_t> h((size_t)n * n); uint16_t *tmp; cudaMalloc(&tmp, (size_t)4096 * n * 2);
+            for (int i0 = 0; i0 < n; i0 += 4096) {
+                const int r = std::min(4096, n - i0);
+                oz::to_u16_rc<<<1024, 256>>>(w.at(i0, 0), w.ld, n, r, n, tmp);
+                cudaMemcpy(h.data() + (size_t)i0 * n, tmp, (size_t)r * n * 2, cudaMemcpyDeviceToHost);
+            }
+            cudaFree(tmp); w.free_();
+            cudaMalloc(&Ai, (size_t)n * n * 2); cudaMemcpy(Ai, h.data(), h.size() * 2, cudaMemcpyHostToDevice);
+        }
+        t_inv = now() - t0;
+        if (n > 8192 && n <= 16384) start_bound();
 
         // 2. lifting: enough digits to reconstruct num / den with |num| <= Hc |b| / min col, den <= H
         std::vector<int32_t> b(n); std::vector<uint32_t> bm(n); double bn = 0; uint64_t sb = 777;
@@ -172,16 +185,21 @@ int main(int argc, char **argv) {
         const long nb = (long)ceil(hc - cmin + 0.5 * log2(bn)) + 2, db = (long)ceil(hb) + 2;
         steps = (size_t)ceil((nb + db + 2) / log2((double)p));
         int32_t *dr; uint32_t *drm; uint16_t *dx; int *derr;
-        cudaMalloc(&dr, n * 4); cudaMalloc(&drm, n * 4); cudaMalloc(&dx, steps * n * 2); cudaMalloc(&derr, 4);
+        cudaMalloc(&dr, n * 4); cudaMalloc(&drm, n * 4); cudaMalloc(&dx, (method == 2 ? steps : 1) * n * 2);   // method 1 keeps 4 entries per digit, in dh
+        uint16_t *dh; cudaMalloc(&dh, steps * 4 * 2); cudaMalloc(&derr, 4);
         cudaMemcpy(dr, b.data(), n * 4, cudaMemcpyHostToDevice); cudaMemcpy(drm, bm.data(), n * 4, cudaMemcpyHostToDevice);
         cudaMemset(derr, 0, 4);
         const double t1 = now();
         for (size_t i = 0; i < steps; i++) {
-            oz::lift_x<<<n / 8, 256>>>(Ai, drm, dx + i * n, n, p);
-            oz::lift_r<<<n / 8, 256>>>(dA, dx + i * n, dr, drm, n, p, derr);
+            uint16_t *xi = method == 2 ? dx + i * n : dx;
+            oz::lift_x<<<n / 8, 256>>>(Ai, drm, xi, n, p, dh + i * 4);
+            oz::lift_r<<<n / 8, 256>>>(dA, xi, dr, drm, n, p, derr);
         }
-        std::vector<uint16_t> X(steps * n); int err;
-        cudaMemcpy(X.data(), dx, X.size() * 2, cudaMemcpyDeviceToHost); cudaMemcpy(&err, derr, 4, cudaMemcpyDeviceToHost);
+        std::vector<uint16_t> X(method == 2 ? steps * n : steps * 4); int err;
+        cudaMemcpy(X.data(), method == 2 ? dx : dh, X.size() * 2, cudaMemcpyDeviceToHost);
+        cudaFree(dh); cudaFree(Ai);
+        if (method != 2) cudaFree(dx);   // method 2 converts dx on the GPU (OZ_GPUCONV)
+        if (n > 16384) start_bound(); cudaMemcpy(&err, derr, 4, cudaMemcpyDeviceToHost);
         t_lift = now() - t1;
         if (err) { printf("LIFTING: inexact division\n"); return 1; }
 
@@ -299,7 +317,7 @@ int main(int argc, char **argv) {
         mpz_ui_pow_ui(Q, p, steps); mpz_set_ui(D, 1);
         for (int j = 0; j < 4; j++) {
             mpz_set_ui(xj, 0);
-            for (size_t i = steps; i-- > 0;) { mpz_mul_ui(xj, xj, p); mpz_add_ui(xj, xj, X[i * n + j]); }
+            for (size_t i = steps; i-- > 0;) { mpz_mul_ui(xj, xj, p); mpz_add_ui(xj, xj, X[i * 4 + j]); }
             if (!ratrec(num, den, xj, Q, nb, db)) { printf("RATREC failed at entry %d\n", j); return 1; }
             mpz_lcm(D, D, den);
         }
@@ -311,7 +329,7 @@ int main(int argc, char **argv) {
         if (bth.joinable()) bth.join();
         t_bound = now() - t3;   // the wait for the bound thread; t_bth is its own time
         const double need_c = ub - dbits + 3;
-        const int bc = std::min(Pb, (int)ceil(need_c / 15.9) + 2);
+        const int bc = n > 16384 ? 1 : std::min(Pb,(int)ceil(need_c / 15.9) + 2);
         std::vector<uint32_t> pr = take(0, need_c, bc), det; std::vector<int> bad, use;
         det_mod_primes(n, bc, dA, pr, det, bad); cudaDeviceSynchronize();
         for (size_t i = 0; i < pr.size(); i++) {
@@ -336,7 +354,7 @@ int main(int argc, char **argv) {
     printf("\n");
     if (getenv("OZ_CHECK")) {   // where FLINT would take hours: det mod 4 primes used nowhere above, against D mod q
         std::vector<uint32_t> cq(all.begin() + 3000, all.begin() + 3004), cd; std::vector<int> cb;   // ~32 000, far below the ones used
-        det_mod_primes(n, 4, dA, cq, cd, cb);
+        det_mod_primes(n, n > 16384 ? 1 : 4, dA, cq, cd, cb);   // n x n int32 per prime: 4.3 GB at 32768
         for (int k = 0; k < 4; k++)
             printf("  check mod %u: %s\n", cq[k], cb[k] ? "prime dropped (zero pivot)" : mpz_fdiv_ui(D, cq[k]) == cd[k] ? "ok" : "MISMATCH");
     }
