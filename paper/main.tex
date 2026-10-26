@@ -289,6 +289,13 @@ of VRAM and 29~GB of host memory. The determinant (425\,348 bits) takes 594~s: $
 the bandwidth limit, $\det A/d$ 39 primes 71~s; the bound, 244 bits above $|\det A|$ at this size (FP32 LU; a larger scale
 $2^s$ does not change it), is hidden under the lifting. Each piece was checked bit-exact against FLINT at $n\le 4096$ with the
 chunks and panels forced small.
+\paragraph{Large entries.} With entries of $L$ bytes stored as byte planes ($A=\sum_j 256^j A_j$), the residues come by Horner and the LU is
+unchanged; the lifting reads the $L$ planes per step and keeps the residual as $L+4$ base-256 digits per row, divided by $p$
+exactly by one lane. Bit-exact against FLINT: $n=1024$ with 64-bit entries in 0.348~s against 13.97~s ($40\times$), $n=2048$
+with 32-bit entries 0.690~s against 51.7~s ($75\times$), $n=2048$ with 64-bit entries (a 137\,173-bit determinant) 3.38~s
+against 109.6~s ($32\times$). The ratio falls with the bits ($17\times$ at $n=1024$ with 128-bit entries): digit-by-digit
+lifting costs $\propto L^2$, which is exactly what high-order lifting~\cite{ps} removes.
+
 \section{Energy}\label{sec:energy}
 Under these kernels the laptop holds $\sim$95~W and the SM clock drops to $\sim$1.8~GHz (2.76~GHz with only the FP64 units busy).
 For GEMM at $n=4096$ (\texttt{bench/energy.cu}, power every 200~ms): native FP64 7.4~GFLOPS/W, Ozaki-II at 16 moduli 53.6
