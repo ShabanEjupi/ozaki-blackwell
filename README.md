@@ -355,3 +355,31 @@ panels, the L1 norms exact in 128 bits; the lifting keeps only the 4 entries per
 through the host. Peak: ~11 GB of VRAM, 29 GB of host RAM. Every piece is checked bit-exact against FLINT at n = 1024–4096
 with the chunking and the panels forced small (`OZ_KCAP=192`, `OZ_PANEL=1`); at n = 4096 the panelled bound gives the same
 47 021 bits as the whole-matrix one.
+
+## Large entries / Hyrje të mëdha (26-10-2026, `OZ_PLANES=L out_det n 32 1 {0,1}`)
+
+Entries of L bytes, stored as L planes of signed bytes (entry = Σ_j 256^j A_j, random). The residues come from the planes
+by Horner (`det_init`), so method 0 and the LU of [A I] are unchanged; the lifting reads all L planes per step
+(`lift_r_planes`: L int8 matvecs, the residual kept as L + 4 base-256 digits per row, normalized and divided by p exactly
+by one lane per row); only the entries whose D·x_j mod Q is not already small are rationally reconstructed. Hadamard
+stands in for the proved bound (which reads int8 A). Every row bit-exact against FLINT `fmpz_mat_det`, 24 threads.
+
+| n | entry bits | \|det\| bits | GPU method 0 | **GPU method 1** | FLINT | vs FLINT |
+|---|---|---|---|---|---|---|
+| 256 | 64 | 16 765 | 0.049 s | 0.135 s | 0.19 s | 1.4× (3.5× method 0) |
+| 256 | 256 | 65 914 | 0.205 s | 0.392 s | 1.22 s | 3.1× (5.5× method 0) |
+| 512 | 64 | 33 776 | 0.240 s | **0.156 s** | 1.24 s | **8.0×** |
+| 512 | 128 | 66 550 | 0.511 s | **0.422 s** | 2.96 s | **7.0×** |
+| 1 024 | 64 | 68 073 | 1.55 s | **0.348 s** | 13.97 s | **40×** |
+| 1 024 | 128 | 133 615 | — (primes run out) | **1.99 s** | 34.2 s | **17×** |
+| 2 048 | 32 | 71 638 | 7.57 s | **0.690 s** | 51.7 s | **75×** |
+| 2 048 | 64 | 137 173 | — | **3.38 s** | 109.6 s | **32×** |
+
+What it says: FLINT is far stronger on large entries than on int8 (its multimodular part scales with the bits, its
+Dixon divisor too), and our digit-by-digit lifting costs ∝ L² (L times the steps, each reading L planes): the ratio falls
+from 40× to 17× as the entries go from 64 to 128 bits at n = 1024. This is the regime where lifting by matrix products
+(high-order lifting, Pauderis–Storjohann ISSAC 2012) changes the exponent — the next step, now with its baseline measured.
+
+**SQ** — Hyrje 32–256 bit (L plane bajtesh): metoda 1 del 40× më shpejt se FLINT te n = 1024 me 64 bit, 75× te n = 2048
+me 32 bit, 32× te n = 2048 me 64 bit (përcaktor 137 173 bit), bit për bit e saktë. Raporti bie me bitët (ngritja ∝ L²) —
+pikërisht aty ku ngritja e rendit të lartë (HOL) e ndryshon eksponentin: hapi i radhës, tani me bazën e matur.

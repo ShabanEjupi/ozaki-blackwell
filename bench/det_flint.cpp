@@ -4,11 +4,15 @@
 #include <string>
 #include <flint/fmpz.h>
 #include <flint/fmpz_mat.h>
-// returns seconds; *bits = bit length of |det|, *hex = det in hex (for the bit-exact check)
-double flint_det(int n, const int8_t *A, int threads, long *bits, std::string *hex) {
+// returns seconds; *bits = bit length of |det|, *hex = det in hex (for the bit-exact check).
+// L > 1: entry = sum_j A[j][i][k] 256^j, L planes of n x n signed bytes (the large-entry matrices of det.cu)
+double flint_det(int n, const int8_t *A, int threads, long *bits, std::string *hex, int L) {
     flint_set_num_threads(threads);
     fmpz_mat_t X; fmpz_mat_init(X, n, n);
-    for (int i = 0; i < n; i++) for (int k = 0; k < n; k++) fmpz_set_si(fmpz_mat_entry(X, i, k), A[(size_t)i * n + k]);
+    for (int i = 0; i < n; i++) for (int k = 0; k < n; k++) {
+        fmpz *e = fmpz_mat_entry(X, i, k);
+        for (int j = L - 1; j >= 0; j--) { fmpz_mul_2exp(e, e, 8); fmpz_add_si(e, e, A[(size_t)j * n * n + (size_t)i * n + k]); }
+    }
     fmpz_t d; fmpz_init(d);
     auto t0 = std::chrono::steady_clock::now();
     fmpz_mat_det(d, X);
@@ -26,7 +30,7 @@ int main(int argc, char **argv) {
     int n = atoi(argv[1]), th = argc > 2 ? atoi(argv[2]) : 24;
     std::vector<int8_t> A((size_t)n * n); uint64_t s = 12345;
     for (auto &a : A) { s = s * 6364136223846793005ull + 1442695040888963407ull; a = (int8_t)((s >> 33) % 255 - 127); }
-    long bits; std::string hex; double t = flint_det(n, A.data(), th, &bits, &hex);
+    long bits; std::string hex; double t = flint_det(n, A.data(), th, &bits, &hex, 1);
     printf("n=%d threads=%d  FLINT fmpz_mat_det %.2f s  |det| %ld bits  head %.16s\n", n, th, t, bits, hex.c_str());
 }
 #endif

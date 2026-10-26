@@ -18,18 +18,19 @@
 #include <gmp.h>
 #include "../src/ozaki_det.cuh"
 #include "../src/ozaki_detbound.cuh"
-double flint_det(int n, const int8_t *A, int threads, long *bits, std::string *hex);
+double flint_det(int n, const int8_t *A, int threads, long *bits, std::string *hex, int L = 1);
 double flint_solve(int n, const int8_t *A, const int32_t *b, int threads, const __mpz_struct *num, const mpz_t D, int *ok);
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 // det mod the primes pr (a multiple of Pb of them), bad ones flagged
 static const int32_t *gU = nullptr, *gL = nullptr;   // the preconditioner, once it is needed
+static int gPlanes = 1;   // OZ_PLANES=L: entries of L bytes, sum_j A[j] 256^j
 
 static void det_mod_primes(int n, int Pb, const int8_t *dA, const std::vector<uint32_t> &pr, std::vector<uint32_t> &det,
                            std::vector<int> &bad) {
     oz::DetWork w; w.alloc(n, Pb);
-    w.preU = gU; w.preL = gL;
+    w.preU = gU; w.preL = gL; w.L = gPlanes;
     det.resize(pr.size()); bad.resize(pr.size());
     std::vector<uint32_t> one(Pb, 1); std::vector<int> zero(Pb, 0);
     for (size_t b = 0; b < pr.size(); b += Pb) {
@@ -73,7 +74,9 @@ static bool ratrec(mpz_t num, mpz_t den, const mpz_t X, const mpz_t Q, long nb, 
 int main(int argc, char **argv) {
     const int n = atoi(argv[1]), Pb = argc > 2 ? atoi(argv[2]) : 32, cmp = argc > 3 ? atoi(argv[3]) : 1,
               method = argc > 4 ? atoi(argv[4]) : 1, kind = argc > 5 ? atoi(argv[5]) : 0;
-    std::vector<int8_t> A((size_t)n * n); uint64_t s = 12345;   // the same LCG as det_flint.cpp's main
+    const int L = getenv("OZ_PLANES") ? atoi(getenv("OZ_PLANES")) : 1; gPlanes = L;
+    if (L > 1 && method == 2) { printf("OZ_PLANES: methods 0 and 1 (FLINT's solve check takes int8)\n"); return 1; }
+    std::vector<int8_t> A((size_t)L * n * n); uint64_t s = 12345;   // the same LCG as det_flint.cpp's main; plane 0 = the int8 matrix
     for (auto &a : A) { s = s * 6364136223846793005ull + 1442695040888963407ull; a = (int8_t)((s >> 33) % 255 - 127); }
     if (kind == 1) A[0] = 0;                                                         // a zero 1 x 1 leading minor
     if (kind == 2) for (int k = 0; k < n; k++) A[(size_t)(n - 1) * n + k] = A[k];   // singular: last row = first row
@@ -93,10 +96,10 @@ int main(int argc, char **argv) {
     std::vector<double> cn(n, 0);
     for (int i = 0; i < n; i++) {
         double r = 0;
-        for (int k = 0; k < n; k++) { double a = A[(size_t)i * n + k]; r += a * a; cn[k] += a * a; }
-        hr += 0.5 * log2(r);
+        for (int k = 0; k < n; k++) { double a = 0; for (int j = 0; j < L; j++) a += A[(size_t)j * n * n + (size_t)i * n + k] * ldexp(1.0, 8 * (j - L + 1)); r += a * a; cn[k] += a * a; }
+        hr += 0.5 * log2(r) + 8.0 * (L - 1);   // entries scaled by 2^-8(L-1) above
     }
-    for (int k = 0; k < n; k++) { hc += 0.5 * log2(cn[k]); cmin = std::min(cmin, 0.5 * log2(cn[k])); }
+    for (int k = 0; k < n; k++) { hc += 0.5 * log2(cn[k]) + 8.0 * (L - 1); cmin = std::min(cmin, 0.5 * log2(cn[k]) + 8.0 * (L - 1)); }
     const double hb = std::min(hr, hc);
     std::vector<char> comp(65280, 0); std::vector<uint32_t> all;   // primes downwards from 65279
     for (int i = 2; i < 65280; i++) if (!comp[i]) for (int k = 2 * i; k < 65280; k += i) comp[k] = 1;
@@ -134,12 +137,12 @@ int main(int argc, char **argv) {
         // 0. the proved bound on log2 |det| (step 4 needs it) on its own thread and stream, overlapping steps 1-3
         // (above n = 8192 it waits until the [A I] workspace is freed: both do not fit in 12 GB together)
         auto start_bound = [&] {
-            if (method == 1 && !getenv("OZ_HADAMARD") && (n >= 4096 || getenv("OZ_BOUND")))
+            if (method == 1 && !getenv("OZ_HADAMARD") && (n >= 4096 || getenv("OZ_BOUND")) && gPlanes == 1)   // the bound reads int8 A
                 bth = std::thread([&] { const double tb = now(); ub = std::min(hb, oz::det_log2_bound(n, dA, getenv("OZ_S") ? atoi(getenv("OZ_S")) : 20, &bprimes)); t_bth = now() - tb; });
         };
         if (n <= 8192) start_bound();
         // 1. A^-1 mod p from the LU of [A I]
-        oz::DetWork w; w.alloc(n, 1, 2 * n);
+        oz::DetWork w; w.alloc(n, 1, 2 * n); w.L = L;
         uint32_t p = 0; size_t pi = 0;
         bool singular = false;
         for (;; pi++) {   // 4 plain primes failing = a zero leading minor over Z, or det 0: precondition and try 8 more
@@ -155,7 +158,7 @@ int main(int argc, char **argv) {
         if (singular) {   // Monte Carlo, not proved: U A L had a zero pivot modulo 8 primes
             if (bth.joinable()) bth.join();
             printf("n=%d: det = 0 (8 preconditioned primes all fail; probabilistic)\n", n);
-            if (cmp) { long fb; std::string fh; flint_det(n, A.data(), 24, &fb, &fh); printf("  FLINT: %s\n", fh.c_str()); }
+            if (cmp) { long fb; std::string fh; flint_det(n, A.data(), 24, &fb, &fh, L); printf("  FLINT: %s\n", fh.c_str()); }
             return 0;
         }
         uint16_t *Ai;
@@ -188,12 +191,18 @@ int main(int argc, char **argv) {
         cudaMalloc(&dr, n * 4); cudaMalloc(&drm, n * 4); cudaMalloc(&dx, (method == 2 ? steps : 1) * n * 2);   // method 1 keeps 4 entries per digit, in dh
         uint16_t *dh; cudaMalloc(&dh, steps * 4 * 2); cudaMalloc(&derr, 4);
         cudaMemcpy(dr, b.data(), n * 4, cudaMemcpyHostToDevice); cudaMemcpy(drm, bm.data(), n * 4, cudaMemcpyHostToDevice);
+        const int J = L + 4; long long *dr64 = nullptr;   // L > 1: the residual as J base-256 digits per row
+        if (L > 1) {
+            std::vector<long long> r64((size_t)n * J, 0); for (int i = 0; i < n; i++) r64[(size_t)i * J] = b[i];
+            cudaMalloc(&dr64, r64.size() * 8); cudaMemcpy(dr64, r64.data(), r64.size() * 8, cudaMemcpyHostToDevice);
+        }
         cudaMemset(derr, 0, 4);
         const double t1 = now();
         for (size_t i = 0; i < steps; i++) {
             uint16_t *xi = method == 2 ? dx + i * n : dx;
             oz::lift_x<<<n / 8, 256>>>(Ai, drm, xi, n, p, dh + i * 4);
-            oz::lift_r<<<n / 8, 256>>>(dA, xi, dr, drm, n, p, derr);
+            if (L > 1) oz::lift_r_planes<<<n / 8, 256>>>(dA, L, xi, dr64, J, drm, n, p, derr);
+            else oz::lift_r<<<n / 8, 256>>>(dA, xi, dr, drm, n, p, derr);
         }
         std::vector<uint16_t> X(method == 2 ? steps * n : steps * 4); int err;
         cudaMemcpy(X.data(), method == 2 ? dx : dh, X.size() * 2, cudaMemcpyDeviceToHost); cudaMemcpy(&err, derr, 4, cudaMemcpyDeviceToHost);
@@ -314,12 +323,20 @@ int main(int argc, char **argv) {
         const double t2 = now();
         mpz_t Q, xj, num, den; mpz_inits(Q, xj, num, den, nullptr);
         mpz_ui_pow_ui(Q, p, steps); mpz_set_ui(D, 1);
+        // the 4 entries in parallel; only those whose D x_j mod Q (symmetric) is not below 2^nb need a reconstruction
+        // (Euclid on ~2(nb + db)-bit numbers, the costly part): when it is, y / D is THE reconstruction, so den | D already
+        std::vector<__mpz_struct> x4(4); for (auto &v : x4) mpz_init(&v);
+#pragma omp parallel for
+        for (int j = 0; j < 4; j++)
+            for (size_t i = steps; i-- > 0;) { mpz_mul_ui(&x4[j], &x4[j], p); mpz_add_ui(&x4[j], &x4[j], X[i * 4 + j]); }
+        mpz_t hq; mpz_init(hq); mpz_fdiv_q_2exp(hq, Q, 1);
         for (int j = 0; j < 4; j++) {
-            mpz_set_ui(xj, 0);
-            for (size_t i = steps; i-- > 0;) { mpz_mul_ui(xj, xj, p); mpz_add_ui(xj, xj, X[i * 4 + j]); }
-            if (!ratrec(num, den, xj, Q, nb, db)) { printf("RATREC failed at entry %d\n", j); return 1; }
+            mpz_mul(xj, &x4[j], D); mpz_mod(xj, xj, Q); if (mpz_cmp(xj, hq) > 0) mpz_sub(xj, xj, Q);
+            if ((long)mpz_sizeinbase(xj, 2) < nb) continue;
+            if (!ratrec(num, den, &x4[j], Q, nb, db)) { printf("RATREC failed at entry %d\n", j); return 1; }
             mpz_lcm(D, D, den);
         }
+        mpz_clear(hq); for (auto &v : x4) mpz_clear(&v);
         dbits = mpz_sizeinbase(D, 2); t_rr = now() - t2;
 
         // 4. c = det / d from as many primes as the bound / d needs: |c| < 2^(ub - dbits + 1). ub: the proved bound of
@@ -364,7 +381,7 @@ int main(int argc, char **argv) {
         }
     }
     if (cmp) {
-        long fb; std::string fh; double ft = flint_det(n, A.data(), 24, &fb, &fh);
+        long fb; std::string fh; double ft = flint_det(n, A.data(), 24, &fb, &fh, L);
         char *gh = mpz_get_str(nullptr, 16, D);
         printf("  FLINT fmpz_mat_det (24 thr) %.2f s  -> %s  (%.1fx)\n", ft, fh == gh ? "BIT-EXACT" : "MISMATCH", ft / total);
         free(gh);

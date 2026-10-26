@@ -30,13 +30,19 @@ __device__ uint32_t powm(uint32_t a, uint32_t e, uint32_t p) {
     return r;
 }
 
-// R[z] = [A I] mod p_z (n x ld, the identity only when ld = 2n), residues in [0, p)
-__global__ void det_init(const int8_t *__restrict__ A, int32_t *__restrict__ R, int n, int ld, const uint32_t *__restrict__ P) {
+// R[z] = [A I] mod p_z (n x ld, the identity only when ld = 2n), residues in [0, p). A is L planes of n x n signed
+// bytes, entry = sum_j A[j] 256^j (L = 1: an int8 matrix), reduced by Horner from the top plane.
+__global__ void det_init(const int8_t *__restrict__ A, int32_t *__restrict__ R, int n, int ld, const uint32_t *__restrict__ P,
+                         int L = 1) {
     const int p = P[blockIdx.y];
     R += (size_t)blockIdx.y * n * ld;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < (size_t)n * ld; i += (size_t)gridDim.x * blockDim.x) {
-        int r = i / ld, c = i % ld, a = c < n ? A[(size_t)r * n + c] % p : c - n == r;
-        R[i] = a < 0 ? a + p : a;
+        int r = i / ld, c = i % ld, a = c - n == r;
+        if (c < n) {
+            a = 0;
+            for (int j = L - 1; j >= 0; j--) { a = (a * 256 + A[(size_t)j * n * n + (size_t)r * n + c]) % p; if (a < 0) a += p; }
+        }
+        R[i] = a;
     }
 }
 
@@ -164,7 +170,7 @@ __global__ void __launch_bounds__(256) diag_inv(const int32_t *__restrict__ R, s
 // kc = n (one chunk, the packing buffers hold any K <= n); above, kc = 2048 keeps the three buffers at ~0.8 GB instead of
 // ~13 GB at n = 32768. A chunked product must not write over its own X or W -- only the K = 64 leaves do, in one chunk.
 struct DetWork {
-    int n, ld, Pb, kc;
+    int n, ld, Pb, kc, L = 1;   // L: byte planes of the input entries (det_init)
     int32_t *R, *Linv, *Uinv;   // R: Pb n ld; Linv, Uinv: Pb (n/64) 64^2, one per diagonal block
     const int32_t *preU = nullptr, *preL = nullptr;   // unit upper / lower n x n, entries in [0, 127]: det(U A L) = det A
     int8_t *Ap, *B1, *B2;
@@ -261,7 +267,7 @@ inline void det_lu(DetWork &w, int j, int wd) {
 inline void det_mod_batch(DetWork &w, const int8_t *dA) {
     const int n = w.n;
     if (w.preU && w.kc < n) { fprintf(stderr, "the preconditioner multiplies in place with K = n: needs kc = n\n"); exit(1); }
-    det_init<<<dim3(256, w.Pb), 256>>>(dA, w.R, n, w.ld, w.P);
+    det_init<<<dim3(256, w.Pb), 256>>>(dA, w.R, n, w.ld, w.P, w.L);
     // A zero leading minor over Z (a structured matrix) fails every prime without pivoting; U A L has generic rank profile
     // with high probability (Kaltofen-Saunders). The entries are the same small integers for every prime, so zw = 0.
     if (w.preU) {
@@ -326,6 +332,41 @@ __global__ void lift_r(const int8_t *__restrict__ A, const uint16_t *__restrict_
         if (q * p != t) *err = 1;
         r[i] = (int32_t)q; int m = (int)(q % p); rm[i] = m < 0 ? m + p : m;
     }
+}
+
+// lift_r for entries of L byte planes (A = sum_j 256^j A_j): r[i] is J base-256 digits (int64, little-endian, not
+// normalized); r[i] = (r[i] - sum_j 256^j (A_j x)[i]) / p exactly, rm[i] = r[i] mod p. One warp per row: the L plane
+// products as in lift_r, then lane 0 normalizes the digits to [0, 256) under a signed top carry c and divides by p from
+// the top. |r| stays below n ||A|| + |b|, about 8L + log2 n bits, so J = L + 4 digits leave room.
+__global__ void lift_r_planes(const int8_t *__restrict__ A, int L, const uint16_t *__restrict__ x, long long *__restrict__ r,
+                              int J, uint32_t *__restrict__ rm, int n, int p, int *err) {
+    const int lane = threadIdx.x & 31, i = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (i >= n) return;
+    long long *ri = r + (size_t)i * J;
+    for (int j = 0; j < L; j++) {
+        const int8_t *a = A + (size_t)j * n * n + (size_t)i * n; long long s = 0;
+        for (int k = lane * 16; k < n; k += 512) {
+            int4 v = *(const int4 *)&a[k]; const int8_t *b = (const int8_t *)&v;
+            uint4 x0 = *(const uint4 *)&x[k], x1 = *(const uint4 *)&x[k + 8];
+            const uint16_t *y0 = (const uint16_t *)&x0, *y1 = (const uint16_t *)&x1;
+            int t = 0;
+#pragma unroll
+            for (int q = 0; q < 8; q++) t += b[q] * (int)y0[q] + b[8 + q] * (int)y1[q];
+            s += t;
+        }
+        for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        if (lane == 0) ri[j] -= s;
+    }
+    if (lane) return;
+    long long c = 0;
+    for (int j = 0; j < J; j++) { long long d = ri[j] + c; c = d >> 8; ri[j] = d - c * 256; }   // >> is floor: digit in [0, 256)
+    long long qh = c >= 0 ? c / p : -((p - 1 - c) / p), rem = c - qh * p;                     // floor(c / p), rem in [0, p)
+    for (int j = J - 1; j >= 0; j--) { long long cur = rem * 256 + ri[j]; ri[j] = cur / p; rem = cur % p; }
+    if (rem) *err = 1;
+    ri[J - 1] += qh * 256;   // the quotient's top part: qh 256^J
+    long long m = 0;
+    for (int j = J - 1; j >= 0; j--) { m = (m * 256 + ri[j]) % p; if (m < 0) m += p; }
+    rm[i] = (uint32_t)m;
 }
 
 // Base-p digits to integers for all n entries at once, as ONE INT8 GEMM: x_j = sum_i d_ij p^i. Digit d = lo + 256 (h + 128),
