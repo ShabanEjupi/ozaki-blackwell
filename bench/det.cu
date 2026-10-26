@@ -135,9 +135,9 @@ int main(int argc, char **argv) {
         // (above n = 8192 it waits until the [A I] workspace is freed: both do not fit in 12 GB together)
         auto start_bound = [&] {
             if (method == 1 && !getenv("OZ_HADAMARD") && (n >= 4096 || getenv("OZ_BOUND")))
-                bth = std::thread([&] { const double tb = now(); ub = std::min(hb, oz::det_log2_bound(n, dA, 20, &bprimes)); t_bth = now() - tb; });
+                bth = std::thread([&] { const double tb = now(); ub = std::min(hb, oz::det_log2_bound(n, dA, getenv("OZ_S") ? atoi(getenv("OZ_S")) : 20, &bprimes)); t_bth = now() - tb; });
         };
-        if (n <= 8192) start_bound();   // above 16384 it runs after the lifting: 12 GB hold one of the two
+        if (n <= 8192) start_bound();
         // 1. A^-1 mod p from the LU of [A I]
         oz::DetWork w; w.alloc(n, 1, 2 * n);
         uint32_t p = 0; size_t pi = 0;
@@ -174,7 +174,7 @@ int main(int argc, char **argv) {
             cudaMalloc(&Ai, (size_t)n * n * 2); cudaMemcpy(Ai, h.data(), h.size() * 2, cudaMemcpyHostToDevice);
         }
         t_inv = now() - t0;
-        if (n > 8192 && n <= 16384) start_bound();
+        if (n > 8192) start_bound();   // above 16384 the panelled bound (~8 GB) fits beside the lifting (3 GB)
 
         // 2. lifting: enough digits to reconstruct num / den with |num| <= Hc |b| / min col, den <= H
         std::vector<int32_t> b(n); std::vector<uint32_t> bm(n); double bn = 0; uint64_t sb = 777;
@@ -196,10 +196,9 @@ int main(int argc, char **argv) {
             oz::lift_r<<<n / 8, 256>>>(dA, xi, dr, drm, n, p, derr);
         }
         std::vector<uint16_t> X(method == 2 ? steps * n : steps * 4); int err;
-        cudaMemcpy(X.data(), method == 2 ? dx : dh, X.size() * 2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(X.data(), method == 2 ? dx : dh, X.size() * 2, cudaMemcpyDeviceToHost); cudaMemcpy(&err, derr, 4, cudaMemcpyDeviceToHost);
         cudaFree(dh); cudaFree(Ai);
         if (method != 2) cudaFree(dx);   // method 2 converts dx on the GPU (OZ_GPUCONV)
-        if (n > 16384) start_bound(); cudaMemcpy(&err, derr, 4, cudaMemcpyDeviceToHost);
         t_lift = now() - t1;
         if (err) { printf("LIFTING: inexact division\n"); return 1; }
 
@@ -353,10 +352,16 @@ int main(int argc, char **argv) {
     else printf("  [%zu primes, %d good]", nprimes, good);
     printf("\n");
     if (getenv("OZ_CHECK")) {   // where FLINT would take hours: det mod 4 primes used nowhere above, against D mod q
-        std::vector<uint32_t> cq(all.begin() + 3000, all.begin() + 3004), cd; std::vector<int> cb;   // ~32 000, far below the ones used
-        det_mod_primes(n, n > 16384 ? 1 : 4, dA, cq, cd, cb);   // n x n int32 per prime: 4.3 GB at 32768
-        for (int k = 0; k < 4; k++)
-            printf("  check mod %u: %s\n", cq[k], cb[k] ? "prime dropped (zero pivot)" : mpz_fdiv_ui(D, cq[k]) == cd[k] ? "ok" : "MISMATCH");
+        // ~32 000, far below the ones used; a prime with a zero pivot (probability ~n/p, 0.4 at n = 32768) is replaced by the next
+        const int cb_ = n > 16384 ? 1 : 4;   // n x n int32 per prime: 4.3 GB at 32768
+        for (size_t at = 3000, ok = 0; ok < 4 && at < 3040; at += cb_) {
+            std::vector<uint32_t> cq(all.begin() + at, all.begin() + at + cb_), cd; std::vector<int> cb;
+            det_mod_primes(n, cb_, dA, cq, cd, cb);
+            for (int k = 0; k < cb_; k++) {
+                if (cb[k]) continue;
+                ok++; printf("  check mod %u: %s\n", cq[k], mpz_fdiv_ui(D, cq[k]) == cd[k] ? "ok" : "MISMATCH");
+            }
+        }
     }
     if (cmp) {
         long fb; std::string fh; double ft = flint_det(n, A.data(), 24, &fb, &fh);

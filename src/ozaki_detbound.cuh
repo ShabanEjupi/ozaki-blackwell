@@ -128,7 +128,7 @@ inline double det_log2_bound_panels(int n, const int8_t *dA, int s, int *primes)
         cudaStreamSynchronize(cudaStreamPerThread); auto t = std::chrono::steady_clock::now();
         printf("  bound %-10s %.3f s\n", what, std::chrono::duration<double>(t - T0).count()); T0 = t;
     };
-    const int wb = std::min(n, 4096);
+    const int wb = std::min(n, 2048);
     const size_t nn = (size_t)n * n;
     cusolverDnHandle_t sh; cublasHandle_t bh; cusolverDnCreate(&sh); cublasCreate(&bh);
     cusolverDnSetStream(sh, cudaStreamPerThread); cublasSetStream(bh, cudaStreamPerThread);
@@ -202,6 +202,7 @@ inline double det_log2_bound_panels(int n, const int8_t *dA, int s, int *primes)
         }
         wt.free_(); wp.free_(); cudaFree(dXp); cudaFree(dBu); cudaFree(dPA);
     }
+    if (cudaError_t e = cudaGetLastError()) { fprintf(stderr, "bound: %s\n", cudaGetErrorString(e)); exit(1); }
     lap("modgemm");
     uint16_t *dR; double *dsq; cudaMalloc(&dR, (size_t)P * wb * n * 2); cudaMalloc(&dsq, n * 8);
     for (int i0 = 0; i0 < n; i0 += wb) {

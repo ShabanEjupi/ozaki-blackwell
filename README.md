@@ -305,9 +305,14 @@ Random int8 entries in [-127, 127]; FLINT 3.0.1 on 24 CPU threads; CPU idle duri
 | 4 096 | 47 021 | 21.3 s | **1.15 s** | 257 s | **224×** |
 | 8 192 | 98 139 | — (primes < 65 280 run out) | **8.05 s** | 2 861 s ¹ | **355×** |
 | 16 384 | 204 480 | — | **65.9 s** | not run (~6 h by n³) | |
+| **32 768** | **425 348** | — | **594 s** ² | not run (~2 days by n³) | |
 
 ¹ while the GPU runs of this table shared the CPU now and then; the leading hex digits agree (`4d609fe9397eb725`).
-All rows bit-exact against FLINT; n = 8192 and 16 384 also checked modulo 4 primes used nowhere else (`OZ_CHECK=1`).
+² 26-10-2026, `OZ_CHECK=1 out_det 32768 32 0 1`: 12 GB of VRAM. A⁻¹ 15 s, lifting 56 145 steps 497 s (the read
+  bandwidth again), the proved bound 238 s on its own thread hidden under the lifting, det / d 39 primes 71 s; checked modulo 4
+  primes used nowhere else (all ok), the same leading digits `-98f922d047a31fc` in three runs. The bound is 244 bits above
+  |det| here (FP32 LU at n = 32 768; `OZ_S=26` gives the same), so det / d takes 39 primes instead of 6.
+All rows bit-exact against FLINT; n = 8192 and 16 384 also checked, and 32 768 checked modulo 4 primes used nowhere else (`OZ_CHECK=1`).
 `fmpz_mat_det` is already FLINT's accelerated path (a Dixon divisor, then primes); its plain multimodular
 `fmpz_mat_det_modular` takes 347 s at n = 2048 (177× method 0, the same algorithm).
 
@@ -339,4 +344,14 @@ High-order lifting replaces the 13 013 GEMVs by ~log₂(m) levels of three n × 
 ~2×, not an order of magnitude, because here m ≈ 1.6 n. It wins big when m ≫ n log n, i.e. for large entries. The other
 levers are small: 31-bit lifting primes save ~14 % of the bytes per bit, tighter numerator bounds ~6 % of the steps.
 For int8 matrices the digit-by-digit lifting at full bandwidth is close to what this machine allows; the next limits to
-break are size (n = 32 768 needs [A I] out of core: 8 GB of int32 residues) and large entries (where high-order lifting pays).
+break were size (n = 32 768, done below) and large entries (where high-order lifting pays).
+
+**n = 32 768 in 12 GB** (26-10-2026). Three things did not fit: the byte-packing buffers of one modular product
+((2n + 128) · 2n bytes each, 13 GB for three), the proved bound (three n × n float matrices and two int64 ones, 30 GB), and
+[A I] beside a 16-bit A⁻¹. Now: products deeper than `kc` = 2048 run in K-chunks (R = X₁W₁, R += X₂W₂, … — a third
+epilogue mode), the bound builds X_L and X_U in 2048-column panels (trsm against identity panels) kept in host RAM,
+T = X_L·PA mod q in row panels, B = T·X_U in column panels to the host as 16-bit residues, Garner and the row sums in row
+panels, the L1 norms exact in 128 bits; the lifting keeps only the 4 entries per digit it reconstructs; A⁻¹ goes to 16 bits
+through the host. Peak: ~11 GB of VRAM, 29 GB of host RAM. Every piece is checked bit-exact against FLINT at n = 1024–4096
+with the chunking and the panels forced small (`OZ_KCAP=192`, `OZ_PANEL=1`); at n = 4096 the panelled bound gives the same
+47 021 bits as the whole-matrix one.

@@ -1,4 +1,4 @@
-% Draft, 23-10-2026. Every number below is a measurement in ../README.md (same laptop, same code, the bench named beside it).
+% Draft, 23-10-2026; n = 32768 and verified references 26-10-2026. Every number below is a measurement in ../README.md (same laptop, same code, the bench named beside it).
 % Build: docker run --rm -v "$PWD":/w -w /w texlive/texlive:latest-small latexmk -pdf main.tex
 \documentclass[11pt]{article}
 \usepackage[T1]{fontenc}
@@ -12,7 +12,7 @@
 
 \title{Precision as a software choice:\\FP64, double-double, triple-double and beyond\\from the INT8 tensor cores of a laptop GPU}
 \author{Shaban}
-\date{Draft, 23 October 2026}
+\date{26 October 2026}
 
 \begin{document}
 \maketitle
@@ -29,7 +29,7 @@ $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.855~s at $n=8192$, $499
 \texttt{\_\_float128} LU on all 24 CPU threads of the same laptop and with an error as small; at $\kappa=10^{36}$, where FP64
 and double-double have no correct digit, a triple-double LU on the GPU is $32\times$ faster than the same arithmetic on 24 CPU
 threads and $145\times$ faster than MPFR, and is the most accurate of the three. Counting CPU and GPU power, a double-double
-solve uses $\sim$270$\times$ less energy than the quad-precision CPU solve. Leaving 8-bit moduli for primes below $2^{16}$ and $2^{23}$ split into bytes, an \emph{exact} product of integer matrices with entries of 1\,015 to 131\,063 bits costs work linear in the bits, is bit-exact against GMP, and runs $10$--$19\times$ faster than FLINT's multimodular \texttt{fmpz\_mat\_mul} on 24 CPU threads, with $15$--$18\times$ less energy. Turning the problem around---int8 in, residues out---the exact determinant of an int8 matrix comes $224\times$ sooner than FLINT at $n=4096$ and $355\times$ at $n=8192$ (98\,139 bits), with a proved bound on $|\det A|$ tight to one bit, and $n=16\,384$ (204\,480 bits) takes 66~s. The laptop is power-bound ($\sim$95~W) under these
+solve uses $\sim$270$\times$ less energy than the quad-precision CPU solve. Leaving 8-bit moduli for primes below $2^{16}$ and $2^{23}$ split into bytes, an \emph{exact} product of integer matrices with entries of 1\,015 to 131\,063 bits costs work linear in the bits, is bit-exact against GMP, and runs $10$--$19\times$ faster than FLINT's multimodular \texttt{fmpz\_mat\_mul} on 24 CPU threads, with $15$--$18\times$ less energy. Turning the problem around---int8 in, residues out---the exact determinant of an int8 matrix comes $224\times$ sooner than FLINT at $n=4096$ and $355\times$ at $n=8192$ (98\,139 bits), with a proved bound on $|\det A|$ tight to one bit, and $n=16\,384$ (204\,480 bits) takes 66~s, $n=32\,768$ (425\,348 bits) 594~s within the 12~GB of the GPU. The laptop is power-bound ($\sim$95~W) under these
 kernels, which shapes what can and cannot be gained.
 \end{abstract}
 
@@ -38,7 +38,7 @@ tensor core-t INT8 janë qindra herë më të shpejtë. Mbi një GPU Blackwell l
 FP64 ($517\times$). Me skemën Ozaki~II (prodhime të sakta të mbetjeve dhe teorema kineze e mbetjeve) ndërtuam shumëzim
 matricash me saktësi FP64, double-double, triple-double dhe arbitrare (deri 424 bit) nga të njëjtat njësi INT8. Te një punë
 reale---$Ax=b$ me $\kappa=10^{20}$---zgjidhja double-double mbaron $499\times$ më shpejt se LU \texttt{\_\_float128} mbi 24 fije
-CPU, me gabim po aq të vogël, dhe me $\sim$270$\times$ më pak energji. Me prime nën $2^{16}$ e $2^{23}$ të ndara në bajte, shumëzimi i \emph{saktë} i matricave me numra të plotë 1\,015--131\,063 bitësh del bit për bit i saktë, $10$--$19\times$ më shpejt se FLINT dhe me $15$--$18\times$ më pak energji. Përcaktori i saktë i një matrice int8 del $224\times$ më shpejt se FLINT te $n=4096$ dhe $355\times$ te $n=8192$, me një kufi të provuar të ngushtë brenda një biti.
+CPU, me gabim po aq të vogël, dhe me $\sim$270$\times$ më pak energji. Me prime nën $2^{16}$ e $2^{23}$ të ndara në bajte, shumëzimi i \emph{saktë} i matricave me numra të plotë 1\,015--131\,063 bitësh del bit për bit i saktë, $10$--$19\times$ më shpejt se FLINT dhe me $15$--$18\times$ më pak energji. Përcaktori i saktë i një matrice int8 del $224\times$ më shpejt se FLINT te $n=4096$ dhe $355\times$ te $n=8192$, me një kufi të provuar të ngushtë brenda një biti; te $n=32\,768$ (425\,348 bit) mbaron për 594~s brenda 12~GB të GPU-së.
 
 \section{Introduction}
 The FP64 units of consumer and laptop GPUs are a small fraction of the chip: on our laptop Blackwell part a peak kernel
@@ -266,9 +266,10 @@ $n$ & $|\det A|$ bits & GPU, all primes & GPU, lifting + bound & FLINT & vs FLIN
 2\,048 & 22\,485 & 1.96 s & 0.293 s & 24.9 s & $85\times$ \\
 4\,096 & 47\,021 & 21.3 s & 1.15 s & 257 s & $224\times$ \\
 8\,192 & 98\,139 & --- & 8.05 s & 2\,861 s & $355\times$ \\
-16\,384 & 204\,480 & --- & 65.9 s & --- & \\\bottomrule
+16\,384 & 204\,480 & --- & 65.9 s & --- & \\
+32\,768 & 425\,348 & --- & 594 s & --- & \\\bottomrule
 \end{tabular}\end{center}
-At $n=8192$ FLINT ran while some GPU runs shared the CPU; the leading digits agree, and $n=8192, 16\,384$ are also checked
+At $n=8192$ FLINT ran while some GPU runs shared the CPU; the leading digits agree, and $n=8192, 16\,384, 32\,768$ are also checked
 modulo four primes used nowhere else. The exact rational solution of $Ax=b$ (same lifting; all $n$ entries back to
 integers by Horner in halves on 24 threads; one common denominator) is bit-exact against FLINT's
 \texttt{fmpz\_mat\_solve\_dixon\_den}: 0.064~s against 2.33~s at $n=1024$ ($36\times$), 0.145~s against 18.9~s at $n=2048$
@@ -276,8 +277,18 @@ integers by Horner in halves on 24 threads; one common denominator) is bit-exact
 Energy per determinant at $n=2048$, both chips counted: $\sim$40~J on the GPU path (process start-up included; $\sim$23~J for the
 computation alone) against $\sim$2\,030~J for FLINT, $\sim$50$\times$ less. At $n=8192$ the lifting is the cost: 13\,013 steps,
 each reading $A^{-1}$ (16 bits per entry) and $A$, at $\sim$100\% of the read bandwidth we measure on this GPU ($\sim$410~GB/s).
-That limit is physical for digit-by-digit lifting; moving past it needs lifting built on matrix products (Storjohann's
-high-order lifting), the next step.
+That limit is physical for digit-by-digit lifting; moving past it needs lifting built on matrix products (high-order lifting,
+the DoublePlusOneLift of Pauderis and Storjohann~\cite{ps}), the next step.
+
+\paragraph{$n=32\,768$ in 12~GB.} One modular product packs $(2n+128)\cdot 2n$ bytes three times (13~GB), and the bound holds
+three float and two int64 $n\times n$ matrices (30~GB). Products deeper than 2048 now run in $K$-chunks (a third epilogue
+mode, $R \mathrel{+}= XW$); the bound builds $X_L$, $X_U$ in column panels (triangular solves against identity panels) kept in
+host memory, forms $T=X_L\,PA \bmod q$ in row panels and $B=T X_U$ in column panels as 16-bit residues on the host, and sums
+the rows in panels, the $L_1$ norms exactly in 128 bits; it runs on its own stream beside the lifting. Peak use: $\sim$11~GB
+of VRAM and 29~GB of host memory. The determinant (425\,348 bits) takes 594~s: $A^{-1}$ 15~s, 56\,145 lifting steps 497~s at
+the bandwidth limit, $\det A/d$ 39 primes 71~s; the bound, 244 bits above $|\det A|$ at this size (FP32 LU; a larger scale
+$2^s$ does not change it), is hidden under the lifting. Each piece was checked bit-exact against FLINT at $n\le 4096$ with the
+chunks and panels forced small.
 \section{Energy}\label{sec:energy}
 Under these kernels the laptop holds $\sim$95~W and the SM clock drops to $\sim$1.8~GHz (2.76~GHz with only the FP64 units busy).
 For GEMM at $n=4096$ (\texttt{bench/energy.cu}, power every 200~ms): native FP64 7.4~GFLOPS/W, Ozaki-II at 16 moduli 53.6
@@ -313,20 +324,35 @@ the same INT8 GEMMs yield FP64, double-double, triple-double and wider products,
 quad precision finishes $499\times$ sooner than on the laptop's own CPU, with $\sim$270$\times$ less energy. Exact integer products of up to 131\,063-bit entries come from the same units, $10$--$19\times$ faster than FLINT. Exact determinants and exact rational solutions of int8 systems, where no big number has to enter the GPU, come $85$--$355\times$ faster than FLINT. The next steps are
 the panel (now the bound of the triple-double solve), CUDA graphs for its launches, and out-of-core sizes beyond the GPU's 12~GB.
 
-\begin{thebibliography}{9}
-\bibitem{ozaki2} K.~Ozaki, Y.~Uchino, T.~Imamura. Ozaki Scheme II: a GEMM-oriented emulation of floating-point matrix
-multiplication using an integer modular technique. arXiv:2504.08009 (title to be verified).
-\bibitem{ozaki2sgemm} arXiv:2508.03984 (Ozaki-II SGEMM emulation with power efficiency on an RTX 5080; title to be verified).
-\bibitem{fp8} arXiv:2603.10634 (an FP8 variant; title to be verified).
-\bibitem{fp4a} arXiv:2608.06812 (FP4 limbs; title to be verified).
-\bibitem{fp4b} arXiv:2609.24519 (FP4 limbs; title to be verified).
-\bibitem{emugemm} arXiv:2606.25453 (EmuGEMM, fused kernels on Blackwell; title to be verified).
-\bibitem{cgemm} arXiv:2512.08321 (complex GEMM by the CRT; title to be verified).
-\bibitem{dgls} J.~Doliskani, P.~Giorgi, R.~Lebreton, \'E.~Schost. Simultaneous conversions with the residue number system using linear algebra. ACM TOMS (2018; to be verified).
-\bibitem{ozamx} arXiv:2609.27831 (Ozaki scheme II is fast on CPUs too: multiple-precision matrix multiplication on Intel AMX-INT8 and Arm SVE2-i8mm; to be verified).
-\bibitem{vdhm} J.~van der Hoeven, M.~Mezzarobba. Integer matrix multiplication at various precisions using AMX and IFMA (preprint, 2026; texmacs.org/joris/amx; to be verified).
-\bibitem{bglm} J.~Berthomieu, S.~Graillat, D.~Lesnoff, T.~Mary. Modular matrix multiplication over large finite fields in floating point, CPU and GPU. arXiv:2601.07508 (to be verified).
-\bibitem{ogita} T.~Ogita. Accurate and verified numerical computation of the matrix determinant. Int.~J.\ Reliability and Safety 6 (2012) 242--254 (also an exact determinant of integer matrices; to be read in full).
-\bibitem{pan} Towards an exact adaptive algorithm for the determinant of a rational matrix. arXiv:0706.0014 (the Dixon-divisor-then-primes hybrid on CPUs; authors to be verified at the source).
+\begin{thebibliography}{99}
+\bibitem{ozaki2} K.~Ozaki, Y.~Uchino, T.~Imamura. Ozaki Scheme II: A GEMM-oriented emulation of floating-point matrix
+multiplication using an integer modular technique. arXiv:2504.08009, 2025.
+\bibitem{ozaki2sgemm} Y.~Uchino, K.~Ozaki, T.~Imamura. High-performance and power-efficient emulation of matrix
+multiplication using INT8 matrix engines. arXiv:2508.03984, 2025.
+\bibitem{fp8} Y.~Uchino, K.~Ozaki, T.~Imamura. Double-precision matrix multiplication emulation via Ozaki-II scheme with
+FP8 quantization. arXiv:2603.10634, 2026.
+\bibitem{fp4a} S.~Hayashi, D.~Mukunoki, T.~Hoshino, T.~Katagiri. DGEMM with Ozaki Scheme I/II on FP4 tensor cores: a
+base-13 E2M1 limb representation. arXiv:2608.06812, 2026.
+\bibitem{fp4b} S.~Hayashi, D.~Mukunoki, T.~Hoshino, T.~Katagiri. AWE: Adaptive weight encoding for exact integer matrix
+products with fewer GEMMs on FP4 tensor cores. arXiv:2609.24519, 2026.
+\bibitem{emugemm} D.~Lu, A.~Maeder, M.~Luisier, A.~N.~Ziogas. EmuGEMM: Fused tensor core kernels for precision emulation
+in matrix multiplication. arXiv:2606.25453, 2026.
+\bibitem{cgemm} Y.~Uchino, Q.~Ma, T.~Imamura, K.~Ozaki, P.~L.~Gutsche. Emulation of complex matrix multiplication based on
+the Chinese remainder theorem. arXiv:2512.08321, 2025.
+\bibitem{dgls} J.~Doliskani, P.~Giorgi, R.~Lebreton, \'E.~Schost. Simultaneous conversions with the residue number system
+using linear algebra. ACM Trans.\ Math.\ Softw.\ 44 (2018). doi:10.1145/3145573.
+\bibitem{ozamx} T.~Kouya. Ozaki Scheme II is fast on CPUs too: multiple-precision matrix multiplication on Intel AMX-INT8
+and Arm SVE2-i8mm. arXiv:2609.27831, 2026.
+\bibitem{vdhm} J.~van der Hoeven, M.~Mezzarobba. Integer matrix multiplication at various precisions using AMX and IFMA.
+Preliminary version of June 1, 2026, \url{https://www.texmacs.org/joris/amx/amx.html}.
+\bibitem{bglm} J.~Berthomieu, S.~Graillat, D.~Lesnoff, T.~Mary. Multiword matrix multiplication over large finite fields
+in floating-point arithmetic. arXiv:2601.07508, 2026.
+\bibitem{ogita} T.~Ogita. Accurate and verified numerical computation of the matrix determinant. Int.\ J.\ Reliability and
+Safety 6(1/2/3) (2012) 242. doi:10.1504/IJRS.2012.044287.
+\bibitem{pan} A.~Urba\'nska. Towards an exact adaptive algorithm for the determinant of a rational matrix.
+arXiv:0706.0014, 2007.
+\bibitem{ps} C.~Pauderis, A.~Storjohann. Deterministic unimodularity certification. Proc.\ ISSAC 2012, 281--288.
+doi:10.1145/2442829.2442870.
 \end{thebibliography}
+
 \end{document}
