@@ -1,11 +1,11 @@
 arXiv submission -- everything the form asks, ready to paste. Upload: arxiv.tar.gz (made by ./build.sh; main.tex only).
 
 Title:      Precision as a software choice: FP64, double-double, triple-double and beyond from the INT8 tensor cores of a laptop GPU
-Authors:    Shaban
+Authors:    Shaban Ejupi
 Primary:    cs.MS (Mathematical Software)
 Cross-list: cs.DC, cs.SC, math.NA
 License:    CC BY 4.0
-Comments:   9 pages. Code and every measurement: <public repository URL, added when the repository is opened>
+Comments:   9 pages. Code and every measurement: https://git.spacecode.tech/shaban/ozaki-blackwell
 
 Abstract (plain text, under arXiv's 1920 characters):
 Laptop GPUs run FP64 at 1/64 of their FP32 rate, while their INT8 tensor cores are hundreds of times faster. On a laptop
@@ -22,4 +22,4 @@ times at n=8192, with a proved bound on |det A| tight to one bit; n=16384 (204,4
 (425,348 bits) 594 s within the GPU's 12 GB. With 32- to 128-bit entries the same method is 45 to 83 times faster than FLINT. Every result is bit-exact against GMP/FLINT or checked modulo independent
 primes.
 
-Before submitting (Shaban): the author line (arXiv accepts a single name), and the repository URL in Comments.
+Ready: upload arxiv.tar.gz, paste the fields above.
