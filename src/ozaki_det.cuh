@@ -369,6 +369,112 @@ __global__ void lift_r_planes(const int8_t *__restrict__ A, int L, const uint16_
     rm[i] = (uint32_t)m;
 }
 
+// Dixon lifting modulo M = p_0 ... p_{s-1}, s primes at once, for entries of L byte planes. lift_r_planes gains 16 bits
+// per step and reads all L planes each time, so the lifting costs ~L^2; here a step gains 16 s bits for 2 s bytes of
+// A^-1 residues + L bytes of A per entry, ~L for s ~ L / 2. x_i = A^-1 r_i mod M comes by CRT from the s residues, as s
+// base-2^16 digits; A x_i = sum_{j,u} 256^(j + 2u) A_j x_{i,u} lands on byte-aligned digits of the residual, which is
+// then divided by p_0, ..., p_{s-1} in turn, each exactly.
+constexpr int LIFT_SMAX = 16;
+struct LiftPrimes { int s; uint32_t p[LIFT_SMAX]; uint32_t inv[LIFT_SMAX][LIFT_SMAX]; };   // inv[u][t] = p_u^-1 mod p_t
+
+// one warp per row: y_t = Ai_t[i] . rm_t mod p_t (Ai_t, rm_t n^2 and n apart), then lane 0: Garner and the mixed radix
+// to S base-2^16 digits x[u][i] (u-major, so liftm_r reads them like lift_r: 16-byte loads); hist[i][u] (rows 0..3)
+// keeps them for the reconstruction. S is a template parameter so the per-digit arrays stay in registers.
+template <int S>
+__global__ void liftm_x(const uint16_t *__restrict__ Ai, const uint32_t *__restrict__ rm, LiftPrimes lp, uint16_t *__restrict__ x,
+                        int n, uint16_t *__restrict__ hist) {
+    constexpr int s = S;
+    const int lane = threadIdx.x & 31, i = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (i >= n) return;
+    uint32_t y[S];
+#pragma unroll
+    for (int t = 0; t < s; t++) {
+        const uint16_t *a = Ai + (size_t)t * n * n + (size_t)i * n; const uint32_t *r = rm + (size_t)t * n; uint64_t acc = 0;
+        for (int k = lane * 8; k < n; k += 256) {
+            uint4 v = *(const uint4 *)&a[k]; uint4 r0 = *(const uint4 *)&r[k], r1 = *(const uint4 *)&r[k + 4];
+            acc += (uint64_t)(v.x & 0xffff) * r0.x + (uint64_t)(v.x >> 16) * r0.y + (uint64_t)(v.y & 0xffff) * r0.z + (uint64_t)(v.y >> 16) * r0.w
+                 + (uint64_t)(v.z & 0xffff) * r1.x + (uint64_t)(v.z >> 16) * r1.y + (uint64_t)(v.w & 0xffff) * r1.z + (uint64_t)(v.w >> 16) * r1.w;
+        }
+        for (int o = 16; o; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        y[t] = (uint32_t)(acc % lp.p[t]);
+    }
+    if (lane) return;
+#pragma unroll
+    for (int t = 0; t < s; t++)   // mixed radix digits: x = y_0 + p_0 (y_1 + p_1 (...)), y_t < p_t
+#pragma unroll
+        for (int u = 0; u < t; u++) y[t] = (uint32_t)((uint64_t)(y[t] + lp.p[t] - y[u] % lp.p[t]) % lp.p[t] * lp.inv[u][t] % lp.p[t]);
+    uint32_t d[S] = {};   // base 2^16, Horner from the top mixed-radix digit: d = d p_t + y_t (< 2^32: 65535 65279 + 65535)
+#pragma unroll
+    for (int t = s - 1; t >= 0; t--) {
+        uint32_t c = y[t];
+#pragma unroll
+        for (int u = 0; u < s; u++) { uint32_t v = d[u] * lp.p[t] + c; d[u] = v & 0xffff; c = v >> 16; }
+    }
+#pragma unroll
+    for (int u = 0; u < s; u++) { x[(size_t)u * n + i] = (uint16_t)d[u]; if (hist && i < 4) hist[i * s + u] = (uint16_t)d[u]; }
+}
+
+// one warp per row: r[i] (J base-256 digits) -= sum_{j,u} 256^(j+2u) A_j[i] . x[:, u], then / p_0 / ... / p_{s-1} exactly;
+// rm_t[i] = r[i] mod p_t. After normalizing, every step of the long division is below 256 p < 2^24: 32-bit divisions.
+template <int S>
+__global__ void liftm_r(const int8_t *__restrict__ A, int L, const uint16_t *__restrict__ x, LiftPrimes lp, long long *__restrict__ r,
+                        int J, uint32_t *__restrict__ rm, int n, int *err) {
+    constexpr int s = S;
+    const int lane = threadIdx.x & 31, i = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (i >= n) return;
+    long long *ri = r + (size_t)i * J;
+    for (int j = 0; j < L; j++) {
+        const int8_t *a = A + (size_t)j * n * n + (size_t)i * n;
+        long long acc[S];
+#pragma unroll
+        for (int u = 0; u < s; u++) acc[u] = 0;
+        for (int k = lane * 16; k < n; k += 512) {
+            int4 v = *(const int4 *)&a[k]; const int8_t *b = (const int8_t *)&v;
+#pragma unroll
+            for (int u = 0; u < s; u++) {
+                uint4 x0 = *(const uint4 *)&x[(size_t)u * n + k], x1 = *(const uint4 *)&x[(size_t)u * n + k + 8];
+                const uint16_t *y0 = (const uint16_t *)&x0, *y1 = (const uint16_t *)&x1;
+                int t = 0;   // 16 products below 2^7 2^16: < 2^27
+#pragma unroll
+                for (int q = 0; q < 8; q++) t += b[q] * (int)y0[q] + b[8 + q] * (int)y1[q];
+                acc[u] += t;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < s; u++) {
+            long long a2 = acc[u];
+            for (int o = 16; o; o >>= 1) a2 += __shfl_xor_sync(0xffffffffu, a2, o);
+            if (lane == 0) ri[j + 2 * u] -= a2;
+        }
+    }
+    if (lane) return;
+    for (int t = 0; t < s; t++) {
+        const uint32_t p = lp.p[t];
+        long long c = 0;
+        for (int j = 0; j < J; j++) { long long d = ri[j] + c; c = d >> 8; ri[j] = d - c * 256; }
+        const long long qh = c >= 0 ? c / (long long)p : -(((long long)p - 1 - c) / (long long)p);
+        uint32_t rem = (uint32_t)(c - qh * p);
+        for (int j = J - 1; j >= 0; j--) { uint32_t cur = rem * 256 + (uint32_t)ri[j]; ri[j] = cur / p; rem = cur % p; }
+        if (rem) *err = 1;
+        ri[J - 1] += qh * 256;
+    }
+    for (int t = 0; t < s; t++) {   // the digits are in [0, 256) except the top one
+        const uint32_t p = lp.p[t];
+        long long m0 = ri[J - 1] % (long long)p; uint32_t m = (uint32_t)(m0 < 0 ? m0 + p : m0);
+        for (int j = J - 2; j >= 0; j--) m = (m * 256 + (uint32_t)ri[j]) % p;
+        rm[(size_t)t * n + i] = m;
+    }
+}
+// S as a run-time value
+inline void liftm_step(int S, const uint16_t *Ai, uint32_t *rm, const LiftPrimes &lp, uint16_t *x, int n, uint16_t *hist,
+                       const int8_t *A, int L, long long *r, int J, int *err) {
+#define OZ_LIFTM(K) case K: liftm_x<K><<<n / 8, 256>>>(Ai, rm, lp, x, n, hist); \
+                            liftm_r<K><<<n / 8, 256>>>(A, L, x, lp, r, J, rm, n, err); break;
+    switch (S) { OZ_LIFTM(2) OZ_LIFTM(3) OZ_LIFTM(4) OZ_LIFTM(6) OZ_LIFTM(8) OZ_LIFTM(12) OZ_LIFTM(16)
+                 default: fprintf(stderr, "OZ_LIFTS=%d: one of 2 3 4 6 8 12 16\n", S); exit(1); }
+#undef OZ_LIFTM
+}
+
 // Base-p digits to integers for all n entries at once, as ONE INT8 GEMM: x_j = sum_i d_ij p^i. Digit d = lo + 256 (h + 128),
 // lo, h signed bytes, so x_j = [lo | h]_j [P; 256 P] + 32768 sum_i p^i, with P[i] = the balanced bytes of p^i (256 P is the
 // same bytes one position up). Accumulators: K2 2^14 < 2^31 for K2 < 131072.

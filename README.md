@@ -364,22 +364,33 @@ by Horner (`det_init`), so method 0 and the LU of [A I] are unchanged; the lifti
 by one lane per row); only the entries whose D·x_j mod Q is not already small are rationally reconstructed. Hadamard
 stands in for the proved bound (which reads int8 A). Every row bit-exact against FLINT `fmpz_mat_det`, 24 threads.
 
-| n | entry bits | \|det\| bits | GPU method 0 | **GPU method 1** | FLINT | vs FLINT |
-|---|---|---|---|---|---|---|
-| 256 | 64 | 16 765 | 0.049 s | 0.135 s | 0.19 s | 1.4× (3.5× method 0) |
-| 256 | 256 | 65 914 | 0.205 s | 0.392 s | 1.22 s | 3.1× (5.5× method 0) |
-| 512 | 64 | 33 776 | 0.240 s | **0.156 s** | 1.24 s | **8.0×** |
-| 512 | 128 | 66 550 | 0.511 s | **0.422 s** | 2.96 s | **7.0×** |
-| 1 024 | 64 | 68 073 | 1.55 s | **0.348 s** | 13.97 s | **40×** |
-| 1 024 | 128 | 133 615 | — (primes run out) | **1.99 s** | 34.2 s | **17×** |
-| 2 048 | 32 | 71 638 | 7.57 s | **0.690 s** | 51.7 s | **75×** |
-| 2 048 | 64 | 137 173 | — | **3.38 s** | 109.6 s | **32×** |
+| n | entry bits | \|det\| bits | GPU method 0 | GPU method 1, one prime | **GPU method 1, S primes** | FLINT | vs FLINT |
+|---|---|---|---|---|---|---|---|
+| 256 | 64 | 16 765 | 0.049 s | 0.075 s | **0.048 s** (S = 4) | 0.17 s | 3.5× |
+| 256 | 128 | 33 148 | 0.097 s | 0.149 s | **0.089 s** (8) | 0.40 s | 4.5× |
+| 256 | 256 | 65 914 | 0.205 s | 0.377 s | **0.242 s** (16) | 1.08 s | 4.5× |
+| 512 | 64 | 33 776 | 0.240 s | 0.166 s | **0.102 s** (4) | 1.17 s | **11×** |
+| 512 | 128 | 66 550 | 0.511 s | 0.429 s | **0.314 s** (8) | 2.66 s | **8.5×** |
+| 1 024 | 64 | 68 073 | 1.55 s | 0.364 s | **0.247 s** (4) | 12.39 s | **50×** |
+| 1 024 | 128 | 133 615 | — (primes run out) | 0.894 s | **0.692 s** (8) | 30.98 s | **45×** |
+| 2 048 | 32 | 71 638 | 7.57 s | 0.612 s | **0.563 s** (2) | 46.70 s | **83×** |
+| 2 048 | 64 | 137 173 | — | 2.79 s | **2.03 s** (4) | 106.89 s | **53×** |
+
+GPU times from runs without FLINT beside them, FLINT the fastest of its runs: on this laptop CPU and GPU share one
+power budget, and a GPU run right after 24 FLINT threads is up to 2× slower (measured; the first version of this table
+had those numbers). **S primes at once** (`liftm_x`, `liftm_r`, S = the largest of 2 3 4 6 8 12 16 not above L / 2, or
+`OZ_LIFTS`): Dixon modulo M = p₀…p_{S−1}; x_i = A⁻¹r_i mod M by CRT from S 16-bit residues (Garner, then S base-2¹⁶
+digits), A·x_i = Σ 256^(j+2u) A_j x_{i,u} lands on byte-aligned digits of the residual, which is divided by p₀, …, p_{S−1}
+in turn (32-bit divisions after normalizing). A step gains 16S bits for 2S bytes of A⁻¹ residues + L bytes of A per
+entry: the lifting falls 1.3–2.9× (n = 1024, 128-bit: 0.579 → 0.388 s). S is a template parameter: with run-time S the
+per-digit arrays went to local memory and a step took 860 µs instead of 185.
 
 What it says: FLINT is far stronger on large entries than on int8 (its multimodular part scales with the bits, its
-Dixon divisor too), and our digit-by-digit lifting costs ∝ L² (L times the steps, each reading L planes): the ratio falls
-from 40× to 17× as the entries go from 64 to 128 bits at n = 1024. This is the regime where lifting by matrix products
+Dixon divisor too), and our digit-by-digit lifting costs ∝ L² (L times the steps, each reading L planes): the one-prime
+lifting fell from 40× to 17× (throttled) as the entries went from 64 to 128 bits at n = 1024; S primes at once keep
+50× and 45×, but each step still reads all L planes of A, so the cost still grows faster than the bits. This is the regime where lifting by matrix products
 (high-order lifting, Pauderis–Storjohann ISSAC 2012) changes the exponent — the next step, now with its baseline measured.
 
-**SQ** — Hyrje 32–256 bit (L plane bajtesh): metoda 1 del 40× më shpejt se FLINT te n = 1024 me 64 bit, 75× te n = 2048
-me 32 bit, 32× te n = 2048 me 64 bit (përcaktor 137 173 bit), bit për bit e saktë. Raporti bie me bitët (ngritja ∝ L²) —
+**SQ** — Hyrje 32–256 bit (L plane bajtesh), ngritje me S prime njëherësh: 50× FLINT te n = 1024 me 64 bit, 45× me
+128 bit, 83× te n = 2048 me 32 bit, 53× me 64 bit (përcaktor 137 173 bit), bit për bit e saktë. Raporti bie me bitët (ngritja ∝ L²) —
 pikërisht aty ku ngritja e rendit të lartë (HOL) e ndryshon eksponentin: hapi i radhës, tani me bazën e matur.

@@ -142,17 +142,27 @@ int main(int argc, char **argv) {
         };
         if (n <= 8192) start_bound();
         // 1. A^-1 mod p from the LU of [A I]
-        oz::DetWork w; w.alloc(n, 1, 2 * n); w.L = L;
-        uint32_t p = 0; size_t pi = 0;
+        // S primes at once (src/ozaki_det.cuh liftm_*) for large entries: S = L / 2 by default (OZ_LIFTS), 1 = one prime
+        int S = 1;
+        if (L > 1) {   // the largest of 1 2 3 4 6 8 12 16 not above L / 2, or OZ_LIFTS
+            for (int c : {2, 3, 4, 6, 8, 12, 16}) if (c <= L / 2) S = c;
+            if (getenv("OZ_LIFTS")) S = atoi(getenv("OZ_LIFTS"));
+        }
+        if (S > 1 && n > 16384) { printf("OZ_LIFTS > 1 above n = 16384: not wired\n"); return 1; }
+        oz::DetWork w; w.alloc(n, S, 2 * n); w.L = L;
+        uint32_t p = 0; size_t pi = 0; oz::LiftPrimes lp{}; lp.s = S;
         bool singular = false;
         for (;; pi++) {   // 4 plain primes failing = a zero leading minor over Z, or det 0: precondition and try 8 more
             if (pi == 4 && !gU) { make_pre(); w.preU = gU; w.preL = gL; }
             if (pi == 12) { singular = true; break; }
-            uint32_t one = 1; int zero = 0; p = all[pi];
-            cudaMemcpy(w.P, &p, 4, cudaMemcpyHostToDevice); cudaMemcpy(w.det, &one, 4, cudaMemcpyHostToDevice);
-            cudaMemcpy(w.bad, &zero, 4, cudaMemcpyHostToDevice);
+            std::vector<uint32_t> one(S, 1); std::vector<int> zero(S, 0), bads(S);
+            for (int t = 0; t < S; t++) lp.p[t] = all[pi * S + t];
+            p = lp.p[0];
+            cudaMemcpy(w.P, lp.p, S * 4, cudaMemcpyHostToDevice); cudaMemcpy(w.det, one.data(), S * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(w.bad, zero.data(), S * 4, cudaMemcpyHostToDevice);
             oz::det_mod_batch(w, dA);
-            int bad; cudaMemcpy(&bad, w.bad, 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(bads.data(), w.bad, S * 4, cudaMemcpyDeviceToHost);
+            int bad = 0; for (int v : bads) bad |= v;
             if (!bad) break;
         }
         if (singular) {   // Monte Carlo, not proved: U A L had a zero pivot modulo 8 primes
@@ -163,8 +173,8 @@ int main(int argc, char **argv) {
         }
         uint16_t *Ai;
         if (n <= 16384) {
-            cudaMalloc(&Ai, (size_t)n * n * 2);
-            oz::to_u16<<<1024, 256>>>(w.R, w.ld, n, n, Ai);
+            cudaMalloc(&Ai, (size_t)S * n * n * 2);
+            for (int t = 0; t < S; t++) oz::to_u16<<<1024, 256>>>(w.R + t * w.zr(), w.ld, n, n, Ai + (size_t)t * n * n);
             cudaDeviceSynchronize(); w.free_();
         } else {   // [A I] (8.6 GB at 32768) and a 16-bit A^-1 beside it do not fit: through the host, 4096 rows at a time
             std::vector<uint16_t> h((size_t)n * n); uint16_t *tmp; cudaMalloc(&tmp, (size_t)4096 * n * 2);
@@ -186,12 +196,24 @@ int main(int argc, char **argv) {
             bm[i] = ((b[i] % (int)p) + p) % p; bn += (double)b[i] * b[i];
         }
         const long nb = (long)ceil(hc - cmin + 0.5 * log2(bn)) + 2, db = (long)ceil(hb) + 2;
-        steps = (size_t)ceil((nb + db + 2) / log2((double)p));
+        double lgM = 0;   // log2 of the modulus gained per step
+        for (int t = 0; t < S; t++) {
+            lgM += log2((double)lp.p[t]);
+            for (int u = 0; u < t; u++) lp.inv[u][t] = (uint32_t)invm(lp.p[u], lp.p[t]);
+        }
+        steps = (size_t)ceil((nb + db + 2) / lgM);
         int32_t *dr; uint32_t *drm; uint16_t *dx; int *derr;
         cudaMalloc(&dr, n * 4); cudaMalloc(&drm, n * 4); cudaMalloc(&dx, (method == 2 ? steps : 1) * n * 2);   // method 1 keeps 4 entries per digit, in dh
-        uint16_t *dh; cudaMalloc(&dh, steps * 4 * 2); cudaMalloc(&derr, 4);
+        uint16_t *dh; cudaMalloc(&dh, steps * 4 * S * 2); cudaMalloc(&derr, 4);
         cudaMemcpy(dr, b.data(), n * 4, cudaMemcpyHostToDevice); cudaMemcpy(drm, bm.data(), n * 4, cudaMemcpyHostToDevice);
-        const int J = L + 4; long long *dr64 = nullptr;   // L > 1: the residual as J base-256 digits per row
+        const int J = L + 2 * S + 2; long long *dr64 = nullptr;   // L > 1: the residual as J base-256 digits per row
+        uint32_t *drmS = nullptr; uint16_t *dxS = nullptr;       // S > 1: r mod p_t (S x n), x_i as S base-2^16 digits (n x S)
+        if (S > 1) {
+            std::vector<uint32_t> rmS((size_t)S * n);
+            for (int t = 0; t < S; t++) for (int i = 0; i < n; i++) rmS[(size_t)t * n + i] = ((b[i] % (int)lp.p[t]) + lp.p[t]) % lp.p[t];
+            cudaMalloc(&drmS, rmS.size() * 4); cudaMemcpy(drmS, rmS.data(), rmS.size() * 4, cudaMemcpyHostToDevice);
+            cudaMalloc(&dxS, (size_t)n * S * 2);
+        }
         if (L > 1) {
             std::vector<long long> r64((size_t)n * J, 0); for (int i = 0; i < n; i++) r64[(size_t)i * J] = b[i];
             cudaMalloc(&dr64, r64.size() * 8); cudaMemcpy(dr64, r64.data(), r64.size() * 8, cudaMemcpyHostToDevice);
@@ -199,12 +221,16 @@ int main(int argc, char **argv) {
         cudaMemset(derr, 0, 4);
         const double t1 = now();
         for (size_t i = 0; i < steps; i++) {
+            if (S > 1) {
+                oz::liftm_step(S, Ai, drmS, lp, dxS, n, dh + i * 4 * S, dA, L, dr64, J, derr);
+                continue;
+            }
             uint16_t *xi = method == 2 ? dx + i * n : dx;
             oz::lift_x<<<n / 8, 256>>>(Ai, drm, xi, n, p, dh + i * 4);
             if (L > 1) oz::lift_r_planes<<<n / 8, 256>>>(dA, L, xi, dr64, J, drm, n, p, derr);
             else oz::lift_r<<<n / 8, 256>>>(dA, xi, dr, drm, n, p, derr);
         }
-        std::vector<uint16_t> X(method == 2 ? steps * n : steps * 4); int err;
+        std::vector<uint16_t> X(method == 2 ? steps * n : steps * 4 * S); int err;
         cudaMemcpy(X.data(), method == 2 ? dx : dh, X.size() * 2, cudaMemcpyDeviceToHost); cudaMemcpy(&err, derr, 4, cudaMemcpyDeviceToHost);
         cudaFree(dh); cudaFree(Ai);
         if (method != 2) cudaFree(dx);   // method 2 converts dx on the GPU (OZ_GPUCONV)
@@ -322,13 +348,21 @@ int main(int argc, char **argv) {
         // 3. a few entries of x back to integers (Horner in p), rational reconstruction, d = lcm of their denominators
         const double t2 = now();
         mpz_t Q, xj, num, den; mpz_inits(Q, xj, num, den, nullptr);
-        mpz_ui_pow_ui(Q, p, steps); mpz_set_ui(D, 1);
+        mpz_t Mz; mpz_init_set_ui(Mz, 1);   // the modulus of one step: p, or p_0 ... p_{S-1}
+        for (int t = 0; t < S; t++) mpz_mul_ui(Mz, Mz, lp.p[t]);
+        mpz_pow_ui(Q, Mz, steps); mpz_set_ui(D, 1);
         // the 4 entries in parallel; only those whose D x_j mod Q (symmetric) is not below 2^nb need a reconstruction
         // (Euclid on ~2(nb + db)-bit numbers, the costly part): when it is, y / D is THE reconstruction, so den | D already
         std::vector<__mpz_struct> x4(4); for (auto &v : x4) mpz_init(&v);
 #pragma omp parallel for
-        for (int j = 0; j < 4; j++)
-            for (size_t i = steps; i-- > 0;) { mpz_mul_ui(&x4[j], &x4[j], p); mpz_add_ui(&x4[j], &x4[j], X[i * 4 + j]); }
+        for (int j = 0; j < 4; j++) {
+            mpz_t dg; mpz_init(dg);
+            for (size_t i = steps; i-- > 0;) {   // digit i of entry j: S base-2^16 words, little-endian
+                mpz_import(dg, S, -1, 2, 0, 0, &X[(i * 4 + j) * S]);
+                mpz_mul(&x4[j], &x4[j], Mz); mpz_add(&x4[j], &x4[j], dg);
+            }
+            mpz_clear(dg);
+        }
         mpz_t hq; mpz_init(hq); mpz_fdiv_q_2exp(hq, Q, 1);
         for (int j = 0; j < 4; j++) {
             mpz_mul(xj, &x4[j], D); mpz_mod(xj, xj, Q); if (mpz_cmp(xj, hq) > 0) mpz_sub(xj, xj, Q);

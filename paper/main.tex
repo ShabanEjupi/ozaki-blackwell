@@ -291,10 +291,13 @@ $2^s$ does not change it), is hidden under the lifting. Each piece was checked b
 chunks and panels forced small.
 \paragraph{Large entries.} With entries of $L$ bytes stored as byte planes ($A=\sum_j 256^j A_j$), the residues come by Horner and the LU is
 unchanged; the lifting reads the $L$ planes per step and keeps the residual as $L+4$ base-256 digits per row, divided by $p$
-exactly by one lane. Bit-exact against FLINT: $n=1024$ with 64-bit entries in 0.348~s against 13.97~s ($40\times$), $n=2048$
-with 32-bit entries 0.690~s against 51.7~s ($75\times$), $n=2048$ with 64-bit entries (a 137\,173-bit determinant) 3.38~s
-against 109.6~s ($32\times$). The ratio falls with the bits ($17\times$ at $n=1024$ with 128-bit entries): digit-by-digit
-lifting costs $\propto L^2$, which is exactly what high-order lifting~\cite{ps} removes.
+exactly by one lane. Lifting modulo $M=p_0\cdots p_{S-1}$ ($S\approx L/2$ primes at once: $x_i$ by CRT from $S$ residues,
+$A x_i$ on byte-aligned digits, division by each $p_t$ in turn) gains $16S$ bits per read of the $L$ planes and cuts the
+lifting 1.3--2.9$\times$. Bit-exact against FLINT: $n=1024$ with 64-bit entries in 0.247~s against 12.4~s ($50\times$), with
+128-bit entries 0.692~s against 31.0~s ($45\times$); $n=2048$ with 32-bit entries 0.563~s against 46.7~s ($83\times$), with
+64-bit entries (a 137\,173-bit determinant) 2.03~s against 106.9~s ($53\times$). GPU times come from runs without FLINT beside
+them: CPU and GPU share one power budget, and right after 24 FLINT threads the GPU is up to $2\times$ slower. Each step still
+reads all $L$ planes, so the cost grows faster than the bits; high-order lifting~\cite{ps} removes that.
 
 \section{Energy}\label{sec:energy}
 Under these kernels the laptop holds $\sim$95~W and the SM clock drops to $\sim$1.8~GHz (2.76~GHz with only the FP64 units busy).
