@@ -3,7 +3,8 @@
 # WSL ext4 disk (read at NVMe speed later, not through /mnt/c). Resumable (curl -C -), every file checked against the sha256
 # that Hugging Face lists (lfs.oid); a file is renamed into place only when its hash matches. Run by the scheduled task
 # ozaki-ultra-fetch (Shaban, 27-10-2026: "at home, however long it takes"); progress in /opt/ozaki/nv/full/fetch.log.
-R=nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4; D=/opt/ozaki/nv/full; mkdir -p $D; cd $D
+# Any other repository: R=<org/name> D=<folder> (27-10: allenai/OLMo-2-0325-32B-Instruct, whose whole training data is indexed by infini-gram).
+R=${R:-nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4}; D=${D:-/opt/ozaki/nv/full}; mkdir -p $D; cd $D
 log() { echo "$(date '+%F %T') $*" >> $D/fetch.log; }
 curl -sf "https://huggingface.co/api/models/$R/tree/main?recursive=true" -o tree.json || { log "tree failed"; exit 1; }
 python3 -I -c '
