@@ -18,6 +18,7 @@
 #include <gmp.h>
 #include "../src/ozaki_det.cuh"
 #include "../src/ozaki_detbound.cuh"
+#include "../src/ozaki_hol.cuh"
 double flint_det(int n, const int8_t *A, int threads, long *bits, std::string *hex, int L = 1);
 double flint_solve(int n, const int8_t *A, const int32_t *b, int threads, const __mpz_struct *num, const mpz_t D, int *ok);
 
@@ -92,12 +93,13 @@ int main(int argc, char **argv) {
         gU = dU; gL = dL;
     };
 
-    double hr = 0, hc = 0, cmin = 1e300;   // Hadamard over rows and over columns: log2 |det| <= min of the two
+    double hr = 0, hc = 0, cmin = 1e300, rmin = 1e300;   // Hadamard over rows and over columns: log2 |det| <= min of the two
     std::vector<double> cn(n, 0);
     for (int i = 0; i < n; i++) {
         double r = 0;
         for (int k = 0; k < n; k++) { double a = 0; for (int j = 0; j < L; j++) a += A[(size_t)j * n * n + (size_t)i * n + k] * ldexp(1.0, 8 * (j - L + 1)); r += a * a; cn[k] += a * a; }
         hr += 0.5 * log2(r) + 8.0 * (L - 1);   // entries scaled by 2^-8(L-1) above
+        rmin = std::min(rmin, 0.5 * log2(r) + 8.0 * (L - 1));
     }
     for (int k = 0; k < n; k++) { hc += 0.5 * log2(cn[k]) + 8.0 * (L - 1); cmin = std::min(cmin, 0.5 * log2(cn[k]) + 8.0 * (L - 1)); }
     const double hb = std::min(hr, hc);
@@ -148,6 +150,17 @@ int main(int argc, char **argv) {
             for (int c : {2, 3, 4, 6, 8, 12, 16}) if (c <= L / 2) S = c;
             if (getenv("OZ_LIFTS")) S = atoi(getenv("OZ_LIFTS"));
         }
+        // OZ_HOL=1: high-order lifting (src/ozaki_hol.cuh) instead of Dixon. X = S primes with X >= 6.25 n^2 |A|
+        // (|A| < 2^(8L-1); 1 bit spare for the retries' slightly smaller primes); prod q > 2^(zbits+1), |R| < 2^zbits
+        const bool hol = getenv("OZ_HOL") != nullptr;
+        int zbits = 0; std::vector<uint32_t> qhol;
+        if (hol) {
+            const double need = log2(6.25) + 2 * log2((double)n) + 8.0 * L - 1 + 1;
+            double lg = 0; S = 0;
+            while (lg < need) lg += log2((double)all[S++]);
+            zbits = (int)ceil(log2(1.25 * n) + 8.0 * L - 1);
+            for (lg = 0; lg < zbits + 2;) { qhol.push_back(all[400 + qhol.size()]); lg += log2((double)qhol.back()); }   // far from the retries' primes
+        }
         if (S > 1 && n > 16384) { printf("OZ_LIFTS > 1 above n = 16384: not wired\n"); return 1; }
         oz::DetWork w; w.alloc(n, S, 2 * n); w.L = L;
         uint32_t p = 0; size_t pi = 0; oz::LiftPrimes lp{}; lp.s = S;
@@ -171,6 +184,34 @@ int main(int argc, char **argv) {
             if (cmp) { long fb; std::string fh; flint_det(n, A.data(), 24, &fb, &fh, L); printf("  FLINT: %s\n", fh.c_str()); }
             return 0;
         }
+        std::vector<__mpz_struct> x4(4); for (auto &v : x4) mpz_init(&v);   // 4 entries of the solution mod Q
+        mpz_t Q; mpz_init(Q); long nb = 0, db = 0; double t2 = 0;
+        if (hol) {   // row form y A = b: the same denominator (s_n of A and of A^T), numerators by Cramer on A^T (rows)
+            t_inv = now() - t0;
+            std::vector<int32_t> b(n); double bn = 0; uint64_t sb = 777;
+            for (int i = 0; i < n; i++) { sb = sb * 6364136223846793005ull + 1442695040888963407ull; b[i] = (int)((sb >> 33) % 255) - 127; bn += (double)b[i] * b[i]; }
+            nb = (long)ceil(hr - rmin + 0.5 * log2(bn)) + 2; db = (long)ceil(hb) + 2;
+            double lgX = 0; for (int t = 0; t < S; t++) lgX += log2((double)lp.p[t]);
+            const int N = (int)ceil((nb + db + 2) / lgX); steps = N;
+            const double t1 = now(); int herr = 0; oz::HolStats hs;
+            std::vector<int16_t> dig = oz::hol_solve(w, dA, L, lp.p, S, qhol.data(), (int)qhol.size(), b.data(), N, zbits, hs, &herr);
+            t_lift = now() - t1;
+            if (herr) { printf("HOL: a residue outside its bound\n"); return 1; }
+            printf("  HOL: X = %d primes, %zu primes q, %d X-digits, %d levels, %d modular GEMMs (n^3 each); setup %.3f  residue chain %.3f  vector chain %.3f s\n",
+                   S, qhol.size(), N, hs.levels, hs.gemms, hs.init, hs.rchain, hs.cchain);
+            t2 = now();
+            const int sN = S * N;
+#pragma omp parallel for
+            for (int j = 0; j < 4; j++)   // Horner over the positions from the top: x = x p_(e mod S) + d_e
+                for (int e = sN - 1; e >= 0; e--) {
+                    mpz_mul_ui(&x4[j], &x4[j], lp.p[e % S]);
+                    const int d = dig[(size_t)e * 4 + j];
+                    if (d >= 0) mpz_add_ui(&x4[j], &x4[j], d); else mpz_sub_ui(&x4[j], &x4[j], -d);
+                }
+            mpz_set_ui(Q, 1); for (int t = 0; t < S; t++) mpz_mul_ui(Q, Q, lp.p[t]);
+            mpz_pow_ui(Q, Q, N);
+            for (auto &v : x4) mpz_mod(&v, &v, Q);
+        } else {
         uint16_t *Ai;
         if (n <= 16384) {
             cudaMalloc(&Ai, (size_t)S * n * n * 2);
@@ -195,7 +236,7 @@ int main(int argc, char **argv) {
             sb = sb * 6364136223846793005ull + 1442695040888963407ull; b[i] = (int)((sb >> 33) % 255) - 127;
             bm[i] = ((b[i] % (int)p) + p) % p; bn += (double)b[i] * b[i];
         }
-        const long nb = (long)ceil(hc - cmin + 0.5 * log2(bn)) + 2, db = (long)ceil(hb) + 2;
+        nb = (long)ceil(hc - cmin + 0.5 * log2(bn)) + 2; db = (long)ceil(hb) + 2;
         double lgM = 0;   // log2 of the modulus gained per step
         for (int t = 0; t < S; t++) {
             lgM += log2((double)lp.p[t]);
@@ -346,14 +387,10 @@ int main(int argc, char **argv) {
         }
 
         // 3. a few entries of x back to integers (Horner in p), rational reconstruction, d = lcm of their denominators
-        const double t2 = now();
-        mpz_t Q, xj, num, den; mpz_inits(Q, xj, num, den, nullptr);
+        t2 = now();
         mpz_t Mz; mpz_init_set_ui(Mz, 1);   // the modulus of one step: p, or p_0 ... p_{S-1}
         for (int t = 0; t < S; t++) mpz_mul_ui(Mz, Mz, lp.p[t]);
-        mpz_pow_ui(Q, Mz, steps); mpz_set_ui(D, 1);
-        // the 4 entries in parallel; only those whose D x_j mod Q (symmetric) is not below 2^nb need a reconstruction
-        // (Euclid on ~2(nb + db)-bit numbers, the costly part): when it is, y / D is THE reconstruction, so den | D already
-        std::vector<__mpz_struct> x4(4); for (auto &v : x4) mpz_init(&v);
+        mpz_pow_ui(Q, Mz, steps);
 #pragma omp parallel for
         for (int j = 0; j < 4; j++) {
             mpz_t dg; mpz_init(dg);
@@ -363,6 +400,11 @@ int main(int argc, char **argv) {
             }
             mpz_clear(dg);
         }
+        mpz_clear(Mz);
+        }   // Dixon
+        // only the entries whose D x_j mod Q (symmetric) is not below 2^nb need a reconstruction (Euclid on
+        // ~2(nb + db)-bit numbers, the costly part): when it is, y / D is THE reconstruction, so den | D already
+        mpz_t xj, num, den; mpz_inits(xj, num, den, nullptr); mpz_set_ui(D, 1);
         mpz_t hq; mpz_init(hq); mpz_fdiv_q_2exp(hq, Q, 1);
         for (int j = 0; j < 4; j++) {
             mpz_mul(xj, &x4[j], D); mpz_mod(xj, xj, Q); if (mpz_cmp(xj, hq) > 0) mpz_sub(xj, xj, Q);
