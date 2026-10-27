@@ -591,7 +591,7 @@ Speed (expert 0 w1, 3072 × 3584):
 | version 1 (per-group 128-bit accumulator, commit 9b77801), 4096 tokens | 34.7 ms | |
 
 **Where exactness is free.** Running K3 on this laptop is a streaming problem: per token the 16 routed experts of 92 layers
-(25.8 GB of MXFP4) and the dense BF16 part (~112 GB) must come from storage. Measured here: NVMe 5.1 GB/s (`dd`
+(25.8 GB of MXFP4) and the dense BF16 part (111.2 GB: attention 72.4, shared experts 24.3, gates, latent projections and norms 12.1, lm_head 2.4 -- summed from the 96 safetensors headers) must come from storage: 137.0 GB per text token. Measured here: NVMe 5.1 GB/s (`dd`
 O_DIRECT), pinned RAM → GPU 45 GB/s (PCIe 5 ×16, `llm/h2d.cu`). The exact decode kernel consumes 94 GB/s — 18× what the disk
 delivers — so on a laptop **a bit-reproducible trillion-parameter model costs the same time as a non-reproducible one**:
 ~27 s per token, all of it reading. What it needs and this laptop lacks: 1.56 TB of storage (669 GB free) — the office link

@@ -415,8 +415,8 @@ On the real router of the layer ($896\times7168$ BF16, FP32 logits, sigmoid plus
 logits alone sends $\sim$1 token in 13\,000 to a different expert (11 in 147\,456 token--split pairs), i.e.\ over K3's 92 MoE
 layers $\sim$1 token in 140 runs a different expert somewhere; with exact logits the choice depends on the input alone.
 
-Where exactness costs nothing: a trillion-parameter model on this laptop is a streaming problem. Per token K3 reads 25.8~GB
-of routed MXFP4 experts and $\sim$112~GB of dense BF16 weights; we measured 5.1~GB/s from the NVMe drive and 45~GB/s over
+Where exactness costs nothing: a trillion-parameter model on this laptop is a streaming problem. Per text token K3 reads 25.8~GB
+of routed MXFP4 experts and 111.2~GB of dense BF16 weights (attention 72.4, shared experts 24.3; summed from the 96 safetensors headers); we measured 5.1~GB/s from the NVMe drive and 45~GB/s over
 PCIe~5~$\times$16, while the exact decode kernel consumes 94~GB/s. A bit-reproducible run therefore takes the same
 $\sim$27~s per token as an ordinary one, all of it reading. What this laptop lacks is 1.56~TB of storage (669~GB free).
 \fussy
