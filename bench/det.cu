@@ -159,10 +159,11 @@ static void det_mod_primes(int n, int Pb, const int8_t *dA, const std::vector<ui
     det.resize(pr.size()); bad.resize(pr.size());
     std::vector<uint32_t> one(Pb, 1); std::vector<int> zero(Pb, 0);
     for (size_t b = 0; b < pr.size(); b += Pb) {
-        cudaMemcpy(w.P, &pr[b], Pb * 4, cudaMemcpyHostToDevice);
+        { std::vector<uint32_t> pb(Pb, pr.back()); std::copy(pr.begin() + b, pr.begin() + std::min(pr.size(), b + Pb), pb.begin()); cudaMemcpy(w.P, pb.data(), Pb * 4, cudaMemcpyHostToDevice); }
         cudaMemcpy(w.det, one.data(), Pb * 4, cudaMemcpyHostToDevice); cudaMemcpy(w.bad, zero.data(), Pb * 4, cudaMemcpyHostToDevice);
         oz::det_mod_batch(w, dA);
-        cudaMemcpy(&det[b], w.det, Pb * 4, cudaMemcpyDeviceToHost); cudaMemcpy(&bad[b], w.bad, Pb * 4, cudaMemcpyDeviceToHost);
+        const size_t k = std::min<size_t>(Pb, pr.size() - b);   // the last batch may be short (the 16-bit primes ran out)
+        cudaMemcpy(&det[b], w.det, k * 4, cudaMemcpyDeviceToHost); cudaMemcpy(&bad[b], w.bad, k * 4, cudaMemcpyDeviceToHost);
     }
     w.free_();
 }
@@ -224,13 +225,13 @@ int main(int argc, char **argv) {
         gU = dU; gL = dL;
     };
 
-    double hr = 0, hc = 0, cmin = 1e300, rmin = 1e300;   // Hadamard over rows and over columns: log2 |det| <= min of the two
+    double hr = 0, hc = 0, cmin = 1e300, rmin = 1e300, rmax = -1e300;   // Hadamard over rows and over columns: log2 |det| <= min of the two
     std::vector<double> cn(n, 0);
     for (int i = 0; i < n; i++) {
         double r = 0;
         for (int k = 0; k < n; k++) { double a = 0; for (int j = 0; j < L; j++) a += A[(size_t)j * n * n + (size_t)i * n + k] * ldexp(1.0, 8 * (j - L + 1)); r += a * a; cn[k] += a * a; }
         hr += 0.5 * log2(r) + 8.0 * (L - 1);   // entries scaled by 2^-8(L-1) above
-        rmin = std::min(rmin, 0.5 * log2(r) + 8.0 * (L - 1));
+        rmin = std::min(rmin, 0.5 * log2(r) + 8.0 * (L - 1)); rmax = std::max(rmax, 0.5 * log2(r) + 8.0 * (L - 1));
     }
     for (int k = 0; k < n; k++) { hc += 0.5 * log2(cn[k]) + 8.0 * (L - 1); cmin = std::min(cmin, 0.5 * log2(cn[k]) + 8.0 * (L - 1)); }
     const double hb = std::min(hr, hc);
@@ -270,7 +271,7 @@ int main(int argc, char **argv) {
         // 0. the proved bound on log2 |det| (step 4 needs it) on its own thread and stream, overlapping steps 1-3
         // (above n = 8192 it waits until the [A I] workspace is freed: both do not fit in 12 GB together)
         auto start_bound = [&] {
-            if (method == 1 && !getenv("OZ_HADAMARD") && (n >= 4096 || (gPlanes > 1 && n >= 2048 && n <= 16384) || getenv("OZ_BOUND")))   // large entries: Hadamard leaves ~0.72 n bits, the primes for them cost more
+            if (method == 1 && !getenv("OZ_HADAMARD") && !(gFile && rmax - rmin > 64) && (n >= 4096 || (gPlanes > 1 && n >= 2048 && n <= 16384) || getenv("OZ_BOUND")))   // large entries: Hadamard leaves ~0.72 n bits, the primes for them cost more
                 bth = std::thread([&] { const double tb = now(); ub = std::min(hb, oz::det_log2_bound(n, dA, getenv("OZ_S") ? atoi(getenv("OZ_S")) : 20, &bprimes, gPlanes)); t_bth = now() - tb; });
         };
         if (n <= 8192) start_bound();
@@ -570,8 +571,10 @@ int main(int argc, char **argv) {
             if (use.back()) det[i] = (uint64_t)det[i] * invm(dm, pr[i]) % pr[i];
         }
         mpz_t c; mpz_init(c); gb = crt(c, pr, det, use); nprimes = pr.size();
-        if (gb < need_c) { printf("NOT ENOUGH GOOD PRIMES\n"); return 1; }
-        mpz_mul(D, D, c); t_mod = now() - t3;
+        if (gb < need_c && gFile) printf("  file: det / d needs %.0f bits, the 16-bit primes give %.0f: det NOT computed (|det| >= d, %ld bits); the solution above is complete\n", need_c, gb, dbits);
+        else if (gb < need_c) { printf("NOT ENOUGH GOOD PRIMES\n"); return 1; }
+        if (gb >= need_c) mpz_mul(D, D, c);
+        t_mod = now() - t3;
         mpz_clears(Q, xj, num, den, c, nullptr);
     }
     const double total = now() - t0;
