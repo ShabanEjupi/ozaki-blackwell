@@ -133,17 +133,7 @@ int main(int argc, char **argv) {
                 if (OLMO) norm(y, kn[L], k); else k = y; rope(k, D_KV, t); seqs[j].kc[L].insert(seqs[j].kc[L].end(), k.begin(), k.end()); }
             W = load_bf(P + "self_attn.v_proj.weight", D_KV * D_HD, D_H);
             for (size_t j = 0; j < NS; j++) { auto y = gemv(W, act_plain(x[j]), 8, seqs[j].mode, seqs[j].mode == 0); seqs[j].vc[L].insert(seqs[j].vc[L].end(), y.begin(), y.end()); }
-            for (size_t j = 0; j < NS; j++) {
-                auto &K = seqs[j].kc[L], &V = seqs[j].vc[L]; size_t T = K.size() / ((size_t)D_KV * D_HD);
-                #pragma omp parallel for schedule(static)
-                for (int hq = 0; hq < D_Q; hq++) {
-                    int g = hq / (D_Q / D_KV); std::vector<double> sc(T); double mx = -1e300;
-                    for (size_t u = 0; u < T; u++) { double a = 0; for (int d = 0; d < D_HD; d++) a += (double)q[j][hq * D_HD + d] * K[(u * D_KV + g) * D_HD + d];
-                        sc[u] = a / sqrt((double)D_HD); mx = std::max(mx, sc[u]); }
-                    double den = 0; for (auto &v : sc) { v = exp(v - mx); den += v; }
-                    for (int d = 0; d < D_HD; d++) { double a = 0; for (size_t u = 0; u < T; u++) a += sc[u] * V[(u * D_KV + g) * D_HD + d]; o[j][hq * D_HD + d] = bf(a / den); }
-                }
-            }
+            for (size_t j = 0; j < NS; j++) attend(q[j], seqs[j].kc[L], seqs[j].vc[L], D_Q, D_KV, D_HD, o[j]);
             W = load_bf(P + "self_attn.o_proj.weight", D_H, D_Q * D_HD);
             for (size_t j = 0; j < NS; j++) { auto y = gemv(W, act_plain(o[j]), 8, seqs[j].mode, seqs[j].mode == 0);
                 if (OLMO) { std::vector<float> n; norm(y, n1[L], n); y = n; }
@@ -163,20 +153,12 @@ int main(int argc, char **argv) {
         for (auto &s : seqs) {
             std::vector<float> hn; norm(s.h, normf, hn);
             auto lg = gemv(LM, act_plain(hn), 24, s.mode, s.mode == 0); s.dig = fnv(s.dig, lg);
-            int b1 = 0; for (int v = 1; v < D_V; v++) if (lg[v] > lg[b1]) b1 = v;
-            int b2 = b1 ? 0 : 1; for (int v = 0; v < D_V; v++) if (v != b1 && lg[v] > lg[b2]) b2 = v;
+            int b1 = pick(lg, t, s.prompt, s.mode, s.toks[t]);
             if (t + 1 >= s.plen && t + 1 >= s.toks.size()) s.toks.push_back(b1);
-            printf("step %zu prompt %d mode %d token %d next %d top1 %.6f top2 %d %.6f\n", t, s.prompt, s.mode, s.toks[t], b1, lg[b1], b2, lg[b2]);
         }
         fflush(stdout);
         double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         fprintf(stderr, "step %zu: %.1f s (disk %.1f s, %.1f GB), uncertified so far %lld\n", t, sec, t_disk - d0, (bytes_disk - b0) / 1e9, st_bad);
     }
-    const char *fn[4] = {"BF16", "FP32", "FP8", "NVFP4"};
-    for (int f = 0; f < 4; f++) if (st_out[f])
-        printf("shadow %s outputs %lld engine_s1_differs %lld (%.2f%%) engine_s4_differs %lld (%.2f%%)\n", fn[f], st_out[f],
-               st_d1[f], 100.0 * st_d1[f] / st_out[f], st_d4[f], 100.0 * st_d4[f] / st_out[f]);
-    printf("uncertified %lld\n", st_bad);
-    for (auto &s : seqs) printf("digest prompt %d mode %d: %016llx\n", s.prompt, s.mode, (unsigned long long)s.dig);
-    for (auto &s : seqs) { printf("seq prompt %d mode %d:", s.prompt, s.mode); for (int v : s.toks) printf(" %d", v); printf("\n"); }
+    report(seqs);
 }

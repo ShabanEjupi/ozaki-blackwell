@@ -313,13 +313,43 @@ static int selftest() {
     return fails != 0;
 }
 
+// ---- shared by the model drivers (ultra.cu, dense.cu) ----------------------------------------------------------------------
+// one token's causal attention over its cache in FP64, rounded once to BF16; query head h reads KV head h / (nq / nkv)
+static void attend(const std::vector<float> &q, const std::vector<float> &K, const std::vector<float> &V, int nq, int nkv, int hd,
+                   std::vector<float> &o) {
+    size_t T = K.size() / ((size_t)nkv * hd);
+    #pragma omp parallel for schedule(static)
+    for (int hq = 0; hq < nq; hq++) {
+        int g = hq / (nq / nkv); std::vector<double> sc(T); double mx = -1e300;
+        for (size_t u = 0; u < T; u++) { double a = 0; for (int d = 0; d < hd; d++) a += (double)q[hq * hd + d] * K[(u * nkv + g) * hd + d];
+            sc[u] = a / sqrt((double)hd); mx = std::max(mx, sc[u]); }
+        double den = 0; for (auto &v : sc) { v = exp(v - mx); den += v; }
+        for (int d = 0; d < hd; d++) { double a = 0; for (size_t u = 0; u < T; u++) a += sc[u] * V[(u * nkv + g) * hd + d]; o[hq * hd + d] = bf(a / den); }
+    }
+}
+// greedy: the largest logit (lowest id on a tie), printed with the runner-up
+static int pick(const std::vector<float> &lg, size_t t, int prompt, int mode, int token) {
+    int V = lg.size(), b1 = 0; for (int v = 1; v < V; v++) if (lg[v] > lg[b1]) b1 = v;
+    int b2 = b1 ? 0 : 1; for (int v = 0; v < V; v++) if (v != b1 && lg[v] > lg[b2]) b2 = v;
+    printf("step %zu prompt %d mode %d token %d next %d top1 %.6f top2 %d %.6f\n", t, prompt, mode, token, b1, lg[b1], b2, lg[b2]);
+    return b1;
+}
+template <class S> static void report(const std::vector<S> &seqs) {   // shadow statistics, digests, token ids
+    const char *fn[4] = {"BF16", "FP32", "FP8", "NVFP4"};
+    for (int f = 0; f < 4; f++) if (st_out[f])
+        printf("shadow %s outputs %lld engine_s1_differs %lld (%.2f%%) engine_s4_differs %lld (%.2f%%)\n", fn[f], st_out[f],
+               st_d1[f], 100.0 * st_d1[f] / st_out[f], st_d4[f], 100.0 * st_d4[f] / st_out[f]);
+    printf("uncertified %lld\n", st_bad);
+    for (auto &s : seqs) printf("digest prompt %d mode %d: %016llx\n", s.prompt, s.mode, (unsigned long long)s.dig);
+    for (auto &s : seqs) { printf("seq prompt %d mode %d:", s.prompt, s.mode); for (int v : s.toks) printf(" %d", v); printf("\n"); }
+}
+
 // ---- sequences ---------------------------------------------------------------------------------------------------------
 struct Seq {
     int prompt, mode; std::vector<int> toks; size_t plen;
     std::vector<float> h;
     std::map<int, std::vector<float>> conv, ssm;            // per Mamba layer: last 3 conv inputs [CONV][3], state [MH][MD][MN]
     std::map<int, std::vector<float>> kc, vc;               // per attention layer: [t][NKV*HD]
-    std::vector<std::pair<float, float>> top;
     uint64_t dig = 1469598103934665603ULL;   // FNV-1a of every residual stream after every layer and every logit vector
 };
 
@@ -441,17 +471,7 @@ int main(int argc, char **argv) {
                     for (size_t j = 0; j < seqs.size(); j++) { auto r = gemv(W, act_plain(x[j]), 8, seqs[j].mode, seqs[j].mode == 0);
                         auto &c = kv[0] == 'k' ? seqs[j].kc[L] : seqs[j].vc[L]; c.insert(c.end(), r.begin(), r.end()); }
                 }
-                for (size_t j = 0; j < seqs.size(); j++) {
-                    auto &K = seqs[j].kc[L], &Vv = seqs[j].vc[L]; size_t T = K.size() / (NKV * HD);
-                    #pragma omp parallel for schedule(static)
-                    for (int hq = 0; hq < NQ; hq++) {
-                        int g = hq / (NQ / NKV); std::vector<double> sc(T); double mx = -1e300;
-                        for (size_t u = 0; u < T; u++) { double a = 0; for (int d = 0; d < HD; d++) a += (double)q[j][hq * HD + d] * K[(u * NKV + g) * HD + d];
-                            sc[u] = a / sqrt((double)HD); mx = std::max(mx, sc[u]); }
-                        double den = 0; for (auto &v : sc) { v = exp(v - mx); den += v; }
-                        for (int d = 0; d < HD; d++) { double a = 0; for (size_t u = 0; u < T; u++) a += sc[u] * Vv[(u * NKV + g) * HD + d]; o[j][hq * HD + d] = bf(a / den); }
-                    }
-                }
+                for (size_t j = 0; j < seqs.size(); j++) attend(q[j], seqs[j].kc[L], seqs[j].vc[L], NQ, NKV, HD, o[j]);
                 W = load_w(Q + "o_proj.weight", F_BF16, H, NQ * HD);
                 for (size_t j = 0; j < seqs.size(); j++) out[j] = gemv(W, act_plain(o[j]), 8, seqs[j].mode, seqs[j].mode == 0);
             } else {   // moe
@@ -507,22 +527,14 @@ int main(int argc, char **argv) {
         for (auto &s : seqs) {   // final norm, logits (FP32, correctly rounded on the exact path), greedy
             std::vector<float> hn(H); rmsnorm(s.h, normf, hn, 0, H);
             auto lg = gemv(LM, act_plain(hn), 24, s.mode, s.mode == 0); s.dig = fnv(s.dig, lg);
-            int b1 = 0; for (int v = 1; v < VOC; v++) if (lg[v] > lg[b1]) b1 = v;
-            int b2 = b1 ? 0 : 1; for (int v = 0; v < VOC; v++) if (v != b1 && lg[v] > lg[b2]) b2 = v;
-            if (t + 1 >= s.plen) { if (t + 1 >= s.toks.size()) s.toks.push_back(b1); s.top.push_back({lg[b1], lg[b2]}); }
-            printf("step %zu prompt %d mode %d token %d next %d top1 %.6f top2 %d %.6f\n", t, s.prompt, s.mode, s.toks[t], b1, lg[b1], b2, lg[b2]);
+            int b1 = pick(lg, t, s.prompt, s.mode, s.toks[t]);
+            if (t + 1 >= s.plen && t + 1 >= s.toks.size()) s.toks.push_back(b1);
         }
         fflush(stdout);
         double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         fprintf(stderr, "step %zu: %.1f s (disk %.1f s, %.1f GB, %.2f GB/s), uncertified so far %lld\n", t, sec, t_disk - d0,
                 (bytes_disk - b0) / 1e9, (bytes_disk - b0) / 1e9 / std::max(1e-9, t_disk - d0), st_bad);
     }
-    const char *fn[4] = {"BF16", "FP32", "FP8", "NVFP4"};
-    for (int f = 0; f < 4; f++) if (st_out[f])
-        printf("shadow %s outputs %lld engine_s1_differs %lld (%.2f%%) engine_s4_differs %lld (%.2f%%)\n", fn[f], st_out[f],
-               st_d1[f], 100.0 * st_d1[f] / st_out[f], st_d4[f], 100.0 * st_d4[f] / st_out[f]);
-    printf("uncertified %lld\n", st_bad);
-    for (auto &s : seqs) printf("digest prompt %d mode %d: %016llx\n", s.prompt, s.mode, (unsigned long long)s.dig);
-    for (auto &s : seqs) { printf("seq prompt %d mode %d:", s.prompt, s.mode); for (int v : s.toks) printf(" %d", v); printf("\n"); }
+    report(seqs);
 }
 #endif
