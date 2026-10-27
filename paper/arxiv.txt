@@ -5,7 +5,7 @@ Authors:    Shaban Ejupi
 Primary:    cs.MS (Mathematical Software)
 Cross-list: cs.DC, cs.SC, math.NA
 License:    CC BY 4.0
-Comments:   9 pages. Code and every measurement: https://git.spacecode.tech/shaban/ozaki-blackwell
+Comments:   11 pages. Code and every measurement: https://git.spacecode.tech/shaban/ozaki-blackwell
 
 Abstract (plain text, under arXiv's 1920 characters):
 Laptop GPUs run FP64 at 1/64 of their FP32 rate, while their INT8 tensor cores are hundreds of times faster. On a laptop
@@ -19,7 +19,7 @@ the CPU and 145 times faster than MPFR. With primes below 2^16 and 2^23 split in
 matrices with 1,015 to 131,063-bit entries is 10 to 19 times faster than FLINT on 24 threads. Turning the problem around,
 int8 in and residues out, the exact determinant of an int8 matrix comes 224 times sooner than FLINT at n=4096 and 355
 times at n=8192, with a proved bound on |det A| tight to one bit; n=16384 (204,480 bits) takes 66 s and n=32768
-(425,348 bits) 594 s within the GPU's 12 GB. With 32- to 256-bit entries, high-order lifting on the same modular GEMMs and a proved bound for such entries are 63 to 306 times faster than FLINT (n=4096, 64-bit entries: 3.3 s against 868 s), the ratio growing with the bits. Every result is bit-exact against GMP/FLINT or checked modulo independent
+(425,348 bits) 594 s within the GPU's 12 GB. With 32- to 256-bit entries, high-order lifting on the same modular GEMMs and a proved bound for such entries are 63 to 380 times faster than FLINT (n=4096, 64-bit entries: 2.3 s against 868 s), the ratio growing with the bits. On 13 of the most ill-conditioned real matrices of NIST Matrix Market the certified exact solution takes 0.2-34 s, up to ~900 times sooner than SPEX; FP64 has no correct digit on 7 of them. Every result is bit-exact against GMP/FLINT or checked modulo independent
 primes.
 
 Ready: upload arxiv.tar.gz, paste the fields above.

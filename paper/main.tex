@@ -30,7 +30,7 @@ $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.855~s at $n=8192$, $499
 and double-double have no correct digit, a triple-double LU on the GPU is $32\times$ faster than the same arithmetic on 24 CPU
 threads and $145\times$ faster than MPFR, and is the most accurate of the three. Counting CPU and GPU power, a double-double
 solve uses $\sim$270$\times$ less energy than the quad-precision CPU solve. Leaving 8-bit moduli for primes below $2^{16}$ and $2^{23}$ split into bytes, an \emph{exact} product of integer matrices with entries of 1\,015 to 131\,063 bits costs work linear in the bits, is bit-exact against GMP, and runs $10$--$19\times$ faster than FLINT's multimodular \texttt{fmpz\_mat\_mul} on 24 CPU threads, with $15$--$18\times$ less energy. Turning the problem around---int8 in, residues out---the exact determinant of an int8 matrix comes $224\times$ sooner than FLINT at $n=4096$ and $355\times$ at $n=8192$ (98\,139 bits), with a proved bound on $|\det A|$ tight to one bit, and $n=16\,384$ (204\,480 bits) takes 66~s, $n=32\,768$ (425\,348 bits) 594~s within the 12~GB of the GPU. For entries of 32 to 256 bits, high-order lifting on the same modular GEMMs (the residue squared in RNS, the solution vector carried through INT8 GEMMs) and a proved bound for byte-plane entries give the determinant $236\times$ sooner than FLINT at $n=2048$ with 64-bit entries, $306\times$ with 128-bit entries and $265\times$ at $n=4096$ (276\,398 bits in 3.3~s against 868~s): the ratio grows with the entry size. The laptop is power-bound ($\sim$95~W) under these
-kernels, which shapes what can and cannot be gained.
+kernels, which shapes what can and cannot be gained. On 13 of the most ill-conditioned real matrices of NIST Matrix Market ($n\le5005$, entries up to 154 bits) the certified exact solution takes 0.2--34~s, up to $\sim$900$\times$ sooner than SPEX; FP64 has no correct digit on 7 of them.
 \end{abstract}
 
 \noindent\textbf{Përmbledhje (shqip).} Kartelat grafike të laptopëve e ekzekutojnë FP64 me 1/64 e shpejtësisë FP32, ndërsa
@@ -341,6 +341,50 @@ $n$ & $b$ & $|\det A|$ bits & Dixon & HOL & FLINT & vs FLINT \\\midrule
 Moduli below 256 for $X$ (one GEMM per modulus, as in Ozaki-II) are not an option here: without pivoting the LU modulo $p$
 fails with probability $\approx 1-e^{-n/p}$.
 
+\section{Real systems: how wrong FP64 is, and the exact answer}\label{sec:real}
+The residue chain of the lifting above now runs over 8-bit moduli wherever B$_0$ is not involved: $Z^2$ exactly in an RNS of
+23--42 odd moduli below 256 (one INT8 GEMM each; on random data a 16-bit modular product costs $2.8\times$ more per bit of
+modulus at $n=4096$), a base extension by approximate CRT to the 16-bit primes of $X$, and $AM$ modulo the first 10--19 moduli
+only. At $4096\times64$ bits this takes the determinant from 3.22 to 2.28~s ($380\times$ FLINT), with the same result.
+
+We then took the 13 most ill-conditioned square real matrices with $900\le n\le 8192$ of NIST Matrix Market---fluid dynamics
+(FIDAP, LNS), magnetohydrodynamics (MHD), the Quebec Hydro network, crystal growth, oil reservoirs, a chemical
+plant---and solved $Ax=b$ \emph{exactly}. Every double is $m\,2^e$, so scaling row $i$ by $2^{k_i}$ gives integer entries (up
+to 154 bits) and the same $x$, with no rounding anywhere; rows are ordered by FP64 partial pivoting, since the GPU LU does not
+pivot. High-order lifting gives all $n$ entries, a common denominator follows from a few half-gcd reconstructions, the
+reconstruction is unique by the Hadamard and Cramer bounds, and $yM=c$ is checked modulo two further primes. On the same
+integers we ran SPEX Left LU~\cite{spex} (SuiteSparse 7.6, exact sparse REF LU, one CPU thread); both programs print a digest
+$\sum_j x_j r^j \bmod 2^{61}-1$. FP64 is LAPACK \texttt{dgesv} and SuperLU on the original doubles.
+
+\begin{table}[h]\centering\footnotesize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lrrrrrrcrr}
+\hline
+matrix & $n$ & $\kappa$ (NIST) & bits & GPU s & SPEX s & & same $x$ & \multicolumn{2}{c}{FP64 digits (entries with none)}\\
+ & & & & & & & & LAPACK & SuperLU \\ \hline
+west0989 & 989 & 5.7$\cdot 10^{12}$ & 75 & 0.17 & 1.5 & 9$\times$ & yes & 11.7 (0) & 11.8 (0) \\
+qh1484 & 1484 & 5.6$\cdot 10^{17}$ & 96 & 0.55 & 12.4 & 23$\times$ & yes & 11.2 (0) & 12.2 (0) \\
+fidap032 & 1159 & 5.2$\cdot 10^{20}$ & 60 & 0.28 & 54.5 & 193$\times$ & yes & 0.0 (568) & 0.0 (572) \\
+fidap006 & 1651 & 3.5$\cdot 10^{21}$ & 154 & 1.08 & 963.7 & 895$\times$ & yes & 0.0 (887) & 0.0 (693) \\
+cry2500 & 2500 & 4.4$\cdot 10^{17}$ & 70 & 1.41 & $>$7200 &  & -- & 6.4 (0) & 5.1 (0) \\
+fidapm07 & 2065 & 6.8$\cdot 10^{19}$ & 118 & 1.19 & -- &  & -- & 0.0 (430) & 0.0 (290) \\
+fidap026 & 2163 & 4.7$\cdot 10^{18}$ & 153 & 2.12 & -- &  & -- & 0.0 (1568) & 0.0 (1530) \\
+mhd3200a & 3200 & 6.5$\cdot 10^{39}$ & 130 & 4.02 & -- &  & -- & 0.0 (2876) & 0.0 (2768) \\
+fidap014 & 3251 & 2.6$\cdot 10^{16}$ & 124 & 4.74 & -- &  & -- & 7.6 (0) & 8.0 (0) \\
+lns\_3937 & 3937 & 1.0$\cdot 10^{17}$ & 79 & 4.31 & -- &  & -- & 10.1 (2) & 7.4 (1) \\
+fidap012 & 3973 & 2.2$\cdot 10^{20}$ & 119 & 7.44 & -- &  & -- & 0.0 (483) & 0.0 (482) \\
+mhd4800a & 4800 & 3.2$\cdot 10^{47}$ & 131 & 34.39 & -- &  & -- & 0.0 (3923) & 0.0 (4754) \\
+sherman3 & 5005 & 6.9$\cdot 10^{16}$ & 102 & 14.25 & -- &  & -- & 11.8 (0) & 12.4 (0) \\
+\hline
+\end{tabular}
+\caption{Exact solutions of real systems on the laptop (GPU: $A^{-1}$, lifting, reconstruction and all numerators). SPEX
+ran afterwards on the CPU alone, limit 2~h. $yM=c$ held modulo both check primes in every row.}\label{tab:real}
+\end{table}
+
+On 7 of the 13 systems FP64 has not one correct digit, LAPACK and SuperLU alike---on mhd3200a and mhd4800a the normwise error
+is $10^8$ and 82--99\,\% of the entries have no correct digit---and NIST's own (FP64) condition estimate does not say which:
+qh1484 at $5.6\cdot10^{17}$ keeps 11 digits. The certified exact solution takes 0.2--34~s; SPEX returns the same $x$, bit for
+bit, where it finishes within the limit, 9 to $\sim$900$\times$ later.
+
 \section{Energy}\label{sec:energy}
 Under these kernels the laptop holds $\sim$95~W and the SM clock drops to $\sim$1.8~GHz (2.76~GHz with only the FP64 units busy).
 For GEMM at $n=4096$ (\texttt{bench/energy.cu}, power every 200~ms): native FP64 7.4~GFLOPS/W, Ozaki-II at 16 moduli 53.6
@@ -377,6 +421,9 @@ quad precision finishes $499\times$ sooner than on the laptop's own CPU, with $\
 the panel (now the bound of the triple-double solve), CUDA graphs for its launches, and out-of-core sizes beyond the GPU's 12~GB.
 
 \begin{thebibliography}{99}
+\bibitem{spex} C.~Lourenco, J.~Chen, E.~Moreno-Centeno, T.~A.~Davis. Algorithm 1021: SPEX Left LU, exactly solving sparse linear
+systems via a sparse left-looking integer-preserving LU factorization. \emph{ACM Trans. Math. Softw.} 48(2):1--23, 2022.
+doi:10.1145/3519024.
 \bibitem{ozaki2} K.~Ozaki, Y.~Uchino, T.~Imamura. Ozaki Scheme II: A GEMM-oriented emulation of floating-point matrix
 multiplication using an integer modular technique. arXiv:2504.08009, 2025.
 \bibitem{ozaki2sgemm} Y.~Uchino, K.~Ozaki, T.~Imamura. High-performance and power-efficient emulation of matrix
