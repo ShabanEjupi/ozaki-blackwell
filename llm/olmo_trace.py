@@ -6,19 +6,23 @@
 # python3 -I llm/olmo_trace.py --seqs olmo.txt [min words]   (the lines "seq prompt P mode M: 'text'" of ultra_tok.py dec)
 # --index NAME: another infini-gram index, e.g. v4_dclm-baseline_llama (4.3T tokens of filtered Common Crawl) for a model
 # whose own data is not open (Nemotron 3 Ultra: Nemotron-CC is drawn from Common Crawl; that is the public web, not its set).
-import ast, json, sys, time, urllib.request
+import ast, json, sys, time, urllib.error, urllib.request
 API, IDX = "https://api.infini-gram.io/", "v4_olmo-2-0325-32b-instruct_llama"
 if "--index" in sys.argv:
     i = sys.argv.index("--index"); IDX = sys.argv[i + 1]; del sys.argv[i:i + 2]
 
-def q(**kw):
+def q(**kw):   # one query, politely: 0.5 s apart; a 403/429 (rate limit, seen 27-10 after ~200 fast queries) waits minutes
     kw["index"] = IDX
-    for t in range(6):
+    for t in range(8):
+        time.sleep(0.5)
         try:
-            r = urllib.request.Request(API, json.dumps(kw).encode(), {"Content-Type": "application/json"})
+            r = urllib.request.Request(API, json.dumps(kw).encode(), {"Content-Type": "application/json", "User-Agent": "ozaki-blackwell olmo_trace.py"})
             with urllib.request.urlopen(r, timeout=60) as f: out = json.load(f)
             if "error" not in out: return out
             err = out["error"]
+        except urllib.error.HTTPError as e:
+            err = f"HTTP {e.code}"
+            if e.code in (403, 429): time.sleep(60 * (t + 1)); continue
         except Exception as e: err = str(e)
         time.sleep(2 * (t + 1))
     raise SystemExit(f"infini-gram: {err}")
