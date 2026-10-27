@@ -56,15 +56,15 @@ per INT8 operation (fewer moduli, fewer bit flips), not in latency hiding.
 Under load the laptop holds ~95 W and the SM clock drops to ~1.8 GHz (2.76 GHz on the FP64 units alone).
 
 ## Next / Më tej (27-10-2026)
-- The SPEX column of the real-system table fills overnight (`/opt/ozaki/real/batch.log`; regenerate with `bench/real_table.py [--tex]`).
-- M = B₀·R̄ mod X is the largest 16-bit part of the residue chain left: A⁻¹ modulo primes < 256 needs a batched LU **with** pivoting.
-- Real systems above n ≈ 6000 do not fit the HOL buffers in 12 GB (W·n² bytes per Z copy): block the residue chain by columns.
-- The proved bound stalls when row norms differ by more than ~2⁶⁴ (FP32 of A/256^{L−1} underflows): scale rows by powers of
-  two inside the bound (log₂\|det\| adds the exponents) instead of skipping it.
-- n = 32768 (int8): a tighter bound would save at most the 71 s of det/d out of 594 s; an FP64 LU for it costs ~50 s at 1/64 rate.
+- Kimi K3 end to end on this laptop needs 1.56 TB of storage (669 GB free; the office link gave 2.9 MB/s): an external NVMe
+  and the K3 attention (KDA linear attention + MLA) on the exact products; then the whole model streams at ~27 s per token.
+- Real systems above n ≈ 6000 run by Dixon (bench/real_dixon.sh); HOL by column blocks would be 2.6–4.3× faster there.
+- The SPEX column fills when the night runs finish (`/opt/ozaki/real/batch.log`, pass 2b; `bench/real_table.py [--tex]`).
+- The decode kernel reads 94 GB/s of packed weights, below what the GPU memory gives (irrelevant while the weights stream from disk).
+- An 8-bit X for HOL was measured and dropped (below); the proved bound with row scaling and n = 32768 remain as before.
 
-**SQ** — Radha: kolona SPEX plotësohet natën; M me prime < 256 kërkon LU me pivotim; n > 6000 kërkon zinxhirin në blloqe;
-kufiri i provuar me shkallëzim rreshtash; 32768: kufiri më i ngushtë kursen ≤ 71 s nga 594.
+**SQ** — Radha: K3 i plotë kërkon 1,56 TB disk (SSD i jashtëm) dhe vëmendjen e K3; n > 6000 me Dixon (HOL në blloqe do
+ishte 2,6–4,3× më shpejt); kolona SPEX plotësohet natën.
 
 ## Double-double (~106-bit) GEMM from INT8 — a precision no GPU has in hardware (`bench/dd_test.cu`)
 
