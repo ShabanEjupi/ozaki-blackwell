@@ -437,7 +437,8 @@ integer-loop path, 32 tokens alone, Python rationals from the raw bytes (sampled
 \texttt{mma.m16n8k64.kind::mxf4nvf4.block\_scale.scale\_vec::4X} with FP32 accumulation (what inference engines run), leaves
 18--49\% of the outputs not correctly rounded and changes up to 0.81\% of them between split-K 1 and 4; an emulation with
 an exact epilogue shows that the FP32 sum alone accounts for 0--0.9\% and the rest is $\alpha=\mathrm{fp32}(g_Wg_A)$. With the
-same plain tiling the native instruction runs at 50--55~TOPS and the exact path at 16--18~TOPS. The exact decode reads 405--487~GB/s of packed weights for one
+same plain tiling the native instruction runs at 50--55~TOPS and the exact path at 16--18~TOPS; sustained at sim~W they
+give 435--477 and 155~GOP per joule. The exact decode reads 405--487~GB/s of packed weights for one
 token and 136--184~GB/s for eight; the whole NVFP4 checkpoint ($\sim$320~GB) fits this laptop's free disk.
 \fussy
 

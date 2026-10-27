@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 #include <random>
@@ -422,6 +423,21 @@ static float *project(const std::string &dir, const std::string &pre, int M, int
         printf("  native NVFP4 MMA (m16n8k64 block_scale, FP32 acc) %.3f ms = %.1f TOPS: not correctly rounded split 1 %zu (%.2f %%), "
                "split 4 %zu (%.2f %%), split 1 vs 4 differ %zu (%.2f %%), max rel. error %.2e\n",
                tn, 2.0 * MN * K / tn / 1e9, e1n, 100.0 * e1n / MN, e4n, 100.0 * e4n / MN, d14n, 100.0 * d14n / MN, rel);
+        // NV_ENERGY=s: s seconds of exact prefill, 3 s idle, s seconds of the native FP4 MMA (llm/energy_nv.sh samples the power)
+        if (getenv("NV_ENERGY")) {
+            const double secs = atof(getenv("NV_ENERGY"));
+            auto wall = [] { struct timespec t; clock_gettime(CLOCK_REALTIME, &t); return t.tv_sec + 1e-9 * t.tv_nsec; };
+            const char *p = pre.c_str() + pre.rfind('.') + 1;
+            double t0 = wall(); long it = 0;
+            while (wall() - t0 < secs) { tc(); CK(cudaDeviceSynchronize()); it++; }
+            const double t1 = wall();
+            printf("ENERGY exact_%s %.3f %.3f %ld %d %d %d\n", p, t0, t1, it, M, N, K); fflush(stdout);
+            while (wall() - t1 < 3) {}
+            const double t2 = wall(); long in = 0;
+            while (wall() - t2 < secs) { nat(Yn1, 1); CK(cudaDeviceSynchronize()); in++; }
+            printf("ENERGY native_%s %.3f %.3f %ld %d %d %d\n", p, t2, wall(), in, M, N, K); fflush(stdout);
+            const double t3 = wall(); while (wall() - t3 < 3) {}
+        }
         CK(cudaFree(dpa)); CK(cudaFree(Yn1)); CK(cudaFree(Yn4));
     }
     // decode: 1 and 8 tokens straight from the packed nibbles, timed against the FP32 GEMV; bits must equal the prefill path

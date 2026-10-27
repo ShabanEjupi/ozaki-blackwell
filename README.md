@@ -694,6 +694,7 @@ One routed expert end to end, real weights (expert 0 of MoE layers 49 and 99; 40
 | native, split-K 1 vs 4 differ | 0 % | 0.81 % | 0 % | 0.28 % |
 | native speed (the same plain tiling as the exact kernel) | 49.5 TOPS | 55.0 | 50.3 | 54.8 |
 | CPU (numpy BLAS + Python integers, `nv_cpu.py`), every output vs the GPU tensor cores | 0 of 20 971 520 differ | 0 of 8 388 608 | | |
+| energy, 10 s each at ~94 W (`llm/energy_nv.sh`): exact / native, GOP per joule | 155 / 435 | 156 / 477 | | |
 | the same FP32 sum with an exact epilogue (summation alone) | 0 % | 0.88 % | 0 % | 0.35 % |
 | split-K 1 vs 4 differ | 0 % | 0.30 % | 0 % | 0.12 % |
 | exact prefill (INT8 MMA + int64 epilogue) | 16.1 TOPS | 17.5 | 16.5 | 17.4 |
