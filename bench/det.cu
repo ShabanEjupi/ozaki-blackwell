@@ -63,6 +63,33 @@ static void file_convert(const std::vector<int16_t> &dig, int n, int S, const ui
     mpz_clear(X);
 }
 
+// The same for Dixon (OZ_FILE without OZ_HOL): position k of entry j is S base-2^16 words dig[(k S + u) n + j] (a value in
+// [0, X), X = p_0 ... p_{S-1}), as liftm_x writes them; positions in base X by halves.
+static void file_convert16(const std::vector<uint16_t> &dig, int n, int S, const uint32_t *p, size_t N, const mpz_t Q, std::vector<__mpz_struct> &Y) {
+    std::vector<__mpz_struct> pw; mpz_t X; mpz_init_set_ui(X, 1); for (int t = 0; t < S; t++) mpz_mul_ui(X, X, p[t]);
+    for (size_t len = N; len > 1; len = (len + 1) / 2) { pw.emplace_back(); mpz_init(&pw.back()); if (pw.size() == 1) mpz_set(&pw[0], X); else mpz_mul(&pw.back(), &pw[pw.size() - 2], &pw[pw.size() - 2]); }
+    Y.resize(n);
+#pragma omp parallel for schedule(dynamic, 4)
+    for (int j = 0; j < n; j++) {
+        std::vector<__mpz_struct> v(N);
+        uint16_t w[16];
+        for (size_t k = 0; k < N; k++) {
+            for (int u = 0; u < S; u++) w[u] = dig[(k * S + u) * n + j];
+            mpz_init(&v[k]); mpz_import(&v[k], S, -1, 2, 0, 0, w);
+        }
+        size_t l = 0;
+        for (size_t len = N; len > 1; len = (len + 1) / 2, l++)
+            for (size_t i = 0; 2 * i < len; i++) {
+                if (2 * i + 1 < len) mpz_addmul(&v[2 * i], &v[2 * i + 1], &pw[l]);
+                if (i != 2 * i) mpz_swap(&v[i], &v[2 * i]);
+            }
+        mpz_init(&Y[j]); mpz_mod(&Y[j], &v[0], Q);
+        for (auto &z : v) mpz_clear(&z);
+    }
+    for (auto &z : pw) mpz_clear(&z);
+    mpz_clear(X);
+}
+
 // OZ_FILE, once the denominator D is known from four entries: every numerator num_j = Y_j D (symmetric mod Q), an entry
 // whose numerator is not below 2^nb gets its own reconstruction (D grows to the lcm, a second pass); then y M = c is
 // CHECKED modulo two primes used nowhere else, the digest sum_j y_j r^j mod 2^61 - 1 (r = 1234567: the same as
@@ -211,6 +238,15 @@ int main(int argc, char **argv) {
         if (fread(A.data(), 1, A.size(), fi) != A.size() || fread(gB.data(), 4, n, fi) != (size_t)n) { printf("OZ_FILE: short\n"); return 1; }
         fclose(fi);
     }
+    // Dixon (method 1 without OZ_HOL) lifts A x = b by columns; the file holds the row form y M = c: lift on M^T, same y
+    const bool dixfile = gFile && method == 1 && !getenv("OZ_HOL");
+    std::vector<int8_t> Aorig;
+    if (dixfile) {
+        Aorig = A;
+        for (int j = 0; j < L; j++)
+#pragma omp parallel for
+            for (int i = 0; i < n; i++) for (int k = 0; k < n; k++) A[(size_t)j * n * n + (size_t)k * n + i] = Aorig[(size_t)j * n * n + (size_t)i * n + k];
+    }
     if (kind == 1) for (int j = 0; j < L; j++) A[(size_t)j * n * n] = 0;   // a zero 1 x 1 leading minor (every plane)
     if (kind == 2) for (int j = 0; j < L; j++) for (int k = 0; k < n; k++) A[(size_t)j * n * n + (size_t)(n - 1) * n + k] = A[(size_t)j * n * n + k];   // singular: last row = first row
     // U unit upper, L unit lower, entries in [0, 127] off the diagonal: the same residues for every prime
@@ -298,7 +334,7 @@ int main(int argc, char **argv) {
         uint32_t p = 0; size_t pi = 0; oz::LiftPrimes lp{}; lp.s = S;
         bool singular = false;
         for (;; pi++) {   // 4 plain primes failing = a zero leading minor over Z, or det 0: precondition and try 8 more
-            if (pi == 4 && gFile && hol) { printf("OZ_FILE: a zero leading minor modulo 4 primes (the permutation of mm2oz.py did not take); HOL takes no preconditioner\n"); return 1; }
+            if (pi == 4 && gFile) { printf("OZ_FILE: a zero leading minor modulo 4 primes (the permutation of mm2oz.py did not take); a preconditioner would change x\n"); return 1; }
             if (pi == 4 && !gU) { make_pre(); w.preU = gU; w.preL = gL; }
             if (pi == 12) { singular = true; break; }
             std::vector<uint32_t> one(S, 1); std::vector<int> zero(S, 0), bads(S);
@@ -373,7 +409,7 @@ int main(int argc, char **argv) {
         // 2. lifting: enough digits to reconstruct num / den with |num| <= Hc |b| / min col, den <= H
         std::vector<int32_t> b(n); std::vector<uint32_t> bm(n); double bn = 0; uint64_t sb = 777;
         for (int i = 0; i < n; i++) {
-            sb = sb * 6364136223846793005ull + 1442695040888963407ull; b[i] = (int)((sb >> 33) % 255) - 127;
+            sb = sb * 6364136223846793005ull + 1442695040888963407ull; b[i] = (int)((sb >> 33) % 255) - 127; if (gFile) b[i] = gB[i];
             bm[i] = ((b[i] % (int)p) + p) % p; bn += (double)b[i] * b[i];
         }
         nb = (long)ceil(hc - cmin + 0.5 * log2(bn)) + 2; db = (long)ceil(hb) + 2;
@@ -400,16 +436,19 @@ int main(int argc, char **argv) {
             cudaMalloc(&dr64, r64.size() * 8); cudaMemcpy(dr64, r64.data(), r64.size() * 8, cudaMemcpyHostToDevice);
         }
         cudaMemset(derr, 0, 4);
+        std::vector<uint16_t> fdig(gFile ? steps * S * n : 0);   // OZ_FILE: all digits of all entries, ~ (nb + db) n / 8 bytes
         const double t1 = now();
         for (size_t i = 0; i < steps; i++) {
             if (S > 1) {
                 oz::liftm_step(S, Ai, drmS, lp, dxS, n, dh + i * 4 * S, dA, L, dr64, J, derr);
+                if (gFile) cudaMemcpy(fdig.data() + i * S * n, dxS, (size_t)S * n * 2, cudaMemcpyDeviceToHost);
                 continue;
             }
             uint16_t *xi = method == 2 ? dx + i * n : dx;
             oz::lift_x<<<n / 8, 256>>>(Ai, drm, xi, n, p, dh + i * 4);
             if (L > 1) oz::lift_r_planes<<<n / 8, 256>>>(dA, L, xi, dr64, J, drm, n, p, derr);
             else oz::lift_r<<<n / 8, 256>>>(dA, xi, dr, drm, n, p, derr);
+            if (gFile) cudaMemcpy(fdig.data() + i * n, xi, (size_t)n * 2, cudaMemcpyDeviceToHost);
         }
         std::vector<uint16_t> X(method == 2 ? steps * n : steps * 4 * S); int err;
         cudaMemcpy(X.data(), method == 2 ? dx : dh, X.size() * 2, cudaMemcpyDeviceToHost); cudaMemcpy(&err, derr, 4, cudaMemcpyDeviceToHost);
@@ -531,6 +570,12 @@ int main(int argc, char **argv) {
         mpz_t Mz; mpz_init_set_ui(Mz, 1);   // the modulus of one step: p, or p_0 ... p_{S-1}
         for (int t = 0; t < S; t++) mpz_mul_ui(Mz, Mz, lp.p[t]);
         mpz_pow_ui(Q, Mz, steps);
+        if (gFile) {   // every entry (the first four go on to the reconstruction below)
+            const double tc = now();
+            file_convert16(fdig, n, S, lp.p, steps, Q, gY);
+            for (int j = 0; j < 4; j++) mpz_set(&x4[j], &gY[j]);
+            printf("  file: %d entries converted in %.3f s (Dixon, %zu steps)\n", n, now() - tc, steps);
+        } else
 #pragma omp parallel for
         for (int j = 0; j < 4; j++) {
             mpz_t dg; mpz_init(dg);
@@ -554,7 +599,7 @@ int main(int argc, char **argv) {
         }
         mpz_clear(hq); for (auto &v : x4) mpz_clear(&v);
         dbits = mpz_sizeinbase(D, 2); t_rr = now() - t2;
-        if (gFile) { if (!file_solution(n, L, A, gY, D, Q, nb, db)) return 1; dbits = mpz_sizeinbase(D, 2); }
+        if (gFile) { if (!file_solution(n, L, dixfile ? Aorig : A, gY, D, Q, nb, db)) return 1; dbits = mpz_sizeinbase(D, 2); }
 
         // 4. c = det / d from as many primes as the bound / d needs: |c| < 2^(ub - dbits + 1). ub: the proved bound of
         // src/ozaki_detbound.cuh (a few bits above log2 |det|), or Hadamard (below n = 4096, where cuSOLVER's ~0.3 s setup costs more than the primes it saves; OZ_HADAMARD=1; or FP32 LU finds A singular)
