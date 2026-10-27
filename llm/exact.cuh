@@ -22,12 +22,12 @@ struct Digits {
 };
 
 // one block per row: tiers over the whole row of BF16 values. stat = {tiers used (max), elements left over, inf/nan}
-__global__ void split_rows(const __nv_bfloat16 *X, int8_t *dig, int *Bt, int *stat, int rows, int K, int S) {
+__global__ void split_rows(const __nv_bfloat16 *X, int8_t *dig, int *Bt, int *stat, int rows, int K, int S, int tmax = TMAX) {
     const int j = blockIdx.x, Dc = 7 * S - 8;
     const size_t pl = (size_t)rows * K;
     __shared__ int red[32], Es[TMAX];
     int done = 0, lmax = 0;
-    for (int l = 0; l < TMAX; l++) {
+    for (int l = 0; l < tmax; l++) {
         int E = EMPTY;
         for (int k = threadIdx.x; k < K; k += blockDim.x) {
             uint16_t b = __bfloat16_as_ushort(X[(size_t)j * K + k]);
@@ -97,6 +97,24 @@ __device__ __host__ inline double round_i128(__int128 a, int X, int p) {
     const double big = p == 24 ? 0x1.fffffep127 : 0x1.fep127;
     if (f > big) f = INFINITY;
     return neg ? -f : f;
+}
+
+// MXFP4 weights as Digits with one digit: packed [M][K/2] (low nibble = even k) and E8M0 scales [M][K/32] ->
+// dig[a][0][i][k] = 2 E2M1 << ((s - smin_i) mod 4) when (s - smin_i) / 4 == a, else 0; B[a][i] = smin_i + 4 a - 128.
+// One block per row. A (bands) from the host: (max row spread) / 4 + 1.
+__global__ void mx_digits(const uint8_t *pk, const uint8_t *sc, int8_t *dig, int *B, int M, int K, int A) {
+    const int i = blockIdx.x, G = K / 32;
+    __shared__ int smin;
+    if (threadIdx.x == 0) { int m = 255; for (int g = 0; g < G; g++) m = min(m, (int)sc[(size_t)i * G + g]); smin = m; }
+    __syncthreads();
+    if (threadIdx.x < A) B[(size_t)threadIdx.x * M + i] = smin + 4 * threadIdx.x - 128;
+    const uint32_t LUT = 0xC8643210u;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        const uint8_t b = pk[(size_t)i * (K / 2) + k / 2];
+        const int nb = k & 1 ? b >> 4 : b & 15, r = sc[(size_t)i * G + k / 32] - smin;
+        const int v = (int)((LUT >> (4 * (nb & 7))) & 15) << (r % 4);
+        for (int a = 0; a < A; a++) dig[((size_t)a * M + i) * K + k] = a == r / 4 ? (int8_t)(nb & 8 ? -v : v) : 0;
+    }
 }
 
 // P[z][M][Np], z = ((tw Sw + dw) Tx + tx) Sx + dx: the INT8 GEMM of one digit plane of W with one of X

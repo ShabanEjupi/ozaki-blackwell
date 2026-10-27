@@ -385,6 +385,42 @@ is $10^8$ and 82--99\,\% of the entries have no correct digit---and NIST's own (
 qh1484 at $5.6\cdot10^{17}$ keeps 11 digits. The certified exact solution takes 0.2--34~s; SPEX returns the same $x$, bit for
 bit, where it finishes within the limit, 9 to $\sim$900$\times$ later.
 
+\section{The largest open model: correctly rounded MXFP4 and BF16 products}\label{sec:llm}
+\sloppy
+Kimi K3 (Moonshot AI; read from its Hugging Face model card and safetensors headers: 2\,779\,931\,837\,184 parameters, 1.56~TB)
+is the largest open-weights model. Its routed experts (2.72~T parameters; 93 layers $\times$ 896 experts, 16 per token) are
+stored in MXFP4: an E2M1 value per weight, one E8M0 scale per 32. A group of 32 is the depth of one \texttt{mma.m16n8k32}
+INT8 step and $2\cdot$E2M1 is an integer $\le 12$, so MXFP4$\times$BF16 products can be computed \emph{exactly} on INT8 tensor
+cores and rounded once (\texttt{llm/mxexact.cu}, \texttt{llm/exact.cuh}). Weights: $q' = 2\,\mathrm{E2M1}\cdot 2^{(s-s_{\min})\bmod 4}$ is
+an int8 ($\le 96$), one scale per row and band of four binades (every row of the 48 K3 matrices tested spans $\le 3$ binades:
+one band). Activations: each token is aligned to its largest exponent and cut into $S$ int8 digits ($D_c = 7S-8$ bits below
+the top), smaller elements form further tiers. Every (band, tier, digit) pair is a plain INT8 GEMM whose int32 sums cannot
+overflow ($|P| \le K\cdot 96\cdot 128 < 2^{26.4}$); the few terms of an output are added in a 128-bit integer and rounded once,
+with a certificate when a term falls below the 94-bit window (it never failed). BF16$\times$BF16 is the same with both sides
+in digits. A correctly rounded result cannot depend on the summation order, the tiling, the batch or the machine.
+
+On the real weights of layer 5 (experts 0--15, all three matrices, fetched by HTTP range requests; Student-t activations
+scaled by the layer's real norm weight), against what inference engines do (BF16 tensor cores, FP32 accumulation, split-K
+chosen by shape):
+\begin{center}\begin{tabular}{lr}\toprule
+certified correctly rounded (48 matrices, 79.7~M outputs) & all \\
+independent check (Python integers, raw bytes) & 1500/1500 \\
+batch 1, 3, 17, 64, 200 vs 4096; decode kernel vs prefill & bit-identical \\
+engine outputs not correctly rounded, split-K 1/2/4/8 (expert 0 w1) & 81.5/67.1/55.6/51.2\% \\
+engine, split-K 1 vs 4: outputs whose bits differ & 71\% \\
+prefill, 4096 tokens, $3072\times3584$: exact / BF16 & 8.0 / 2.9 ms \\
+decode, 1 token: exact (packed 4-bit) / FP4 GEMV, FP32 & 0.062 / 0.125 ms \\\bottomrule
+\end{tabular}\end{center}
+On the real router of the layer ($896\times7168$ BF16, FP32 logits, sigmoid plus learned bias, top 16), the rounding of the
+logits alone sends $\sim$1 token in 13\,000 to a different expert (11 in 147\,456 token--split pairs), i.e.\ over K3's 92 MoE
+layers $\sim$1 token in 140 runs a different expert somewhere; with exact logits the choice depends on the input alone.
+
+Where exactness costs nothing: a trillion-parameter model on this laptop is a streaming problem. Per token K3 reads 25.8~GB
+of routed MXFP4 experts and $\sim$112~GB of dense BF16 weights; we measured 5.1~GB/s from the NVMe drive and 45~GB/s over
+PCIe~5~$\times$16, while the exact decode kernel consumes 94~GB/s. A bit-reproducible run therefore takes the same
+$\sim$27~s per token as an ordinary one, all of it reading. What this laptop lacks is 1.56~TB of storage (669~GB free).
+\fussy
+
 \section{Energy}\label{sec:energy}
 Under these kernels the laptop holds $\sim$95~W and the SM clock drops to $\sim$1.8~GHz (2.76~GHz with only the FP64 units busy).
 For GEMM at $n=4096$ (\texttt{bench/energy.cu}, power every 200~ms): native FP64 7.4~GFLOPS/W, Ozaki-II at 16 moduli 53.6
