@@ -35,4 +35,4 @@ if "--tex" in sys.argv:   # the same rows for paper/main.tex
     for r in rows:
         c = [x.strip() for x in r.strip("|").split("|")]
         sp = c[7].replace("> 7200", "$>$7200"); ra = c[8].replace("x", r"$\times$")
-        print(f"{c[0].replace(chr(95), chr(92) + chr(95))} & {c[1]} & {c[3].replace('e', r'$\cdot 10^{').replace('$\cdot 10^{+', '$\cdot 10^{') + '}$' if 'e' in c[3] else c[3]} & {c[4]} & {c[6]} & {sp} & {ra} & {c[9]} & {c[11]} & {c[12]} \\\\")
+        print(f"{c[0].replace(chr(95), chr(92) + chr(95))} & {c[1]} & {c[3].replace('e', r'$\cdot 10^{').replace(r'$\cdot 10^{+', r'$\cdot 10^{') + '}$' if 'e' in c[3] else c[3]} & {c[4]} & {c[6]} & {sp} & {ra} & {c[9]} & {c[11]} & {c[12]} \\\\")

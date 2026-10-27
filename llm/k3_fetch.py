@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-# k3_fetch.py <shard> <regex> <outdir> -- fetch selected tensors of one Kimi K3 safetensors shard with HTTP Range requests
+# k3_fetch.py <shard> <regex> <outdir> -- fetch selected tensors of one safetensors shard (HF_REPO, default Kimi K3) with HTTP Range requests
 # (only the bytes of the chosen tensors travel; a whole shard is ~16 GB). Writes <name>.bin per tensor and meta.json.
 # Source: https://huggingface.co/moonshotai/Kimi-K3 (2 779 931 837 184 parameters; routed experts MXFP4, group 32, E8M0 scales).
 import json, os, re, struct, sys, urllib.request
 
-REPO = "https://huggingface.co/moonshotai/Kimi-K3/resolve/main/"
+# HF_REPO=nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4: 560 524 578 816 parameters, routed experts NVFP4 W4A4 (group 16, E4M3
+# scales, FP32 global), weights + recipe + 14.8T tokens of pre-training data published (model card, 27-10-2026).
+REPO = "https://huggingface.co/%s/resolve/main/" % os.environ.get("HF_REPO", "moonshotai/Kimi-K3")
 
 def get(url, a, b):
     req = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (a, b - 1), "User-Agent": "ozaki-blackwell"})

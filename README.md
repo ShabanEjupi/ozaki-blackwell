@@ -59,7 +59,11 @@ Under load the laptop holds ~95 W and the SM clock drops to ~1.8 GHz (2.76 GHz o
 - Kimi K3 end to end on this laptop needs 1.56 TB of storage (669 GB free; the office link gave 2.9 MB/s): an external NVMe
   and the K3 attention (KDA linear attention + MLA) on the exact products; then the whole model streams at ~27 s per token.
 - Real systems above n ≈ 6000 run by Dixon (bench/real_dixon.sh); HOL by column blocks would be 2.6–4.3× faster there.
-- The SPEX column fills when the night runs finish (`/opt/ozaki/real/batch.log`, pass 2b; `bench/real_table.py [--tex]`).
+- cry10000 (n = 10 000) solved exactly in 122 s (D 574 553 bits); the SPEX column for the larger systems fills in the night
+  runs (`/opt/ozaki/real/batch.log`; `bench/real_table.py [--tex]`).
+- Nemotron 3 Ultra (open weights + open pre-training data, 560 B): the whole NVFP4 model (~320 GB) fits the free disk —
+  download it at home, stream it with the exact decode; tile the NVFP4 prefill through shared memory; then trace an exact
+  output back to the published training data (the data are open, so the claim can be checked by anyone).
 - The decode kernel reads 94 GB/s of packed weights, below what the GPU memory gives (irrelevant while the weights stream from disk).
 - An 8-bit X for HOL was measured and dropped (below); the proved bound with row scaling and n = 32768 remain as before.
 
@@ -524,15 +528,17 @@ and chemical plants.
 | qh1484 | 1484 | 6110 | 5.6e17 | 96 | 82985 | 0.55 | 12.4 | 23x | yes | ok | 11.2 (0) | 12.2 (0) |
 | fidap032 | 1159 | 11047 | 5.2e20 | 60 | 58651 | 0.28 | 54.5 | 193x | yes | ok | 0.0 (568) | 0.0 (572) |
 | fidap006 | 1651 | 48968 | 3.5e21 | 154 | 137635 | 1.08 | 963.7 | 895x | yes | ok | 0.0 (887) | 0.0 (693) |
-| cry2500 | 2500 | 12349 | 4.4e17 | 70 | 142772 | 1.41 | > 7200 |  | -- | ok | 6.4 (0) | 5.1 (0) |
-| fidapm07 | 2065 | 45184 | 6.8e19 | 118 | 161950 | 1.19 | -- |  | -- | ok | 0.0 (430) | 0.0 (290) |
-| fidap026 | 2163 | 74195 | 4.7e18 | 153 | 194835 | 2.12 | -- |  | -- | ok | 0.0 (1568) | 0.0 (1530) |
-| mhd3200a | 3200 | 68026 | 6.5e39 | 130 | 186119 | 4.02 | -- |  | -- | ok | 0.0 (2876) | 0.0 (2768) |
-| fidap014 | 3251 | 65747 | 2.6e16 | 124 | 256431 | 4.74 | -- |  | -- | ok | 7.6 (0) | 8.0 (0) |
+| cry2500 | 2500 | 12349 | 4.4e17 | 70 | 142772 | 1.41 | 699.3 | 497x | yes | ok | 6.4 (0) | 5.1 (0) |
+| fidapm07 | 2065 | 45184 | 6.8e19 | 118 | 161950 | 1.19 | > 7200 |  | -- | ok | 0.0 (430) | 0.0 (290) |
+| fidap026 | 2163 | 74195 | 4.7e18 | 153 | 194835 | 2.12 | > 7200 |  | -- | ok | 0.0 (1568) | 0.0 (1530) |
+| mhd3200a | 3200 | 68026 | 6.5e39 | 130 | 186119 | 4.02 | 1290.8 | 321x | yes | ok | 0.0 (2876) | 0.0 (2768) |
+| fidap014 | 3251 | 65747 | 2.6e16 | 124 | 256431 | 4.74 | > 7200 |  | -- | ok | 7.6 (0) | 8.0 (0) |
 | lns_3937 | 3937 | 25407 | 1.0e17 | 79 | 195969 | 4.31 | -- |  | -- | ok | 10.1 (2) | 7.4 (1) |
 | fidap012 | 3973 | 79017 | 2.2e20 | 119 | 271165 | 7.44 | -- |  | -- | ok | 0.0 (483) | 0.0 (482) |
 | mhd4800a | 4800 | 102252 | 3.2e47 | 131 | 281770 | 34.39 | -- |  | -- | ok | 0.0 (3923) | 0.0 (4754) |
 | sherman3 | 5005 | 20033 | 6.9e16 | 102 | 170131 | 14.25 | -- |  | -- | ok | 11.8 (0) | 12.4 (0) |
+| fidapm15 | 9287 | 96099 | 1.36e20 | 63 | 510845 | 78.66 | -- |  | -- | ok | 0.0 (2251) | 0.0 (5260) |
+| cry10000 | 10000 | 49699 | 6.9e20 | 76 | 574553 | 115.02 | -- |  | -- | ok | 4.2 (66) | 1.6 (923) |
 
 GPU s: A⁻¹ + lifting + reconstruction + all numerators (the determinant's det/d step apart; where it needs more than the
 ~78 000 bits the 16-bit primes give, it is reported as not computed — the solution does not depend on it). SPEX ran in the
@@ -660,3 +666,45 @@ once): reproducible with the same libm, and correctly rounded except in rare har
 
 **SQ** — Një bllok i tërë MoE i K3 (shtresa 5, peshat reale): rruga e saktë jep të njëjtët bitë për çdo token, vetëm ose
 në batch; motori me BF16+FP32 ndryshon 49 % të daljeve vetëm nga split-K.
+
+### The largest open model with open training data: Nemotron 3 Ultra, NVFP4 W4A4 exact (`llm/nvexact.cu`, `llm/nv_check.py`)
+
+K3 publishes its weights, not its data. The largest model that publishes **weights, recipe and pre-training data** is NVIDIA
+Nemotron 3 Ultra (Hugging Face metadata of the BF16 checkpoint: **560 524 578 816 parameters**, 55B active; model card:
+226 datasets, 14.8T tokens, 53.8 TiB, a few third-party sets private). It was pre-trained in NVFP4 and its routed experts ship
+as NVFP4 for weights *and* activations (ModelOpt group 16: E2M1 values, one E4M3 scale per 16, an FP32 global scale; the
+activation global scale is static, `input_scale`). The NVFP4 checkpoint is ~320 GB (U8 257.7 G, E4M3 28.3 G, BF16 16.6 G):
+unlike K3, **the whole model fits on this laptop's free 669 GB**.
+
+Exactness here is cheaper than for MXFP4: one NVFP4 block of 16 is exactly one `mma.m16n8k16` INT8 (2·E2M1 is an int8,
+|block sum| ≤ 2304), the two E4M3 scales multiply to an integer ≤ 225 times 2^(εW+εA), and with a shift of 18 every term is
+below 2^47, so the K/16 ≤ 320 terms of an output add **in an int64 without loss**; gW·gA is a 48-bit integer, and the
+104-bit product is rounded once. Nibble order checked against the BF16 checkpoint (low nibble = even k: correlation 0.996;
+the other order 0.03).
+
+One routed expert end to end, real weights (expert 0 of MoE layers 49 and 99; 4096 tokens: h ~ N(0,1) → the real
+`fc1_latent_proj` → NVFP4 → up_proj → relu² → NVFP4 → down_proj):
+
+| | L49 up | L49 down | L99 up | L99 down |
+|---|---:|---:|---:|---:|
+| exact: tensor-core path vs integer loops vs 32 tokens alone | 0 / 0 differ | 0 / 0 | 0 / 0 | 0 / 0 |
+| independent check (`nv_check.py`, Python rationals from the raw bytes), 300 outputs | 0 wrong | 0 wrong | | |
+| FP32 accumulation, alpha = fp32(gW·gA) (what block-scaled FP4 MMA + CUTLASS do): not correctly rounded | 18.5 % | 36.1 % | 30.3 % | 49.0 % |
+| the same FP32 sum with an exact epilogue (summation alone) | 0 % | 0.88 % | 0 % | 0.35 % |
+| split-K 1 vs 4 differ | 0 % | 0.30 % | 0 % | 0.12 % |
+| exact prefill (INT8 MMA + int64 epilogue) | 12.4 TOPS | 10.4 | 12.6 | 11.5 |
+| **exact decode**, 1 token / 8 tokens (packed nibbles, dp4a + int64), GB/s of weights | **395 / 121** | 321 / 87 | 409 / 121 | 317 / 90 |
+| FP32 GEMV (our plain engine-style kernel), 1 / 8 tokens, GB/s; outputs that differ from exact | 144 / 45; 18 % | 131 / 42; 36 % | 144 / 45; 29 % | 131 / 42; 49 % |
+
+So for this model most of the "engine" error is not the order of summation but the epilogue: the global scales are
+multiplied in FP32 (alpha rounded, then the product rounded again). Decode, the step that matters when a model streams,
+runs exactly at L2/memory speed (one expert is 5.9 MB and stays in L2 across the timed repeats). Prefill is epilogue bound
+(16 int64 shift-adds per MMA, operands read from global memory): staging tiles in shared memory is the next step. Layer 1 is
+different: its experts are 99.5 % (near) zero in the BF16 checkpoint as well (median |w| 6.6·10⁻¹⁰), so 92 % of its exact
+outputs are 0.
+
+**SQ** — Modeli më i madh me pesha DHE të dhëna trajnimi të hapura (Nemotron 3 Ultra, 560 miliardë parametra, 14,8T
+tokenë publikë) llogaritet saktë në formatin e vet NVFP4: një bllok 16 = një MMA INT8, shkallët si shift në int64, një
+rrumbullakim. 0 gabime (edhe te kontrolli i pavarur); motori FP32 gabon 18–49 %, kryesisht te shkallët globale. Decode i
+saktë: 317–409 GB/s. I gjithë modeli NVFP4 (~320 GB) hyn në diskun e laptopit.
+
