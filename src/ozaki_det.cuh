@@ -165,12 +165,87 @@ __global__ void __launch_bounds__(256) diag_inv(const int32_t *__restrict__ R, s
     }
 }
 
+// Partial pivoting for small primes (p < 256: a leading minor vanishes with probability ~1/p, so without pivoting an
+// n = 4096 LU fails almost surely). The leaf factors the whole tall panel, rows [j, n) x columns [j, j + 64), in place:
+// pivot = the first row at or below the diagonal with a nonzero residue (any nonzero will do modulo p), swapped with the
+// diagonal row over the WHOLE row (ld columns: the L already computed to the left, the columns to the right that still
+// await their updates -- every update is row-wise, so a swap commutes with it -- and the identity of [A I], which collects
+// P), then the multipliers and the rank-1 update of the rest of the panel. det picks up the pivots and a sign per swap.
+// One block per prime.
+__global__ void __launch_bounds__(1024) panel_lu_piv(int32_t *R, size_t zr, int ld, int n, int j, uint32_t *det, int *bad,
+                                                     const uint32_t *__restrict__ P) {
+    const int z = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+    const uint32_t p = P[z];
+    R += z * zr;
+    __shared__ int piv;
+    __shared__ uint32_t inv, rowt[DB];
+    for (int t = 0; t < DB; t++) {
+        const int c = j + t;
+        if (tid == 0) piv = n;
+        __syncthreads();
+        for (int r = c + tid; r < n; r += nt) if (R[(size_t)r * ld + c]) { atomicMin(&piv, r); break; }
+        __syncthreads();
+        const int r = piv;
+        if (r == n) { if (tid == 0) bad[z] = 1; __syncthreads(); continue; }
+        if (r != c) {
+            for (int k = tid; k < ld; k += nt) { int32_t a = R[(size_t)c * ld + k]; R[(size_t)c * ld + k] = R[(size_t)r * ld + k]; R[(size_t)r * ld + k] = a; }
+            if (tid == 0) det[z] = (p - det[z]) % p;
+        }
+        __syncthreads();
+        if (tid == 0) { const uint32_t pv = R[(size_t)c * ld + c]; det[z] = mulm(det[z], pv, p); inv = powm(pv, p - 2, p); }
+        if (tid < DB) rowt[tid] = R[(size_t)c * ld + j + tid];
+        __syncthreads();
+        const int w = DB - 1 - t;   // columns right of c inside the panel
+        for (int e = tid; e < (n - c - 1) * (w + 1); e += nt) {
+            const int i = c + 1 + e / (w + 1), u = e % (w + 1);   // u = 0: the multiplier itself
+            int32_t *row = R + (size_t)i * ld + c;
+            const uint32_t l = mulm((uint32_t)row[0], inv, p);
+            if (u == 0) continue;
+            row[u] = (int32_t)((row[u] + p - mulm(l, rowt[t + u], p)) % p);
+        }
+        __syncthreads();
+        for (int i = c + 1 + tid; i < n; i += nt) R[(size_t)i * ld + c] = (int32_t)mulm((uint32_t)R[(size_t)i * ld + c], inv, p);
+        __syncthreads();
+    }
+}
+
+// The diagonal block at (j, j), already factored by panel_lu_piv: L^-1 (unit lower) and U^-1 into Linv / Uinv
+__global__ void __launch_bounds__(256) diag_inv_f(const int32_t *__restrict__ R, size_t zr, int ld, int32_t *__restrict__ Linv, size_t zl,
+                                                  int32_t *__restrict__ Uinv, const uint32_t *__restrict__ P) {
+    __shared__ uint32_t S[DB][DB + 1], inv[DB];
+    const int z = blockIdx.x, tid = threadIdx.x;
+    const uint32_t p = P[z];
+    R += z * zr; Linv += z * zl; Uinv += z * zl;
+    for (int i = tid; i < DB * DB; i += 256) S[i / DB][i % DB] = R[(size_t)(i / DB) * ld + i % DB];
+    __syncthreads();
+    if (tid < DB) inv[tid] = S[tid][tid] ? powm(S[tid][tid], p - 2, p) : 1;
+    __syncthreads();
+    if (tid < DB) {
+        const int c = tid; uint32_t x[DB];
+        for (int i = 0; i < DB; i++) {
+            if (i < c) x[i] = 0;
+            else if (i == c) x[i] = 1;
+            else { uint64_t s = 0; for (int q = c; q < i; q++) s += (uint64_t)S[i][q] * x[q]; x[i] = (uint32_t)((p - s % p) % p); }
+        }
+        for (int i = 0; i < DB; i++) Linv[i * DB + c] = x[i];
+    } else if (tid < 2 * DB) {
+        const int c = tid - DB; uint32_t y[DB];
+        for (int i = DB - 1; i >= 0; i--) {
+            if (i > c) y[i] = 0;
+            else if (i == c) y[i] = inv[c];
+            else { uint64_t s = 0; for (int q = i + 1; q <= c; q++) s += (uint64_t)S[i][q] * y[q]; y[i] = mulm((uint32_t)((p - s % p) % p), inv[i], p); }
+        }
+        for (int i = 0; i < DB; i++) Uinv[i * DB + c] = y[i];
+    }
+}
+
 // Workspace for one batch of Pb primes: R is n x ld per prime (ld = n for the determinant, 2n for [A I] -> A^-1)
 // kc: the deepest K one packed product takes; deeper ones run in K-chunks (R = X1 W1, R += X2 W2, ...). Below n = 16384
 // kc = n (one chunk, the packing buffers hold any K <= n); above, kc = 2048 keeps the three buffers at ~0.8 GB instead of
 // ~13 GB at n = 32768. A chunked product must not write over its own X or W -- only the K = 64 leaves do, in one chunk.
 struct DetWork {
     int n, ld, Pb, kc, L = 1;   // L: byte planes of the input entries (det_init)
+    bool piv = false;           // partial pivoting at the leaves (primes < 256: panel_lu_piv)
     int32_t *R, *Linv, *Uinv;   // R: Pb n ld; Linv, Uinv: Pb (n/64) 64^2, one per diagonal block
     const int32_t *preU = nullptr, *preL = nullptr;   // unit upper / lower n x n, entries in [0, 127]: det(U A L) = det A
     int8_t *Ap, *B1, *B2;
@@ -249,6 +324,13 @@ inline void det_lu(DetWork &w, int j, int wd) {
     const int n = w.n;
     if (wd == DB) {
         int32_t *Ui = w.Uinv + (size_t)j * DB;
+        if (w.piv) {   // the tall panel factored with row swaps, L21 included; then the inverses of its diagonal block
+            det_prof.begin();
+            panel_lu_piv<<<w.Pb, 1024>>>(w.R, w.zr(), w.ld, n, j, w.det, w.bad, w.P);
+            diag_inv_f<<<w.Pb, 256>>>(w.at(j, j), w.zr(), w.ld, w.Linv + (size_t)j * DB, (size_t)n * DB, Ui, w.P);
+            det_prof.end(0);
+            return;
+        }
         det_prof.begin();
         diag_inv<<<w.Pb, 256>>>(w.at(j, j), w.zr(), w.ld, w.Linv + (size_t)j * DB, (size_t)n * DB, Ui, w.det, w.bad, w.P);
         det_prof.end(0);

@@ -317,7 +317,7 @@ __global__ void hol_amod8(const int8_t *__restrict__ A, int n, int L, int8_t *__
 // operand (K = n, s primes Mpad 2n apart). x = sum xi_u R / r_u - alpha R, xi_u = x_u (R / r_u)^-1 mod r_u,
 // alpha = round(sum xi_u / r_u): exact while |x| <= 2^-9 R (the float sum errs by < 2^-17).
 template <int SB>
-__global__ void __launch_bounds__(256) hol_bext(const uint8_t *__restrict__ Zb, int n, int8_t *__restrict__ Ap, int Mpad) {
+__global__ void __launch_bounds__(256) hol_bext(const uint8_t *__restrict__ Zb, int n, int8_t *__restrict__ Ap, int Mpad, int cmp = 0) {
     const size_t nn = (size_t)n * n; const int W = hc8.W, s = hc.s;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < nn; i += (size_t)gridDim.x * blockDim.x) {
         float a = 0; uint32_t acc[SB];
@@ -335,11 +335,34 @@ __global__ void __launch_bounds__(256) hol_bext(const uint8_t *__restrict__ Zb, 
         for (int t = 0; t < SB; t++) if (t < s) {
             const int p = (int)hc.p[t];
             const int v = (int)redm(acc[t] + 64u * p - (uint32_t)al * hc8.Rp[t], p, hc.pmi[t]);   // al Rp < 64 p, acc < 2^30
+            if (cmp) { Ap[(size_t)t * Mpad * n + (size_t)j * n + k] = (int8_t)bal(v, p); continue; }   // p < 256: one byte, rows of n
             int8_t lo, hi; split(bal(v, p), lo, hi);
             int8_t *o = Ap + (size_t)t * Mpad * 2 * n + (size_t)j * 2 * n + k;
             o[0] = lo; o[n] = hi;
         }
     }
+}
+
+// X of primes < 256 (det.cu OZ_HOLX8, B0 from the LU with pivoting): B0 mod p_t as balanced int8 rows, from the [A I]
+// workspace (columns n..2n), and M^T = Zb B0^T mod p_t as ONE INT8 GEMM of depth n per prime (|sum| <= n 127^2 < 2^31)
+// instead of modgemm's two of depth 2n.
+__global__ void hol_b8(const int32_t *__restrict__ R, int ld, size_t zr, int8_t *__restrict__ B8, int n) {
+    const size_t nn = (size_t)n * n;
+    for (size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; e < nn * hc.s; e += (size_t)gridDim.x * blockDim.x) {
+        const int z = (int)(e / nn); const size_t i = e % nn;
+        B8[e] = (int8_t)bal(R[z * zr + (i / n) * ld + n + i % n], (int)hc.p[z]);
+    }
+}
+__global__ void __launch_bounds__(THREADS) hol_mmp(const int8_t *__restrict__ Ap, const int8_t *__restrict__ B8, int32_t *__restrict__ Mres,
+                                                   int n, int Mpad) {
+    const int z = blockIdx.z, p = (int)hc.p[z];
+    const size_t nn = (size_t)n * n;
+    int32_t *out = Mres + z * nn;
+    gemm_i8_tile(Ap + (size_t)z * Mpad * n, B8 + z * nn, n, [&](int row, int col, int c00, int c01, int c10, int c11) {
+        auto f = [&](int v) { v %= p; return v < 0 ? v + p : v; };
+        if (row < n) { out[(size_t)row * n + col] = f(c00); out[(size_t)row * n + col + 1] = f(c01); }
+        if (row + 8 < n) { out[(size_t)(row + 8) * n + col] = f(c10); out[(size_t)(row + 8) * n + col + 1] = f(c11); }
+    });
 }
 
 // Z_next = (Zb - AM) / X from the residues v_r mod the WQ q_r (ident: Zb = I), by approximate CRT (|Z| < Q / 4, Q = prod q):
@@ -508,6 +531,10 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
     // B0^T = (A^-1 mod p_t)^T from the LU, A^T mod q_r through Zres (r8: A mod the 8-bit q)
     const dim3 tg(n / 32, n / 32, s), tb(32, 8);
     transpose_i32<<<tg, tb>>>(lu.R + n, lu.ld, lu.zr(), B0T, n);
+    // X of primes < 256 (det.cu OZ_HOLX8): M^T = Zb B0^T as one INT8 GEMM per prime, B0 kept as balanced bytes
+    bool x8 = r8; for (int t = 0; t < s; t++) x8 = x8 && p[t] < 256;
+    int8_t *B8 = nullptr;
+    if (x8) { cudaMalloc(&B8, s * nn); hol_b8<<<4096, 256>>>(lu.R, lu.ld, lu.zr(), B8, n); }
     cudaStreamSynchronize(cudaStreamPerThread); lu.free_();
     if (r8) hol_amod8<<<dim3(256, WQ8), 256>>>(dA, n, L, A8);
     else {
@@ -589,9 +616,10 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
             ph(-1);
             hol_mm8<<<dim3(n / BN, n / BM, W8), THREADS>>>(Z8, Z8T, Zb8, n, 0); st.gemms8 += W8;
             ph(0);
-            OZ_SB(hol_bext, <<<gb, 256>>>(Zb8, n, hw.Ap, Mpad));
+            OZ_SB(hol_bext, <<<gb, 256>>>(Zb8, n, hw.Ap, Mpad, x8));
             ph(1);
-            modgemm<0><<<dim3(Npad / BN, Mpad / BM, s), THREADS>>>(hw.Ap, PB[0], PB[1], Mres, nn, n, n, n, 2 * n, Mpad, Npad, hw.P); st.gemms += s;
+            if (x8) { hol_mmp<<<dim3(n / BN, Mpad / BM, s), THREADS>>>(hw.Ap, B8, Mres, n, Mpad); st.gemms8 += s; }
+            else { modgemm<0><<<dim3(Npad / BN, Mpad / BM, s), THREADS>>>(hw.Ap, PB[0], PB[1], Mres, nn, n, n, n, 2 * n, Mpad, Npad, hw.P); st.gemms += s; }
             ph(2);
             OZ_SB(hol_garner, <<<(n + 7) / 8, 256>>>(Mres, db, n, nullptr, bm, needZ ? Mq8 : nullptr));
             ph(3);
@@ -627,7 +655,7 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
     cudaMemcpy2D(out.data(), (size_t)nout * 2, cb[cur], (size_t)n * 2, (size_t)nout * 2, sN, cudaMemcpyDeviceToHost);
     cudaMemcpy(err_out, derr, 4, cudaMemcpyDeviceToHost);
     hw.free_();
-    for (void *v : {(void *)B0T, (void *)PB[0], (void *)PB[1], (void *)PB[2], (void *)PB[3], (void *)Zres, (void *)Mres, (void *)Mq, (void *)AMq, (void *)Bt, (void *)cb[0],
+    for (void *v : {(void *)B8, (void *)B0T, (void *)PB[0], (void *)PB[1], (void *)PB[2], (void *)PB[3], (void *)Zres, (void *)Mres, (void *)Mq, (void *)AMq, (void *)Bt, (void *)cb[0],
                     (void *)cb[1], (void *)G, (void *)Apk, (void *)bm, (void *)db, (void *)carry, (void *)dtop, (void *)derr, (void *)Z8, (void *)Z8T, (void *)Zb8, (void *)Mq8, (void *)AM8, (void *)A8})
         cudaFree(v);
     return out;
