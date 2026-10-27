@@ -61,7 +61,7 @@ Under load the laptop holds ~95 W and the SM clock drops to ~1.8 GHz (2.76 GHz o
 - Real systems above n ≈ 6000 run by Dixon (bench/real_dixon.sh); HOL by column blocks would be 2.6–4.3× faster there.
 - cry10000 (n = 10 000) solved exactly in 122 s (D 574 553 bits); the SPEX column for the larger systems fills in the night
   runs (`/opt/ozaki/real/batch.log`; `bench/real_table.py [--tex]`).
-- Nemotron 3 Ultra (open weights + open pre-training data, 560 B): the whole NVFP4 model (~320 GB) fits the free disk —
+- Nemotron 3 Ultra (open weights + open pre-training data, 560 B): the whole NVFP4 model (352.3 GB) fits the free disk —
   download it at home, stream it with the exact decode; tile the NVFP4 prefill through shared memory; then trace an exact
   output back to the published training data (the data are open, so the claim can be checked by anyone).
 - The decode kernel reads 94 GB/s of packed weights, below what the GPU memory gives (irrelevant while the weights stream from disk).
@@ -673,8 +673,11 @@ K3 publishes its weights, not its data. The largest model that publishes **weigh
 Nemotron 3 Ultra (Hugging Face metadata of the BF16 checkpoint: **560 524 578 816 parameters**, 55B active; model card:
 226 datasets, 14.8T tokens, 53.8 TiB, a few third-party sets private). It was pre-trained in NVFP4 and its routed experts ship
 as NVFP4 for weights *and* activations (ModelOpt group 16: E2M1 values, one E4M3 scale per 16, an FP32 global scale; the
-activation global scale is static, `input_scale`). The NVFP4 checkpoint is ~320 GB (U8 257.7 G, E4M3 28.3 G, BF16 16.6 G):
-unlike K3, **the whole model fits on this laptop's free 669 GB**.
+activation global scale is static, `input_scale`). The NVFP4 checkpoint is 352.3 GB (summed from its 113 safetensors headers):
+unlike K3, **the whole model fits on this laptop's free 669 GB**. Per token it reads 37.8 GB of dense weights (Mamba-2,
+attention, latent projections, router, shared experts, lm_head) and 13.4 GB of routed experts (22 of 512 in 48 layers):
+51.2 GB. With the dense part in RAM (PCIe 45 GB/s, measured) and the experts from the NVMe (5.1 GB/s), ~3.5 s per token,
+bit-reproducible — 8× sooner than K3 on the same laptop.
 
 Exactness here is cheaper than for MXFP4: one NVFP4 block of 16 is exactly one `mma.m16n8k16` INT8 (2·E2M1 is an int8,
 |block sum| ≤ 2304), the two E4M3 scales multiply to an integer ≤ 225 times 2^(εW+εA), and with a shift of 18 every term is
@@ -719,5 +722,5 @@ outputs are 0.
 **SQ** — Modeli më i madh me pesha DHE të dhëna trajnimi të hapura (Nemotron 3 Ultra, 560 miliardë parametra, 14,8T
 tokenë publikë) llogaritet saktë në formatin e vet NVFP4: një bllok 16 = një MMA INT8, shkallët si shift në int64, një
 rrumbullakim. 0 gabime (edhe te kontrolli i pavarur); motori FP32 gabon 18–49 %, kryesisht te shkallët globale. Decode i
-saktë: 405–487 GB/s. I gjithë modeli NVFP4 (~320 GB) hyn në diskun e laptopit.
+saktë: 405–487 GB/s. I gjithë modeli NVFP4 (352 GB) hyn në diskun e laptopit; një token lexon 51,2 GB → ~3,5 s/token, saktë.
 
