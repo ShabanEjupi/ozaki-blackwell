@@ -304,6 +304,12 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
     cudaStreamSynchronize(cudaStreamPerThread); lu.free_();
     det_init<<<dim3(256, w), 256>>>(dA, Zres, n, n, hw.P + s, L);
     transpose_i32<<<dim3(n / 32, n / 32, w), tb>>>(Zres, n, nn, AT, n);
+    // the right factors that never change, packed once: B0^T (M^T = Zb B0^T) and A^T ((A M)^T = M^T A^T)
+    const int Mpad = rup(n, BM), Npad = rup(n, BN); const size_t pk = (size_t)Npad * 2 * n;
+    int8_t *PB[4]; cudaMalloc(&PB[0], s * pk); cudaMalloc(&PB[1], s * pk); cudaMalloc(&PB[2], w * pk); cudaMalloc(&PB[3], w * pk);
+    pack_b<<<dim3(Npad / 64, n / 64, s), 256>>>(B0T, nn, n, n, n, Npad, PB[0], PB[1], hw.P);
+    pack_b<<<dim3(Npad / 64, n / 64, w), 256>>>(AT, nn, n, n, n, Npad, PB[2], PB[3], hw.P + s);
+    cudaStreamSynchronize(cudaStreamPerThread); cudaFree(AT); AT = nullptr;
 
     // out = X W modulo nz primes from z0 (X, W: residue matrices nn apart per prime)
     auto mgemm = [&](int32_t *out, int z0, int nz, const int32_t *X, const int32_t *W) {
@@ -311,9 +317,18 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
         mod_xw<false>(v, X, nn, n, W, nn, n, n, n, n, 0, 0);
         st.gemms += nz;
     };
+    auto mgemm_pre = [&](int32_t *out, int z0, int nz, const int32_t *X, int8_t *const *B) {   // W packed in B[0], B[1]
+        const uint32_t *P = hw.P + z0;
+        det_prof.begin();
+        pack_a<<<dim3(std::min(2048, Mpad * n / 1024 + 1), nz), 256>>>(X, nn, n, n, n, Mpad, hw.Ap, P);
+        det_prof.end(1); det_prof.begin();
+        modgemm<0><<<dim3(Npad / BN, Mpad / BM, nz), THREADS>>>(hw.Ap, B[0], B[1], out, nn, n, n, n, 2 * n, Mpad, Npad, P);
+        det_prof.end(2);
+        st.gemms += nz;
+    };
     const int gb = (int)std::min<size_t>(8192, (nn + 255) / 256);
     auto next = [&](const int32_t *Zb, int ident) {   // Z_next from Zb and M^T (in Mq): A M, then the division by X
-        mgemm(AMq, s, w, Mq, AT);
+        mgemm_pre(AMq, s, w, Mq, PB + 2);
         hol_next<<<gb, 256>>>(Zb, AMq, n, ident, Zres, Bt, U, zbits, derr);
     };
     int top[2] = {0, 0}, cur = 0;
@@ -351,7 +366,7 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
         int32_t *Zb = hw.R;
         if (needM || needZ) {
             mgemm(Zb, 0, needZ ? s + w : s, Zres, Zres);
-            mgemm(Mres, 0, s, Zb, B0T);
+            mgemm_pre(Mres, 0, s, Zb, PB);
             hol_garner<<<(n + 7) / 8, 256>>>(Mres, db, n, needZ ? Mq : nullptr, bm);
         }
         cudaStreamSynchronize(cudaStreamPerThread); st.rchain += now() - ta; ta = now();
@@ -380,7 +395,7 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
     cudaMemcpy2D(out.data(), 8, cb[cur], (size_t)n * 2, 8, sN, cudaMemcpyDeviceToHost);
     cudaMemcpy(err_out, derr, 4, cudaMemcpyDeviceToHost);
     hw.free_();
-    for (void *v : {(void *)B0T, (void *)AT, (void *)Zres, (void *)Mres, (void *)Mq, (void *)AMq, (void *)Bt, (void *)cb[0],
+    for (void *v : {(void *)B0T, (void *)PB[0], (void *)PB[1], (void *)PB[2], (void *)PB[3], (void *)Zres, (void *)Mres, (void *)Mq, (void *)AMq, (void *)Bt, (void *)cb[0],
                     (void *)cb[1], (void *)G, (void *)Apk, (void *)bm, (void *)db, (void *)carry, (void *)dtop, (void *)derr})
         cudaFree(v);
     return out;
