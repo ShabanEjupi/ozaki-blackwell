@@ -445,9 +445,46 @@ native instruction runs at 49--55~TOPS with a plain tiling and the exact path at
 registers, \texttt{m16n8k16} INT8 reaches 116~TOPS and the block-scaled FP4 instruction 465~TOPS, so with both kernels tuned
 to peak a correctly rounded prefill costs $4\times$; in decode both read the same packed bytes. The exact decode reads
 405--500~GB/s of packed weights for one token and 136--184~GB/s for eight; the whole NVFP4 checkpoint (352~GB, from its 113 safetensors headers) fits this laptop's free disk, and a token reads
-51.2~GB of it (37.8 dense, 13.4 of routed experts): $\sim$3.5~s per token with the dense part in RAM, $8\times$ sooner than K3. Its FP32 router is exactly three BF16
+51.2~GB of it (37.8 dense, 13.4 of routed experts; measured below: 26~s per token from NVMe). Its FP32 router is exactly three BF16
 matrices, so its logits are one correctly rounded product with $K=3\cdot 8192$: FP32 accumulation rounds 90--97\% of them
 differently, yet only 1 of 16\,384 token-layer routing decisions moves (2 layers, 2 seeds, 4096 tokens).
+
+\paragraph{The whole model, token by token, from disk.} One GEMV covers the four formats of the checkpoint: BF16 (attention,
+latent projections, lm\_head), FP32 (router), FP8 E4M3 W8A8 with per-tensor scales and a static input scale (Mamba in and
+out, shared experts) and NVFP4 W4A4 (routed experts). Once an activation is quantized as its format prescribes, every
+element is an integer times a power of two, so a warp accumulates its row in a 128-bit fixed point anchored at the row's
+largest possible term, multiplies by the exact product of the FP32 global scales and rounds once to BF16 (FP32 for router
+and logits); terms below the 125-bit window are counted and the rounding is certified when the interval they span rounds to
+one value. Against a 2560-bit superaccumulator on the host, 6\,656 outputs in all four formats (narrow and $2^{\pm60}$
+ranges, heavy cancellation, exact ties) agree in every bit; a 40-bit window and ties-away rounding are both caught (the tie
+test also caught a bug: squeezing the accumulator to 78 bits widened the interval when no bit was lost, so every exact tie
+came out uncertified). Everything else (the Mamba-2 recurrence with its FP32 state, the causal convolution, attention
+without positional encoding, sigmoid top-22 routing, RMSNorms, residuals) runs on the host in FP64 and is rounded once to
+the precision the model keeps there, identically for every path. All 560\,B parameters stream from the laptop's NVMe: one
+sequence reads 48~GB per token in 16~s (2.95~GB/s) and takes 26~s, and ``The capital of Kosovo is'' continues
+``\,Pristina''. Three prompts (Albanian, English, $123456789\times 987654321$) then ran as nine sequences, each prompt exact
+and on the same host code with FP32-accumulating GEMVs (split-K 1 or 4: two configurations of one engine), 45 steps of
+57--71~s (70--86~GB read): 1.54 billion correctly rounded outputs, none uncertified. On the exact path's own inputs the
+engine rounds 12.6--13.8\% of the BF16 projections and 40.6--47.3\% of the router logits differently, but only 0.003\% of
+the FP8 and NVFP4 ones (41\,914 of 1.42 billion): at BF16 output precision FP32 accumulation of the narrow formats is almost
+always exact, of the wide ones it is not. Downstream, the engine's top logit drifts up to 1.22 from the exact one (0.17--0.31
+on average) while the tokens still agree, the exact top-two margin falls to 0.017, and the streams part: the Albanian one at
+the 5th generated token with split-K 4 (an indentation of 8 against 4 spaces) and at the 13th with split-K 1 (``\,ri''
+against ``\,pav''; the exact path goes on ``Kosova është vend i ri i pavarur'', the engine ``Kosova është vend i pavarur që
+ka deklaruar pavarësinë më 17 shkurt 2008''), the English one at the 29th (``\,and'' against ``\,of''). On the product all
+three write 121932631112635269, which is correct. The drivers print a 64-bit FNV-1a digest of every residual stream and
+logit vector of the exact path, so anyone with the checkpoint can check a run.
+
+\paragraph{Full access.} Checking an output against the data a model learned from needs the data, not only its recipe.
+Measured on the Hugging Face API and the model cards (27 October 2026): Ultra's main sets are gated as above; Jais-3-375B-A23B
+(379\,B, Apache-2.0) beats Ultra on most rows of its own card but publishes a 10\% sample of its data (23.8\,B tokens); the
+strongest model whose data is wholly public and ungated is IFM's K2-Think-V2 (72.6\,B, Apache-2.0, TxT360 under ODC-BY);
+and the one model whose entire training data is indexed for public lookup is OLMo-2-0325-32B-Instruct (all 4.6\,T tokens in
+the infini-gram index \texttt{v4\_olmo-2-0325-32b-instruct\_llama}). No fully open model is better than Ultra today. The same
+exact GEMV drives both dense models (\texttt{llm/dense.cu}: OLMo~2's post-norm with $q$/$k$ norms; Llama with YaRN, K2's FP32
+checkpoint rounded to BF16 as an engine loads it), and every maximal span of an OLMo~2 output is looked up in its own
+training data with its count and a source document (\texttt{llm/olmo\_trace.py}): ``The capital of Kosovo is Pristina''
+occurs 224 times, one of them a DCLM page from graphicmaps.com.
 \fussy
 
 \section{Energy}\label{sec:energy}

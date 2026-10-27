@@ -758,3 +758,48 @@ order → `fc2_latent_proj` (correctly rounded to BF16). Engine path: FP32 route
 the native NVFP4 instruction, FP32 sum, split-K 1 or 4. 4 tokens (Student-t through the real norm), 75 experts: exact
 products not certified 0; **each token alone vs in the batch: 0 of 32 768 BF16 outputs differ**; engine split-K 1 vs 4:
 35 differ (0.1 %); engine vs exact: 37 (0.1 %). The shared expert (FP8 W8A8) is not in it yet.
+
+#### The whole of Nemotron 3 Ultra, token by token, every linear map exact (`llm/ultra.cu`)
+
+All 560 B parameters (the 352 GB NVFP4 checkpoint, sha256-checked) stream from the laptop's NVMe for every token. One GEMV
+covers the checkpoint's four formats — BF16 (attention, latent projections, lm_head), FP32 (router), FP8 E4M3 W8A8 (Mamba
+in/out, shared experts), NVFP4 W4A4 (routed experts): once the activation is quantized as its format prescribes, every
+element is an integer times a power of two; a warp sums its row in a 128-bit fixed point anchored at the row's largest
+possible term, multiplies by the exact product of the FP32 global scales and rounds **once** to BF16 (FP32 for router and
+logits), certified (terms below the 125-bit window are counted; the rounding stands when their interval rounds to one
+value). The rest — Mamba-2 recurrence (FP32 state), causal conv, attention (no positional encoding), sigmoid top-22
+routing, RMSNorms, residuals — runs on the host in FP64, rounded once where the model keeps BF16. Semantics from
+transformers v5.3.0 `modeling_nemotron_h.py` (production `dt_limit (0, ∞)`, not the eager path's clamp at 1e-3).
+
+- `out_ultra --selftest`: 6 656 outputs of all four formats against an independent 2 560-bit host superaccumulator (narrow
+  and 2^±60 ranges, heavy cancellation, exact ties): 0 differ, 0 uncertified. Mutants caught: a 40-bit window (3 459
+  differ), ties away from zero (188). The tie test caught a real bug first: squeezing to 78 bits widened the interval even
+  when no bit was lost, so every exact tie came out uncertified and on the wrong side.
+- One sequence: 48 GB per token in 16 s (2.95 GB/s), **26 s per token**; "The capital of Kosovo is" → **" Pristina"**.
+- Three prompts × {exact, engine split-K 1, engine split-K 4} = nine sequences, 45 steps of 57–71 s (70–86 GB read per
+  step): **1.54 billion correctly rounded outputs, 0 uncertified**. Shadow (the engine GEMV on the exact path's own
+  inputs): BF16 projections 12.6–13.8 % rounded differently, FP32 router 40.6–47.3 %, FP8 and NVFP4 only 0.003 %
+  (41 914 of 1.42 billion) — at BF16 output precision FP32 accumulation of the narrow formats is almost always exact.
+- Downstream the engine's top logit drifts up to **1.22** from the exact one (mean 0.17–0.31) while tokens agree; the exact
+  top-two margin falls to 0.017. Albanian: exact "Kryeqyteti i Kosovës është Prishtina." then "Kosova është vend i ri i
+  pavarur."; split-K 1 parts at the 13th generated token ("Kosova është vend i pavarur që ka deklaruar pavarësinë më 17
+  shkurt 2008."), split-K 4 at the 5th (indentation). English: parts at the 29th (" and" vs " of").
+  `123456789 * 987654321 =` → **121932631112635269** on all three paths (correct).
+- `ultra_summary.py` prints this from the log; the drivers print an FNV-1a 64 digest of every residual stream and logit
+  vector of the exact path (from the next run on), so a third party with the checkpoint can check a run bit for bit.
+
+**Full access** (measured 27-10 on the HF API and model cards): Ultra's main data is gated; Jais-3-375B-A23B (379 B,
+Apache-2.0) beats Ultra on most rows of its own card but publishes a 10 % sample of its data; the strongest model whose
+data is wholly public is IFM's K2-Think-V2 (72.6 B, TxT360 ODC-BY); OLMo-2-0325-32B-Instruct is the one model whose whole
+training data (4.6 T tokens) is indexed for public lookup (infini-gram). `llm/dense.cu` runs both dense models exact;
+`llm/olmo_trace.py` finds every maximal span of an output in that data ("The capital of Kosovo is Pristina": 224 times,
+a DCLM page from graphicmaps.com); `--index v4_dclm-baseline_llama` looks Ultra's text up in the public web it was drawn
+from. Queued (`llm/chain_open.sh`): OLMo 2 exact + traced, then K2-Think-V2 after SPEX pass 3.
+
+**SQ** — Nemotron 3 Ultra i tërë (560 miliardë parametra) punon në laptop nga disku, token pas tokeni, me çdo prodhim
+matricë-vektor të rrumbullakosur saktë (një rrumbullakim i certifikuar, i provuar kundër një akumuluesi 2 560-bit; prova e
+barazimeve gjeti dhe ndreqi një defekt). 26 s për token. Te tri prompt-e, motori me akumulim FP32 ndryshon 13 % të daljeve
+BF16 dhe 47 % të logit-ëve të ruterit, logit-i largohet deri në 1,22, dhe teksti ndahet: shqip pas tokenit të 5-të / 13-të,
+anglisht pas të 29-tit. 123456789 × 987654321 = 121932631112635269 — saktë në të tri rrugët. Për qasje të plotë te të
+dhënat: OLMo 2 32B (të gjitha të dhënat e trajnimit të kërkueshme), K2-Think-V2 (më i forti plotësisht i hapur); asnjë model
+plotësisht i hapur s'e kalon Ultra-n sot.
