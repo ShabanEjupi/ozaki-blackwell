@@ -460,3 +460,82 @@ nivel; zinxhiri i mbetjeve në RNS (2(s+w) GEMM modulare për nivel, matricat t�
 mbi shifra me bazë të përzier periodike. Bashkë me kufirin e provuar për plane (1 bit mbi |det| te 2048 × 64 bit) dhe
 rindërtimin half-gcd të FLINT-it: 236× FLINT te 2048 × 64 bit, 306× te 2048 × 128 bit, 265× te 4096 × 64 bit (867,7 s → 3,27 s),
 bit për bit e saktë. Raporti tani RRITET me bitët. Modulet < 256 për X nuk bëjnë (LU pa pivotim mod p dështon ~1−e^(−n/p)).
+
+### The residue chain over 8-bit moduli (27-10-2026, `hol8_setup`, `bench/rchain_bench.cu`, `bench/hol8_check.sh`)
+
+Measured first, on random data (the power budget depends on the bits that toggle): a 16-bit modular product (two INT8 GEMMs of
+depth 2n, two passes) runs at 95 TOPS at n = 4096, a product modulo a prime < 256 (one INT8 GEMM of depth n, balanced residues
+as int8, reduced in the epilogue) at 134 TOPS — **2.8× less time per bit of modulus**. So only M = B₀·R̄ mod X keeps 16-bit
+products (B₀ = A⁻¹ mod p needs the LU, see above); the rest moved to 8-bit moduli (odd primes 17…251 and 243, 169, 125, 121, 49):
+
+- **Z² exactly**, in an RNS of W moduli with ∏ > 2^{2·zbits + log₂n + 10} (W = 23 at 64-bit entries, 42 at 128-bit), one
+  INT8 GEMM each; then **base extension** to the 16-bit p_t by approximate CRT (x = Σ ξ_u R/r_u − αR, α = round(Σ ξ_u/r_u)
+  in float, exact while |x| ≤ 2⁻⁹R), written straight into modgemm's packed [lo | hi] operand.
+- **A·M only modulo the first WQ moduli** (∏ > 2^{zbits+2}: WQ = 10 at 64-bit), and **Z from them by approximate CRT**
+  (no Garner): its residues modulo all W moduli and its balanced byte planes accumulated signed from the bytes of Q/q_r.
+- Barrett reduction (`redm`, 4 instructions) instead of `%` in every Garner, and the kernels templated on s so the arrays stay
+  in registers (they spilled 240 B before).
+
+| n × entry bits | 16-bit chain (residue chain) | **8-bit chain** (residue chain) | FLINT | **vs FLINT** |
+|---|---|---|---|---|
+| 1 024 × 64 | 0.129 s (0.032) | **0.110 s** (0.017) | 12.39 s | 113× |
+| 1 024 × 128 | 0.201 s (0.056) | **0.183 s** (0.041) | 30.98 s | 169× |
+| 2 048 × 64 | 0.468 s (0.211) | **0.362 s** (0.124) | 106.89 s | **295×** |
+| 2 048 × 128 | 0.838 s (0.365) | **0.725 s** (0.259) | 261.65 s | **361×** |
+| 4 096 × 64 | 3.221 s (2.050) | **2.284 s** (1.141) | 867.68 s | **380×** |
+
+Same heads as the 16-bit chain (`OZ_HOL16=1`) at 256…4096 × 64/128 bits, also with every new buffer poisoned (`OZ_POISON=1`);
+n % 128 ≠ 0 or > ~360 bits of Z² fall back to the 16-bit chain by themselves. At 4096 × 64 the residue chain is now
+Z² 0.27 s · M (16-bit) 0.39 · A·M 0.15 · Z 0.09 · Garner of M 0.07 · base extension 0.04 · transposes 0.02 (`OZ_PROF=1`):
+M is the largest part left, and it needs A⁻¹ modulo small primes, i.e. an LU with pivoting.
+
+**SQ** — Zinxhiri i mbetjeve tani me module 8-bit: Z² saktë në RNS me 23–42 module < 256 (një GEMM INT8 secili, 2,8× më lirë
+për bit se moduli 16-bit), zgjerim baze me CRT të përafërt, A·M vetëm mod 10 moduleve të para. 4096 × 64 bit: 3,22 → 2,28 s
+(380× FLINT), bit për bit i njëjtë me zinxhirin 16-bit.
+
+## Real systems, exact / Sisteme reale, saktë (27-10-2026, `bench/mm2oz.py`, `OZ_FILE`, `bench/spex_solve.c`, `bench/real_run.sh`)
+
+The question an engineer asks: **how wrong is FP64 on the hardest real matrices, and can the exact answer be had in seconds?**
+The 13 most ill-conditioned square real matrices with 900 ≤ n ≤ 8192 of NIST Matrix Market (the first source: the original
+Harwell-Boeing, SPARSKIT/FIDAP and NEP collections with NIST's condition estimates; SuiteSparse refuses scripted downloads),
+from fluid dynamics (FIDAP, LNS), magnetohydrodynamics (MHD), a power network (Quebec Hydro), crystal growth, oil reservoirs
+and chemical plants.
+
+- **No rounding anywhere**: every double is m·2^e exactly, row i is multiplied by 2^{k_i} (its largest denominator), so
+  (DA)x = Db has integer entries — up to 154 bits — and the same x. Rows are put in the order of FP64 partial pivoting (the GPU
+  LU does not pivot; the order changes nothing in x), n is padded to a multiple of 128 with I. b = D⁻¹c, c random in [−127, 127].
+- **The whole solution**: high-order lifting (above) for y·(PDA)ᵀ = c, all n entries converted by halves (X^{2^l}), one
+  common denominator found in a few rounds of half-gcd reconstruction, then **checked**: y·M = c modulo two primes used nowhere
+  else. The reconstruction is unique by the Hadamard/Cramer bounds, so the solution is proved, not just tested.
+- **Against SPEX Left LU** (SuiteSparse 7.6, SPEX 2.3: exact sparse REF LU with COLAMD, GMP, one CPU thread — the dedicated
+  tool for exact sparse solving) on the very same integers; both print a digest Σ x_j r^j mod 2⁶¹−1 of the solution.
+- **FP64**: LAPACK `dgesv` (dense, partial pivoting) and SuperLU (scipy `spsolve`) on the original doubles, against the exact x.
+
+| matrix | n | nnz | kappa (NIST est.) | entry bits | denominator bits | GPU s | SPEX s | | same x | y M = c mod 2 primes | FP64 LAPACK digits (entries with none) | FP64 SuperLU digits (entries with none) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|:-:|:-:|---:|---:|
+| west0989 | 989 | 3518 | 5.7e12 | 75 | 28383 | 0.17 | 1.5 | 9x | yes | ok | 11.7 (0) | 11.8 (0) |
+| qh1484 | 1484 | 6110 | 5.6e17 | 96 | 82985 | 0.55 | 12.4 | 23x | yes | ok | 11.2 (0) | 12.2 (0) |
+| fidap032 | 1159 | 11047 | 5.2e20 | 60 | 58651 | 0.28 | 54.5 | 193x | yes | ok | 0.0 (568) | 0.0 (572) |
+| fidap006 | 1651 | 48968 | 3.5e21 | 154 | 137635 | 1.08 | 963.7 | 895x | yes | ok | 0.0 (887) | 0.0 (693) |
+| cry2500 | 2500 | 12349 | 4.4e17 | 70 | 142772 | 1.41 | > 7200 |  | -- | ok | 6.4 (0) | 5.1 (0) |
+| fidapm07 | 2065 | 45184 | 6.8e19 | 118 | 161950 | 1.19 | -- |  | -- | ok | 0.0 (430) | 0.0 (290) |
+| fidap026 | 2163 | 74195 | 4.7e18 | 153 | 194835 | 2.12 | -- |  | -- | ok | 0.0 (1568) | 0.0 (1530) |
+| mhd3200a | 3200 | 68026 | 6.5e39 | 130 | 186119 | 4.02 | -- |  | -- | ok | 0.0 (2876) | 0.0 (2768) |
+| fidap014 | 3251 | 65747 | 2.6e16 | 124 | 256431 | 4.74 | -- |  | -- | ok | 7.6 (0) | 8.0 (0) |
+| lns_3937 | 3937 | 25407 | 1.0e17 | 79 | 195969 | 4.31 | -- |  | -- | ok | 10.1 (2) | 7.4 (1) |
+| fidap012 | 3973 | 79017 | 2.2e20 | 119 | 271165 | 7.44 | -- |  | -- | ok | 0.0 (483) | 0.0 (482) |
+| mhd4800a | 4800 | 102252 | 3.2e47 | 131 | 281770 | 34.39 | -- |  | -- | ok | 0.0 (3923) | 0.0 (4754) |
+| sherman3 | 5005 | 20033 | 6.9e16 | 102 | 170131 | 14.25 | -- |  | -- | ok | 11.8 (0) | 12.4 (0) |
+
+GPU s: A⁻¹ + lifting + reconstruction + all numerators (the determinant's det/d step apart; where it needs more than the
+~78 000 bits the 16-bit primes give, it is reported as not computed — the solution does not depend on it). SPEX ran in the
+night after the GPU pass (CPU alone), limit 2 h each.
+
+What the table says: on **6 of 13 real systems FP64 has not one correct digit** — LAPACK and SuperLU alike, with the right
+order of magnitude only by accident (mhd3200a / mhd4800a: normwise error 10⁸, 90 % of the entries without a correct digit) —
+while NIST's condition estimate (itself FP64) does not tell which ones (qh1484 at 5.6·10¹⁷ keeps 11 digits). The exact
+solution, certified, takes 0.2–34 s on the laptop; SPEX gives the same x bit for bit where it finishes, 23× to ~900× slower.
+
+**SQ** — 13 matricat reale më të këqija të NIST Matrix Market (n 989–5005, κ deri 3·10⁴⁷): zgjidhja e SAKTË, e certifikuar,
+për 0,2–34 s te laptopi; SPEX (vegla e dedikuar për zgjidhje të sakta të rralla) jep të njëjtën x bit për bit, 23–900× më ngadalë.
+Te 6 nga 13 sisteme FP64 (LAPACK dhe SuperLU) s'ka asnjë shifër të saktë.
