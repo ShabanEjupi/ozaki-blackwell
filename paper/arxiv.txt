@@ -19,7 +19,7 @@ the CPU and 145 times faster than MPFR. With primes below 2^16 and 2^23 split in
 matrices with 1,015 to 131,063-bit entries is 10 to 19 times faster than FLINT on 24 threads. Turning the problem around,
 int8 in and residues out, the exact determinant of an int8 matrix comes 224 times sooner than FLINT at n=4096 and 355
 times at n=8192, with a proved bound on |det A| tight to one bit; n=16384 (204,480 bits) takes 66 s and n=32768
-(425,348 bits) 594 s within the GPU's 12 GB. With 32- to 128-bit entries the same method is 45 to 83 times faster than FLINT. Every result is bit-exact against GMP/FLINT or checked modulo independent
+(425,348 bits) 594 s within the GPU's 12 GB. With 32- to 256-bit entries, high-order lifting on the same modular GEMMs and a proved bound for such entries are 63 to 306 times faster than FLINT (n=4096, 64-bit entries: 3.3 s against 868 s), the ratio growing with the bits. Every result is bit-exact against GMP/FLINT or checked modulo independent
 primes.
 
 Ready: upload arxiv.tar.gz, paste the fields above.

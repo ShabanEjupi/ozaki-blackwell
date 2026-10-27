@@ -394,3 +394,69 @@ lifting fell from 40× to 17× (throttled) as the entries went from 64 to 128 bi
 **SQ** — Hyrje 32–256 bit (L plane bajtesh), ngritje me S prime njëherësh: 50× FLINT te n = 1024 me 64 bit, 45× me
 128 bit, 83× te n = 2048 me 32 bit, 53× me 64 bit (përcaktor 137 173 bit), bit për bit e saktë. Raporti bie me bitët (ngritja ∝ L²) —
 pikërisht aty ku ngritja e rendit të lartë (HOL) e ndryshon eksponentin: hapi i radhës, tani me bazën e matur.
+
+## High-order lifting on tensor cores / Ngritja e rendit të lartë (27-10-2026, `src/ozaki_hol.cuh`, `OZ_HOL=1 OZ_PLANES=L out_det n 32 1 1`)
+
+Dixon gains one X-digit per step and reads A and A⁻¹ each time; for L-byte entries that is ~L² and memory-bound. High-order
+lifting (Storjohann 2005, J. Complexity 21:609–650, §8 "sparse inverse expansion"; row form, y·A = b) squares the residue
+instead, so the precision doubles per level: ~log₂ N levels of n³ products instead of N matrix-vector steps.
+
+- **X = p₀…p_{s−1}**, distinct 16-bit primes with X ≥ 6.25 n²‖A‖; B₀ = A⁻¹ mod X from the LU of [A I] modulo each (the same
+  batched LU as before, s primes at once). R₀ = (I − A B₀)/X; level i: R̄ = Rᵢ², Mᵢ = B₀R̄ mod X ∈ [0, X),
+  R_{i+1} = (R̄ − A Mᵢ)/X exactly, and ‖Rᵢ‖ ≤ 1.25 n‖A‖ at every level. With C₀ = B₀, C_{i+1} = Cᵢ(I + X^m Rᵢ) + X^{2m} Mᵢ,
+  m_{i+1} = 2mᵢ + 1: A⁻¹ = Cᵢ + X^{mᵢ}A⁻¹Rᵢ, so cᵢ = b Cᵢ ≡ b A⁻¹ (mod X^{mᵢ}).
+- **The residue chain in RNS**, no big number anywhere: Rᵢ modulo the s primes of X and w more primes q (∏q > 2·2^zbits);
+  Mᵢ from its s residues by Garner; R_{i+1} mod q = (R̄ − A Mᵢ)·X⁻¹ mod q, its exact value by Garner over the q (sign from the
+  mixed-radix digits against (q−1)/2), checked against its bound. 2(s + w) modular GEMMs per level (64-bit entries at
+  n = 2048: s = 6, w = 5). Every matrix is kept **transposed** (Z = Rᵀ, B₀ᵀ, Aᵀ, Mᵀ), so the vector chain reads K-contiguous
+  rows; B₀ᵀ and Aᵀ are packed into GEMM operands once.
+- **The vector chain as INT8 GEMMs**: cᵢ is stored as balanced digits in a *periodic* mixed radix (position e has radix
+  p_{e mod s}), so X^m is a shift by s·m positions and the Garner digits of Mᵢ are digits of this radix already. cᵢ·Rᵢ is one
+  GEMM: rows = digits of cᵢ as [lo | hi] bytes (K = 2n), columns = the byte planes of Z as [Z_v | Z_{v−1}], so column v
+  collects 256^v; the planes are combined per (position, entry) in parallel into NL 32-bit limbs, and the carries run down
+  the positions one thread per entry (floor division by p with a 64-bit reciprocal). Only cᵢ mod X^{N−m} matters, and cᵢ
+  has ~s·mᵢ nonzero digits, so the rows sum to ~s·N over all levels.
+- **Around it**: the proved bound now takes byte planes (float LU of A/256^{L−1} — only an approximation, B = X_L·PA·X_U is
+  exact from the planes; Garner over up to 16 primes with |B_ij| rounded up from the mixed-radix digits, no 128-bit limit):
+  at n = 2048 with 64-bit entries it gives 137 174 bits for |det| = 137 173 bits, so det/d takes 6 primes instead of 128.
+  The rational reconstruction is FLINT's `_fmpq_reconstruct_fmpz_2` (half-gcd above a cutoff, FLINT 3.0.1 source): 0.493 →
+  0.047 s at that size (`OZ_GMPRR=1` keeps the quadratic Euclid).
+
+| n | entry bits | \|det\| bits | Dixon, S primes (lift) | **HOL** (lift: residue + vector chain) | FLINT | **vs FLINT** |
+|---|---|---|---|---|---|---|
+| 256 | 64 | 16 765 | 0.041 s (0.015) | **0.039 s** (0.013) | 0.17 s | 4.4× |
+| 256 | 128 | 33 148 | 0.059 s (0.034) | **0.039 s** (0.018) | 0.40 s | 10× |
+| 256 | 256 | 65 914 | 0.139 s (0.103) | **0.063 s** (0.033) | 1.08 s | 17× |
+| 512 | 64 | 33 776 | 0.074 s (0.040) | **0.052 s** (0.022) | 1.17 s | 22× |
+| 512 | 128 | 66 550 | 0.147 s (0.105) | **0.074 s** (0.036) | 2.66 s | 36× |
+| 512 | 256 | 132 082 | 0.399 s (0.343) | **0.139 s** (0.079) | 8.82 s | **63×** |
+| 1 024 | 64 | 68 073 | 0.177 s (0.120) | **0.126 s** (0.064) | 12.39 s | **98×** |
+| 1 024 | 128 | 133 615 | 0.434 s (0.361) | **0.219 s** (0.132) | 30.98 s | **141×** |
+| 2 048 | 32 | 71 638 | 0.358 s (0.279) | **0.288 s** (0.204) | 46.70 s | **162×** |
+| 2 048 | 64 | 137 173 | 1.091 s (0.974) | **0.453 s** (0.329) | 106.89 s | **236×** |
+| 2 048 | 128 | 268 249 | 2.946 s (2.774) | **0.856 s** (0.652) | 261.65 s | **306×** |
+| 4 096 | 32 | 145 330 | 3.425 s (3.217) | **1.934 s** (1.666) | 416.46 s | **215×** |
+| 4 096 | 64 | 276 398 | 7.443 s (7.050) | **3.273 s** (2.712) | 867.68 s | **265×** |
+
+GPU: best of two runs, without FLINT beside it (`bench/hol_table.sh`, measured right after the FLINT runs, ~10 % slower than the
+first runs of the night). Both GPU columns now use the proved bound for planes and FLINT's reconstruction, so the Dixon column is faster than the
+table above. FLINT: `fmpz_mat_det`, 24 threads; the 512 × 256-bit, 2048 × 128-bit and 4096-row references are new
+(27-10, `/opt/ozaki/flint/hol_flint.log`). At 4096 × 64-bit the residue chain is 2.08 s of the 2.71 s lifting
+(247 modular GEMMs of n³, ~8 ms each: power-bound), the vector chain 0.44 s.
+
+What changed: the ratio to FLINT now **rises** with the entry size (63× at 512 × 256-bit, 306× at 2048 × 128-bit) where
+digit-by-digit lifting made it fall — the lifting is 2.6–4.3× faster than S-prime Dixon and grows like the bits, not their
+square.
+
+Checked: bit-exact against FLINT `fmpz_mat_det` in every row; a zero leading minor (preconditioned) and a singular matrix
+(det = 0, FLINT 0) through the same path; the bounded-residue check never fired.
+
+🚫 **Moduli below 256 for X do not work** (measured): the LU without pivoting fails modulo p with probability ~1 − e^{−n/p}
+(n = 1024, p = 251: ~2 % success), and preconditioning cannot help (its randomness lives in F_p). Only the q (which need no
+A⁻¹) could be 8-bit: ~20 % of the residue chain, not done.
+
+**SQ** — Ngritja e rendit të lartë (Storjohann 2005) te bërthamat tensor: mbetja ngrihet në katror, saktësia dyfishohet për
+nivel; zinxhiri i mbetjeve në RNS (2(s+w) GEMM modulare për nivel, matricat të transpozuara), zinxhiri i vektorit si GEMM INT8
+mbi shifra me bazë të përzier periodike. Bashkë me kufirin e provuar për plane (1 bit mbi |det| te 2048 × 64 bit) dhe
+rindërtimin half-gcd të FLINT-it: 236× FLINT te 2048 × 64 bit, 306× te 2048 × 128 bit, 265× te 4096 × 64 bit (867,7 s → 3,27 s),
+bit për bit e saktë. Raporti tani RRITET me bitët. Modulet < 256 për X nuk bëjnë (LU pa pivotim mod p dështon ~1−e^(−n/p)).
