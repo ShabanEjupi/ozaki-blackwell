@@ -4,8 +4,12 @@
 # its count and one document that contains the longest span (its source URL from the document metadata).
 # python3 -I llm/olmo_trace.py "text" [min words, default 3]
 # python3 -I llm/olmo_trace.py --seqs olmo.txt [min words]   (the lines "seq prompt P mode M: 'text'" of ultra_tok.py dec)
+# --index NAME: another infini-gram index, e.g. v4_dclm-baseline_llama (4.3T tokens of filtered Common Crawl) for a model
+# whose own data is not open (Nemotron 3 Ultra: Nemotron-CC is drawn from Common Crawl; that is the public web, not its set).
 import ast, json, sys, time, urllib.request
 API, IDX = "https://api.infini-gram.io/", "v4_olmo-2-0325-32b-instruct_llama"
+if "--index" in sys.argv:
+    i = sys.argv.index("--index"); IDX = sys.argv[i + 1]; del sys.argv[i:i + 2]
 
 def q(**kw):
     kw["index"] = IDX
@@ -29,7 +33,7 @@ def trace(text, minw):
             if n == 0: break
             j, c = j + 1, n
         if j - i >= minw and not any(a <= i and j <= b for a, b, _ in spans): spans.append((i, j, c))
-    print(f"text: {text!r}\nindex: {IDX}\nmaximal spans of >= {minw} words found verbatim in the training data:")
+    print(f"text: {text!r}\nindex: {IDX}\nmaximal spans of >= {minw} words found verbatim in the indexed corpus:")
     for a, b, c in spans: print(f"  [{a}:{b}] {b - a} words, {c} occurrences: {' '.join(w[a:b])!r}")
     if not spans:
         print("  none: no span of that length occurs verbatim"); return
