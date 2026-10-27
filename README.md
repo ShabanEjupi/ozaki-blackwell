@@ -546,3 +546,58 @@ solution, certified, takes 0.2–34 s on the laptop; SPEX gives the same x bit f
 **SQ** — 13 matricat reale më të këqija të NIST Matrix Market (n 989–5005, κ deri 3·10⁴⁷): zgjidhja e SAKTË, e certifikuar,
 për 0,2–34 s te laptopi; SPEX (vegla e dedikuar për zgjidhje të sakta të rralla) jep të njëjtën x bit për bit, 23–900× më ngadalë.
 Te 7 nga 13 sisteme FP64 (LAPACK dhe SuperLU) s'ka asnjë shifër të saktë.
+
+## Exact arithmetic for the largest open model / Aritmetikë e saktë për modelin më të madh të hapur (27-10-2026, `llm/`)
+
+**Kimi K3** (moonshotai/Kimi-K3 on Hugging Face, read from the model card and the safetensors headers: **2 779 931 837 184
+parameters**, 96 shards, 1.56 TB) is the largest open-weights model; after it come Qwen3.8-2.4T-A95B and DeepSeek-V4-Pro
+(1.65 T). Its routed experts (2.72 T of the parameters: 93 layers × 896 experts, 16 used per token, latent width 3584) are stored
+MXFP4: an E2M1 value per weight and one E8M0 scale per 32. The rest (57 G) is BF16.
+
+An MXFP4 group of 32 is exactly the depth of one `mma.m16n8k32` INT8 step, and 2·E2M1 is an integer ≤ 12. So the product of
+MXFP4 weights and BF16 activations can be computed **exactly** with INT8 tensor cores and rounded **once** — every output is
+the correctly rounded value of Σ_k w_ik x_kj (`llm/mxexact.cu`):
+
+- weights: q' = 2·E2M1 · 2^{(s − s_min) mod 4} is an int8 (≤ 96); a row keeps one scale per band of four binades (on K3 every
+  row of the 48 matrices tested spans ≤ 3 binades: one band);
+- activations: each token is aligned to its largest exponent, A = m·2^{D_c − (E − e)} with D_c = 7S − 8, cut into S int8
+  digits; elements more than 2^{D_c} below the top form the next tier with their own exponent;
+- every (band, tier, digit) is a plain INT8 GEMM whose int32 sums cannot overflow (|P| ≤ K·96·128 < 2^{26.4} for K ≤ 7168);
+  the few terms of an output are added in a 128-bit integer and rounded once to FP32 (round-to-nearest-even, subnormals
+  included). A correctly rounded result cannot depend on the order of summation, the tiling, the batch or the machine.
+
+The baseline is what inference engines do: dequantize to BF16 (exact) and multiply on BF16 tensor cores with FP32
+accumulation, the split of K chosen by shape (`bf16_gemm` + `reduce_k`); for decode, an FP4 GEMV with FP32 multiply-add.
+
+Real weights: layer 5, experts 0–15, w1/w2/w3 (48 matrices, 281 MB fetched with HTTP range requests by `llm/k3_fetch.py`;
+the rest of the 16 GB shard never travels). Activations: Student-t (3 degrees of freedom: heavy tails like real hidden states)
+times the layer's real `routed_expert_norm` weight.
+
+| | result |
+|---|---|
+| outputs certified correctly rounded (48 matrices, 512 tokens; expert 0 w1 also 4096 tokens) | **all** (0 uncertified of 79.7 M) |
+| independent check: Python integers/`Fraction` from the raw bytes (`llm/mx_check.py`), 1500 random outputs | 1500 / 1500 |
+| same outputs for batch 1, 3, 17, 64, 200 and the 4096 batch | bit-identical, every matrix |
+| decode kernel (packed 4-bit read once, 1–8 tokens) vs the prefill path | bit-identical, every matrix |
+| BF16 tensor cores + FP32 accumulation, split-K 1 / 2 / 4 / 8: outputs not correctly rounded | 81.5 / 67.1 / 55.6 / 51.2 % (expert 0 w1); 75–83 % for split-K 1 over all 48 |
+| BF16 split-K 1 vs 4: outputs whose bits differ (4096 tokens × 3072) | 8 963 796 (71 %) |
+
+Speed (expert 0 w1, 3072 × 3584):
+
+| | exact (this work) | baseline |
+|---|---:|---:|
+| 4096 tokens (prefill), 4 digits | 8.0 ms: split 1.3 + 8 INT8 GEMMs 4.5 (153–162 TOPS each) + rounding 1.9 | BF16 tensor cores 2.9 ms (our kernel, 31 TFLOPS) |
+| 1 token (decode) | 0.062 ms = 94 GB/s of packed weights | FP4 GEMV, FP32: 0.125 ms |
+| version 1 (per-group 128-bit accumulator, commit 9b77801), 4096 tokens | 34.7 ms | |
+
+**Where exactness is free.** Running K3 on this laptop is a streaming problem: per token the 16 routed experts of 92 layers
+(25.8 GB of MXFP4) and the dense BF16 part (~112 GB) must come from storage. Measured here: NVMe 5.1 GB/s (`dd`
+O_DIRECT), pinned RAM → GPU 45 GB/s (PCIe 5 ×16, `llm/h2d.cu`). The exact decode kernel consumes 94 GB/s — 18× what the disk
+delivers — so on a laptop **a bit-reproducible trillion-parameter model costs the same time as a non-reproducible one**:
+~27 s per token, all of it reading. What it needs and this laptop lacks: 1.56 TB of storage (669 GB free) — the office link
+gave 2.9 MB/s from Hugging Face, i.e. six days for the weights.
+
+**SQ** — Kimi K3 (2,78 T parametra, modeli më i madh me pesha të hapura): prodhimi MXFP4 × BF16 i ekspertëve, i
+rrumbullakosur SAKTË, mbi tensor core INT8. Mbi peshat e vërteta (48 matrica): çdo dalje e certifikuar, e njëjtë për çdo
+batch dhe te decode; rruga e zakonshme BF16+FP32 gabon te 51–83 % e daljeve dhe ndryshon bitët sipas split-K. Prefill 8 ms
+(2,8× BF16), decode 94 GB/s — 18× më shpejt se disku, pra për një model që rrjedh nga disku saktësia s'kushton asgjë.
