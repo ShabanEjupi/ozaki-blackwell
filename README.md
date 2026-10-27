@@ -639,3 +639,24 @@ of the primes; at 128-bit entries (23 primes) the chain left its bound. The wiri
 
 **SQ** — X me prime < 256: LU me pivotim funksionon (A·A⁻¹ = I, asnjë prime singular), por HOL-i del 2× më i ngadaltë
 (2,33 → 4,58 s), sepse shifrat e zinxhirit vektorial dyfishohen. U mat dhe u hoq; mbetet X 16-bit.
+
+### A whole MoE block of K3, exact (`llm/moe.cu`)
+
+Layer 5 end to end, real weights (62 routed experts fetched on demand by `llm/k3_fetch.py`, the gate, the latent down/up
+projections, the norm, the two shared experts): router → 16 experts (w1, w3, SiTU, w2) → weighted sum → RMSNorm → up
+projection → + shared experts. Exact path: every matrix product correctly rounded to BF16 (the router to FP32), the
+weighted sum and RMSNorm in FP64 in a fixed order, rounded once. Engine path: BF16 tensor cores with FP32 accumulation,
+results cast to BF16, float reductions. 4 tokens (Student-t hidden states through the real post-attention norm):
+
+| | |
+|---|---|
+| exact products not certified | 0 |
+| exact: each token alone vs in the batch of 4 | 0 of 28 672 outputs differ |
+| engine, split-K 1 vs split-K 4 | 14 041 of 28 672 outputs differ (49.0 %) |
+| engine split-K 1 vs exact | 14 256 differ (49.7 %) |
+
+The only parts not covered by correct rounding are the transcendental functions of SiTU and the sigmoid (FP64 here, rounded
+once): reproducible with the same libm, and correctly rounded except in rare hard cases.
+
+**SQ** — Një bllok i tërë MoE i K3 (shtresa 5, peshat reale): rruga e saktë jep të njëjtët bitë për çdo token, vetëm ose
+në batch; motori me BF16+FP32 ndryshon 49 % të daljeve vetëm nga split-K.

@@ -414,6 +414,9 @@ decode, 1 token: exact (packed 4-bit) / FP4 GEMV, FP32 & 0.062 / 0.125 ms \\\bot
 On the real router of the layer ($896\times7168$ BF16, FP32 logits, sigmoid plus learned bias, top 16), the rounding of the
 logits alone sends $\sim$1 token in 13\,000 to a different expert (11 in 147\,456 token--split pairs), i.e.\ over K3's 92 MoE
 layers $\sim$1 token in 140 runs a different expert somewhere; with exact logits the choice depends on the input alone.
+A whole MoE block of layer 5 (62 real experts fetched on demand, the latent projections, RMSNorm and the shared experts;
+products correctly rounded, reductions in FP64 in a fixed order) gives the same bits for every token alone or in a batch,
+while the engine path changes 49\% of the block's 28\,672 BF16 outputs between split-K 1 and 4.
 
 Where exactness costs nothing: a trillion-parameter model on this laptop is a streaming problem. Per text token K3 reads 25.8~GB
 of routed MXFP4 experts and 111.2~GB of dense BF16 weights (attention 72.4, shared experts 24.3; summed from the 96 safetensors headers); we measured 5.1~GB/s from the NVMe drive and 45~GB/s over
