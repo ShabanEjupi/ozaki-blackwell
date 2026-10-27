@@ -262,7 +262,9 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
                                      int w, const int32_t *b, int N, int zbits, HolStats &st, int *err_out) {
     using clk = std::chrono::steady_clock;
     auto now = [] { return std::chrono::duration<double>(clk::now().time_since_epoch()).count(); };
-    const int n = lu.n, U = (zbits + 2 + 7) / 8, sN = s * N;
+    const int n = lu.n, sN = s * N;
+    int U = (zbits + 2 + 7) / 8;
+    if ((U + 1) * n % BN) U++;   // n % 128 == 64: one more (zero) plane, so the vector GEMM has whole 128-column tiles
     const size_t nn = (size_t)n * n;
     // the carry needs |c digit| |Z| n < 2^(15 + log2 n + zbits), a sign bit and room for the carry itself
     int lgn = 0; while ((1 << lgn) < n) lgn++;
@@ -340,11 +342,9 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
     };
     auto combine_k = [&](int rows) {
         const int gr = (int)std::min<size_t>(8192, ((size_t)rows * n + 255) / 256);
-        switch (NL) { case 4: hol_combine<4><<<gr, 256>>>(G, rows, n, U); break;
-                      case 6: hol_combine<6><<<gr, 256>>>(G, rows, n, U); break;
-                      case 8: hol_combine<8><<<gr, 256>>>(G, rows, n, U); break;
-                      case 10: hol_combine<10><<<gr, 256>>>(G, rows, n, U); break;
-                      default: hol_combine<12><<<gr, 256>>>(G, rows, n, U); }
+#define OZ_HB(K) case K: hol_combine<K><<<gr, 256>>>(G, rows, n, U); break;
+        switch (NL) { OZ_HB(4) OZ_HB(6) OZ_HB(8) OZ_HB(10) OZ_HB(12) }
+#undef OZ_HB
     };
     auto set_top = [&](int v) { cudaMemcpy(dtop, &v, 4, cudaMemcpyHostToDevice); };
     auto get_top = [&] { int v; cudaMemcpy(&v, dtop, 4, cudaMemcpyDeviceToHost); return v; };
