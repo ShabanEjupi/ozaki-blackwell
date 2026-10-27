@@ -197,9 +197,10 @@ int main(int argc, char **argv) {
             const double t1 = now(); int herr = 0; oz::HolStats hs;
             std::vector<int16_t> dig = oz::hol_solve(w, dA, L, lp.p, S, qhol.data(), (int)qhol.size(), b.data(), N, zbits, hs, &herr);
             t_lift = now() - t1;
+            if (oz::det_prof.on) printf("  HOL8 phases: Z^2 %.3f  bext %.3f  M %.3f  garner %.3f  AM %.3f  next %.3f  transpose %.3f s\n", hs.ph[0], hs.ph[1], hs.ph[2], hs.ph[3], hs.ph[4], hs.ph[5], hs.ph[6]);
             if (herr) { printf("HOL: a residue outside its bound\n"); return 1; }
-            printf("  HOL: X = %d primes, %zu primes q, %d X-digits, %d levels, %d modular GEMMs (n^3 each); setup %.3f  residue chain %.3f  vector chain %.3f s\n",
-                   S, qhol.size(), N, hs.levels, hs.gemms, hs.init, hs.rchain, hs.cchain);
+            printf("  HOL: X = %d primes, %zu primes q, %d X-digits, %d levels, %d modular GEMMs 16-bit + %d 8-bit (W %d, WQ %d); setup %.3f  residue chain %.3f  vector chain %.3f s\n",
+                   S, qhol.size(), N, hs.levels, hs.gemms, hs.gemms8, hs.W, hs.WQ, hs.init, hs.rchain, hs.cchain);
             t2 = now();
             const int sN = S * N;
 #pragma omp parallel for
