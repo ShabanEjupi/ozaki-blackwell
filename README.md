@@ -61,9 +61,9 @@ Under load the laptop holds ~95 W and the SM clock drops to ~1.8 GHz (2.76 GHz o
 - Real systems above n ≈ 6000 run by Dixon (bench/real_dixon.sh); HOL by column blocks would be 2.6–4.3× faster there.
 - cry10000 (n = 10 000) solved exactly in 122 s (D 574 553 bits); the SPEX column for the larger systems fills in the night
   runs (`/opt/ozaki/real/batch.log`; `bench/real_table.py [--tex]`).
-- Nemotron 3 Ultra (open weights + open pre-training data, 560 B): the whole NVFP4 model (352.3 GB) fits the free disk —
-  download it at home, stream it with the exact decode; tile the NVFP4 prefill through shared memory; then trace an exact
-  output back to the published training data (the data are open, so the claim can be checked by anyone).
+- ✅ 27-10: Nemotron 3 Ultra (560 B, open weights; its main pre-training data gated, internal training only) runs whole and
+  exact from disk (`llm/ultra.cu`, below). Next: read-ahead (disk 16 s of the 26 s per token), the NVFP4 prefill tiled
+  through shared memory, and the fully open models — OLMo 2 32B traced into its whole training data, K2-Think-V2 (`llm/dense.cu`).
 - The decode kernel reads 94 GB/s of packed weights, below what the GPU memory gives (irrelevant while the weights stream from disk).
 - An 8-bit X for HOL was measured and dropped (below); the proved bound with row scaling and n = 32768 remain as before.
 
@@ -667,9 +667,12 @@ once): reproducible with the same libm, and correctly rounded except in rare har
 **SQ** — Një bllok i tërë MoE i K3 (shtresa 5, peshat reale): rruga e saktë jep të njëjtët bitë për çdo token, vetëm ose
 në batch; motori me BF16+FP32 ndryshon 49 % të daljeve vetëm nga split-K.
 
-### The largest open model with open training data: Nemotron 3 Ultra, NVFP4 W4A4 exact (`llm/nvexact.cu`, `llm/nv_check.py`)
+### The largest model with a published data recipe: Nemotron 3 Ultra, NVFP4 W4A4 exact (`llm/nvexact.cu`, `llm/nv_check.py`)
 
-K3 publishes its weights, not its data. The largest model that publishes **weights, recipe and pre-training data** is NVIDIA
+K3 publishes its weights, not its data. Measured 27-10 on the Hugging Face API, the bulk of the data Nemotron 3 Ultra lists
+(Nemotron-CC v2/v2.1, the code and SFT pre-training sets) is gated by manual approval under an agreement for internal
+training only; Legal-v1, Specialized-v1.x and Code-v3 are free (CC-BY-4.0). With that caveat, the largest model that
+publishes **weights, recipe and a list of its pre-training data** is NVIDIA
 Nemotron 3 Ultra (Hugging Face metadata of the BF16 checkpoint: **560 524 578 816 parameters**, 55B active; model card:
 226 datasets, 14.8T tokens, 53.8 TiB, a few third-party sets private). It was pre-trained in NVFP4 and its routed experts ship
 as NVFP4 for weights *and* activations (ModelOpt group 16: E2M1 values, one E4M3 scale per 16, an FP32 global scale; the
@@ -719,8 +722,8 @@ the split, exactly like the emulation above: the error is the format’s FP32 ep
 different: its experts are 99.5 % (near) zero in the BF16 checkpoint as well (median |w| 6.6·10⁻¹⁰), so 92 % of its exact
 outputs are 0.
 
-**SQ** — Modeli më i madh me pesha DHE të dhëna trajnimi të hapura (Nemotron 3 Ultra, 560 miliardë parametra, 14,8T
-tokenë publikë) llogaritet saktë në formatin e vet NVFP4: një bllok 16 = një MMA INT8, shkallët si shift në int64, një
+**SQ** — Modeli më i madh me pesha të hapura dhe recetë të publikuar të dhënash (Nemotron 3 Ultra, 560 miliardë parametra,
+14,8T tokenë; shumica e tyre me qasje të kufizuar: miratim me dorë, vetëm për trajnim të brendshëm) llogaritet saktë në formatin e vet NVFP4: një bllok 16 = një MMA INT8, shkallët si shift në int64, një
 rrumbullakim. 0 gabime (edhe te kontrolli i pavarur); motori FP32 gabon 18–49 %, kryesisht te shkallët globale. Decode i
 saktë: 405–487 GB/s. I gjithë modeli NVFP4 (352 GB) hyn në diskun e laptopit; një token lexon 51,2 GB → ~3,5 s/token, saktë.
 
