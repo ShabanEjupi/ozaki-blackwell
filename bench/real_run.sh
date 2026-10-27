@@ -9,5 +9,5 @@ python3 -I bench/mm2oz.py $D/m.mtx.gz $D/s > $D/conv.log || { echo "$N: conversi
 read np L n0 < <(python3 -c "import struct;print(*struct.unpack('3i',open('$D/s.oz','rb').read()[4:16]))")
 echo "$N: $(cat $D/conv.log)"
 OZ_FILE=$D/s.oz OZ_PLANES=$L OZ_HOL=1 ./out_det $np 32 0 1 > $D/gpu.log 2>&1; echo "  GPU rc=$? $(grep -E 'file:|HOL:|head|FILE|failed|RATREC|minor' $D/gpu.log | tr '\n' ' ' | cut -c1-900)"
-timeout ${SPEX_T:-3600} ./out_spex $D/s.int > $D/spex.log 2>&1; echo "  SPEX rc=$? $(cat $D/spex.log | tail -1)"
+if [ "${SPEX_T:-3600}" != 0 ]; then timeout ${SPEX_T:-3600} ./out_spex $D/s.int > $D/spex.log 2>&1; echo "  SPEX rc=$? $(tail -1 $D/spex.log)"; fi
 python3 -I bench/fp64_err.py $D $n0 $np
