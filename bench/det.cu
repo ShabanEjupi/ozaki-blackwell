@@ -16,7 +16,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <algorithm>
 #include <gmp.h>
 #include "../src/ozaki_det.cuh"
 #include "../src/ozaki_detbound.cuh"
@@ -31,7 +30,6 @@ static double now() { return std::chrono::duration<double>(std::chrono::steady_c
 static const int32_t *gU = nullptr, *gL = nullptr;   // the preconditioner, once it is needed
 static int gPlanes = 1;   // OZ_PLANES=L: entries of L bytes, sum_j A[j] 256^j
 static uint64_t invm(uint64_t a, uint64_t p);
-static std::vector<uint32_t> gX8;   // OZ_HOLX8: the candidate primes < 256 for X
 static const char *gFile = nullptr; static std::vector<int32_t> gB; static std::vector<__mpz_struct> gY;   // OZ_FILE: a system from bench/mm2oz.py, its right-hand side
 
 // OZ_FILE, after the lifting: the WHOLE solution y = c M^-1 (= x^T of the original system) from the digits of every entry.
@@ -330,21 +328,9 @@ int main(int argc, char **argv) {
             while (lg < need) lg += log2((double)all[S++]);
             zbits = (int)ceil(log2(1.25 * n) + 8.0 * L - 1);
             for (lg = 0; lg < zbits + 2;) { qhol.push_back(all[400 + qhol.size()]); lg += log2((double)qhol.back()); }   // far from the retries' primes
-            if (getenv("OZ_HOLX8")) {   // X from primes < 256 (B0 by LU WITH pivoting): below the q of the 8-bit chain, which X must not divide
-                std::vector<uint32_t> m;   // the moduli of hol8_setup, largest first; its q are the first WQ
-                for (uint32_t v = 251; v >= 17; v -= 2) { bool pr = true; for (uint32_t d = 3; d * d <= v; d += 2) if (v % d == 0) { pr = false; break; } if (pr) m.push_back(v); }
-                for (uint32_t v : {243u, 169u, 125u, 121u, 49u}) m.push_back(v);
-                std::sort(m.rbegin(), m.rend());
-                int WQ = 0; double lq = 0; while (lq < zbits + 2) lq += log2((double)m[WQ++]);
-                gX8.clear();
-                for (int u = WQ; u < (int)m.size(); u++) { bool pr = true; for (uint32_t d = 3; d * d <= m[u]; d += 2) if (m[u] % d == 0) pr = false; if (pr) gX8.push_back(m[u]); }
-                for (lg = 0, S = 0; lg < need; S++) lg += log2((double)gX8[S]);
-                printf("  X: %d primes below 256 (%u..%u, %.1f bits), after the %d q of the 8-bit chain\n", S, gX8[S - 1], gX8[0], lg, WQ);
-            }
         }
         if (S > 1 && n > 16384) { printf("OZ_LIFTS > 1 above n = 16384: not wired\n"); return 1; }
         oz::DetWork w; w.alloc(n, S, 2 * n); w.L = L;
-        if (hol && !gX8.empty()) w.piv = true;
         uint32_t p = 0; size_t pi = 0; oz::LiftPrimes lp{}; lp.s = S;
         bool singular = false;
         for (;; pi++) {   // 4 plain primes failing = a zero leading minor over Z, or det 0: precondition and try 8 more
@@ -353,7 +339,6 @@ int main(int argc, char **argv) {
             if (pi == 12) { singular = true; break; }
             std::vector<uint32_t> one(S, 1); std::vector<int> zero(S, 0), bads(S);
             for (int t = 0; t < S; t++) lp.p[t] = all[pi * S + t];
-            if (hol && !gX8.empty()) { if (pi + S > gX8.size() || pi == 4) { printf("OZ_HOLX8: A singular modulo 4 windows of small primes\n"); return 1; } for (int t = 0; t < S; t++) lp.p[t] = gX8[pi + t]; }
             p = lp.p[0];
             cudaMemcpy(w.P, lp.p, S * 4, cudaMemcpyHostToDevice); cudaMemcpy(w.det, one.data(), S * 4, cudaMemcpyHostToDevice);
             cudaMemcpy(w.bad, zero.data(), S * 4, cudaMemcpyHostToDevice);

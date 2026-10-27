@@ -16,12 +16,12 @@ int main(int argc, char **argv) {
     std::vector<uint32_t> p8;
     for (uint32_t c = 255; p8.size() < (size_t)s && c > 2; c--) { bool pr = true; for (uint32_t d = 2; d * d <= c; d++) if (c % d == 0) pr = false; if (pr) p8.push_back(c); }
     auto now = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
-    for (int mode = 0; mode < 2; mode++) {   // 0: s primes < 256 with pivoting; 1: s/2 primes < 2^16 without (today's B0)
+    for (int mode = 0; mode < 3; mode++) {   // 0: s primes < 256 with pivoting; 1: s/2 primes < 2^16 without (today's B0); 2: those with pivoting
         const int sz = mode ? s / 2 : s;
         std::vector<uint32_t> P(sz), one(sz, 1); std::vector<int> zero(sz, 0), bad(sz);
         for (int t = 0; t < sz; t++) P[t] = mode ? 65521 - 2 * t * 6 : p8[t];
-        if (mode) { int k = 0; for (uint32_t c = 65521; k < sz; c -= 2) { bool pr = true; for (uint32_t d = 3; d * d <= c; d += 2) if (c % d == 0) pr = false; if (pr) P[k++] = c; } }
-        oz::DetWork w; w.alloc(n, sz, 2 * n); w.piv = mode == 0;
+        if (mode) { int k = 0; for (uint32_t c = 65279; k < sz; c -= 2) { bool pr = true; for (uint32_t d = 3; d * d <= c; d += 2) if (c % d == 0) pr = false; if (pr) P[k++] = c; } }
+        oz::DetWork w; w.alloc(n, sz, 2 * n); w.piv = mode != 1;
         cudaMemcpy(w.P, P.data(), sz * 4, cudaMemcpyHostToDevice); cudaMemcpy(w.det, one.data(), sz * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(w.bad, zero.data(), sz * 4, cudaMemcpyHostToDevice);
         cudaDeviceSynchronize(); const double t0 = now();
@@ -45,7 +45,7 @@ int main(int argc, char **argv) {
             }
         }
         printf("n %d, %d primes %s: %.3f s, %d singular, %d wrong entries in %d checked rows\n", n, sz,
-               mode ? "< 2^16, no pivoting" : "< 256, partial pivoting", t1 - t0, nbad, wrong, 3 * (sz - nbad));
+               mode == 1 ? "< 2^16, no pivoting" : mode ? "< 2^16, partial pivoting" : "< 256, partial pivoting", t1 - t0, nbad, wrong, 3 * (sz - nbad));
         w.free_();
     }
     return 0;

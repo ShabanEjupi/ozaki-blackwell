@@ -622,3 +622,20 @@ logits the choice is a function of the input alone.
 
 **SQ** — Te ruteri real i K3, vetëm rrumbullakimi i logit-ëve (split-K) e dërgon ~1 token në 13 000 te një ekspert tjetër për
 shtresë, ~1 në 140 tokenë në 92 shtresa. Me logit-ë të saktë zgjedhja varet vetëm nga hyrja.
+
+### Measured and dropped: an 8-bit X for the HOL residue chain (27-10-2026, `bench/lu8_test.cu`)
+
+M = B₀·Zb mod X is the last 16-bit part of the 8-bit residue chain; with X a product of primes < 256 it would be one INT8
+GEMM of depth n per prime instead of modgemm's two of depth 2n. B₀ = A⁻¹ mod p then needs LU **with** pivoting (a leading
+minor vanishes with probability ~1/p): `panel_lu_piv` factors the whole tall leaf panel with row swaps over the whole row
+(the L to the left, the columns still waiting for their updates -- every update is row-wise, so a swap commutes with it --
+and the identity of [A I]). Checked: (A mod p)·A⁻¹ = I on every tested row, no prime singular; n = 4096, 12 primes < 256:
+0.357 s (16-bit primes without pivoting: 0.119 s, one of six singular; with pivoting 0.236 s).
+
+End to end it does not pay: same determinant head, but 4096 × 64-bit **2.33 s → 4.58 s** (1024 × 64: 0.122 → 0.159), because
+an X of 8-bit primes doubles the digit positions of the vector chain (lifting 1.79 → 3.78 s) and Garner grows with the square
+of the primes; at 128-bit entries (23 primes) the chain left its bound. The wiring was removed; the pivoted LU stays
+(`DetWork.piv`), and so does the 16-bit X.
+
+**SQ** — X me prime < 256: LU me pivotim funksionon (A·A⁻¹ = I, asnjë prime singular), por HOL-i del 2× më i ngadaltë
+(2,33 → 4,58 s), sepse shifrat e zinxhirit vektorial dyfishohen. U mat dhe u hoq; mbetet X 16-bit.

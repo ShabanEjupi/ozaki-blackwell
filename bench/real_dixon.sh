@@ -8,7 +8,10 @@ for N in "$@"; do
     D=/opt/ozaki/real/$N
     read np L n0 < <(python3 -c "import struct;print(*struct.unpack('3i',open('$D/s.oz','rb').read()[4:16]))")
     echo "$N: $(cat $D/conv.log)"
-    OZ_HADAMARD=1 OZ_FILE=$D/s.oz OZ_PLANES=$L ./out_det $np 32 0 1 > $D/gpu_dixon.log 2>&1
-    echo "  GPU rc=$? $(grep -E 'file:|head|FILE|failed|RATREC|LIFT' $D/gpu_dixon.log | tr '\n' ' ' | cut -c1-900)"
+    t0=$(date +%s.%N)
+    rm -f $D/t_sol   # the moment the certified solution is printed (the det/d step that follows is not part of the solve)
+    OZ_HADAMARD=1 OZ_FILE=$D/s.oz OZ_PLANES=$L timeout 3600 stdbuf -oL ./out_det $np 32 0 1 2>&1 |
+        while IFS= read -r l; do echo "$l"; case "$l" in *"solution x = num"*) date +%s.%N > $D/t_sol;; esac; done > $D/gpu_dixon.log
+    echo "  GPU solve $( [ -f $D/t_sol ] && echo "$(cat $D/t_sol) - $t0" | bc ) s (wall to the certified solution) $(grep -E 'file:|head|FILE|failed|RATREC|LIFT' $D/gpu_dixon.log | tr '\n' ' ' | cut -c1-900)"
     python3 -I bench/fp64_err.py $D $n0 $np
 done
