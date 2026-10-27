@@ -374,7 +374,7 @@ __global__ void lift_r_planes(const int8_t *__restrict__ A, int L, const uint16_
 // A^-1 residues + L bytes of A per entry, ~L for s ~ L / 2. x_i = A^-1 r_i mod M comes by CRT from the s residues, as s
 // base-2^16 digits; A x_i = sum_{j,u} 256^(j + 2u) A_j x_{i,u} lands on byte-aligned digits of the residual, which is
 // then divided by p_0, ..., p_{s-1} in turn, each exactly.
-constexpr int LIFT_SMAX = 16;
+constexpr int LIFT_SMAX = 24;   // 16 for liftm; up to 24 primes of X for the high-order lifting (det.cu keeps them here too)
 struct LiftPrimes { int s; uint32_t p[LIFT_SMAX]; uint32_t inv[LIFT_SMAX][LIFT_SMAX]; };   // inv[u][t] = p_u^-1 mod p_t
 
 // one warp per row: y_t = Ai_t[i] . rm_t mod p_t (Ai_t, rm_t n^2 and n apart), then lane 0: Garner and the mixed radix

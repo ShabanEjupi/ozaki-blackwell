@@ -24,7 +24,7 @@
 
 namespace oz {
 
-constexpr int HOL_SMAX = 16, HOL_WMAX = 12, HOL_BMAX = 2 * HOL_WMAX;   // primes of X, primes q, bytes below prod q
+constexpr int HOL_SMAX = 24, HOL_WMAX = 20, HOL_BMAX = 2 * HOL_WMAX;   // primes of X, primes q, bytes below prod q
 
 struct HolConst {
     int s, w;
@@ -266,8 +266,8 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
     const size_t nn = (size_t)n * n;
     // the carry needs |c digit| |Z| n < 2^(15 + log2 n + zbits), a sign bit and room for the carry itself
     int lgn = 0; while ((1 << lgn) < n) lgn++;
-    const int nlb = 15 + lgn + zbits + 3, NL = nlb <= 128 ? 4 : nlb <= 192 ? 6 : 8;
-    if (s > HOL_SMAX || w > HOL_WMAX || nlb > 256 || 2 * w > HOL_BMAX || NL > U + 1) { fprintf(stderr, "HOL: s %d w %d bits %d out of range\n", s, w, nlb); exit(1); }
+    const int nlb = 15 + lgn + zbits + 3, NL = nlb <= 128 ? 4 : nlb <= 192 ? 6 : nlb <= 256 ? 8 : nlb <= 320 ? 10 : 12;
+    if (s > HOL_SMAX || w > HOL_WMAX || nlb > 384 || 2 * w > HOL_BMAX || NL > U + 1) { fprintf(stderr, "HOL: s %d w %d bits %d out of range\n", s, w, nlb); exit(1); }
     double t0 = now();
 
     HolConst h{}; h.s = s; h.w = w;
@@ -301,7 +301,7 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
     // B0^T = (A^-1 mod p_t)^T from the LU, A^T mod q_r through Zres
     const dim3 tg(n / 32, n / 32, s), tb(32, 8);
     transpose_i32<<<tg, tb>>>(lu.R + n, lu.ld, lu.zr(), B0T, n);
-    cudaDeviceSynchronize(); lu.free_();
+    cudaStreamSynchronize(cudaStreamPerThread); lu.free_();
     det_init<<<dim3(256, w), 256>>>(dA, Zres, n, n, hw.P + s, L);
     transpose_i32<<<dim3(n / 32, n / 32, w), tb>>>(Zres, n, nn, AT, n);
 
@@ -320,14 +320,16 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
     auto carry_k = [&](const int16_t *co, int16_t *cn, const int32_t *g, int g0, int g1, const long long *bmp, int b0,
                        int p0, int p1, int end, int first) {
 #define OZ_HC(K) case K: hol_carry<K><<<(n + 63) / 64, 64>>>(co, cn, n, g, U, g0, g1, bmp, b0, p0, p1, end, carry, first, dtop); break;
-        switch (NL) { OZ_HC(4) OZ_HC(6) OZ_HC(8) }
+        switch (NL) { OZ_HC(4) OZ_HC(6) OZ_HC(8) OZ_HC(10) OZ_HC(12) }
 #undef OZ_HC
     };
     auto combine_k = [&](int rows) {
         const int gr = (int)std::min<size_t>(8192, ((size_t)rows * n + 255) / 256);
         switch (NL) { case 4: hol_combine<4><<<gr, 256>>>(G, rows, n, U); break;
                       case 6: hol_combine<6><<<gr, 256>>>(G, rows, n, U); break;
-                      default: hol_combine<8><<<gr, 256>>>(G, rows, n, U); }
+                      case 8: hol_combine<8><<<gr, 256>>>(G, rows, n, U); break;
+                      case 10: hol_combine<10><<<gr, 256>>>(G, rows, n, U); break;
+                      default: hol_combine<12><<<gr, 256>>>(G, rows, n, U); }
     };
     auto set_top = [&](int v) { cudaMemcpy(dtop, &v, 4, cudaMemcpyHostToDevice); };
     auto get_top = [&] { int v; cudaMemcpy(&v, dtop, 4, cudaMemcpyDeviceToHost); return v; };
@@ -340,7 +342,7 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
     carry_k(cb[1], cb[0], nullptr, 0, 0, bm, 0, 0, std::min(s, sN), sN, 1);
     top[0] = get_top();
     if (I > 0) next(nullptr, 1);
-    cudaDeviceSynchronize(); st.init = now() - t0;
+    cudaStreamSynchronize(cudaStreamPerThread); st.init = now() - t0;
 
     for (int i = 0; i < I; i++) {
         const long long m = (2ll << i) - 1;
@@ -352,7 +354,7 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
             mgemm(Mres, 0, s, Zb, B0T);
             hol_garner<<<(n + 7) / 8, 256>>>(Mres, db, n, needZ ? Mq : nullptr, bm);
         }
-        cudaDeviceSynchronize(); st.rchain += now() - ta; ta = now();
+        cudaStreamSynchronize(cudaStreamPerThread); st.rchain += now() - ta; ta = now();
         // c_{i+1} = c_i + X^m (c_i mod X^(N - m)) R_i + X^(2m) b M_i, mod X^N
         const int16_t *co = cb[cur]; int16_t *cn = cb[cur ^ 1];
         const int sm = (int)(s * m), E = std::min(top[cur], (int)(s * (N - m))), b0 = needM ? (int)(2 * m * s) : -1;
@@ -371,7 +373,7 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
         top[cur ^ 1] = get_top(); cur ^= 1;
         st.cchain += now() - ta; ta = now();
         if (needZ) next(Zb + s * nn, 0);   // Zb mod q_r: after the s matrices mod p_t
-        cudaDeviceSynchronize(); st.rchain += now() - ta;
+        cudaStreamSynchronize(cudaStreamPerThread); st.rchain += now() - ta;
     }
 
     std::vector<int16_t> out((size_t)sN * 4);

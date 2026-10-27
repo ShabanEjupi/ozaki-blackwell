@@ -21,6 +21,7 @@
 #include "../src/ozaki_hol.cuh"
 double flint_det(int n, const int8_t *A, int threads, long *bits, std::string *hex, int L = 1);
 double flint_solve(int n, const int8_t *A, const int32_t *b, int threads, const __mpz_struct *num, const mpz_t D, int *ok);
+bool flint_ratrec(mpz_t num, mpz_t den, const mpz_t X, const mpz_t Q, long nb, long db);   // half-gcd (det_flint.cpp)
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -139,8 +140,8 @@ int main(int argc, char **argv) {
         // 0. the proved bound on log2 |det| (step 4 needs it) on its own thread and stream, overlapping steps 1-3
         // (above n = 8192 it waits until the [A I] workspace is freed: both do not fit in 12 GB together)
         auto start_bound = [&] {
-            if (method == 1 && !getenv("OZ_HADAMARD") && (n >= 4096 || getenv("OZ_BOUND")) && gPlanes == 1)   // the bound reads int8 A
-                bth = std::thread([&] { const double tb = now(); ub = std::min(hb, oz::det_log2_bound(n, dA, getenv("OZ_S") ? atoi(getenv("OZ_S")) : 20, &bprimes)); t_bth = now() - tb; });
+            if (method == 1 && !getenv("OZ_HADAMARD") && (n >= 4096 || (gPlanes > 1 && n >= 2048 && n <= 16384) || getenv("OZ_BOUND")))   // large entries: Hadamard leaves ~0.72 n bits, the primes for them cost more
+                bth = std::thread([&] { const double tb = now(); ub = std::min(hb, oz::det_log2_bound(n, dA, getenv("OZ_S") ? atoi(getenv("OZ_S")) : 20, &bprimes, gPlanes)); t_bth = now() - tb; });
         };
         if (n <= 8192) start_bound();
         // 1. A^-1 mod p from the LU of [A I]
@@ -409,7 +410,7 @@ int main(int argc, char **argv) {
         for (int j = 0; j < 4; j++) {
             mpz_mul(xj, &x4[j], D); mpz_mod(xj, xj, Q); if (mpz_cmp(xj, hq) > 0) mpz_sub(xj, xj, Q);
             if ((long)mpz_sizeinbase(xj, 2) < nb) continue;
-            if (!ratrec(num, den, &x4[j], Q, nb, db)) { printf("RATREC failed at entry %d\n", j); return 1; }
+            if (!(getenv("OZ_GMPRR") ? ratrec : flint_ratrec)(num, den, &x4[j], Q, nb, db)) { printf("RATREC failed at entry %d\n", j); return 1; }
             mpz_lcm(D, D, den);
         }
         mpz_clear(hq); for (auto &v : x4) mpz_clear(&v);

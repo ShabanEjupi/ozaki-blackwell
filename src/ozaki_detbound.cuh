@@ -40,32 +40,36 @@ __global__ void bound_l1(const long long *__restrict__ XL, const long long *__re
         cu[t] = b; du[t] = XU[(size_t)t * n + t];
     }
 }
-__global__ void bound_prep(const int8_t *__restrict__ A, int n, float *__restrict__ LU, float *__restrict__ Li, float *__restrict__ Ui) {
+// L > 1 (entries of L byte planes): the float LU only needs an approximation of A, here A / 256^(L-1) rounded -- the
+// bound stays proved, since B below is computed exactly from the integer A
+__global__ void bound_prep(const int8_t *__restrict__ A, int n, float *__restrict__ LU, float *__restrict__ Li, float *__restrict__ Ui,
+                           int L = 1) {
     for (size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; e < (size_t)n * n; e += (size_t)gridDim.x * blockDim.x) {
         const int i = e % n, k = e / n;   // column-major (i, k)
-        LU[e] = A[(size_t)i * n + k]; if (Li) Li[e] = Ui[e] = i == k;
+        double a = 0; for (int j = 0; j < L; j++) a = a / 256 + A[(size_t)j * n * n + (size_t)i * n + k];
+        LU[e] = (float)a; if (Li) Li[e] = Ui[e] = i == k;
     }
 }
-__global__ void bound_rows_perm(const int8_t *__restrict__ A, const int *__restrict__ ord, int n, int8_t *__restrict__ PA) {
-    for (size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; e < (size_t)n * n; e += (size_t)gridDim.x * blockDim.x)
-        PA[e] = A[(size_t)ord[e / n] * n + e % n];
+__global__ void bound_rows_perm(const int8_t *__restrict__ A, const int *__restrict__ ord, int n, int8_t *__restrict__ PA, int L = 1) {
+    const size_t nn = (size_t)n * n;
+    for (size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; e < L * nn; e += (size_t)gridDim.x * blockDim.x) {
+        const size_t f = e % nn; PA[e] = A[e - f + (size_t)ord[f / n] * n + f % n];
+    }
 }
 
-struct Garner { int P; uint32_t q[7]; uint32_t inv[7][7]; unsigned long long pre_lo[8], pre_hi[8]; };   // pre = prod_{t<k} q_t
+constexpr int BOUND_PMAX = 16;   // 16-bit primes: |B_ij| up to ~255 bits (L-byte entries add 8 (L - 1) bits to int8's ~110)
+struct Garner { int P; uint32_t q[BOUND_PMAX]; uint32_t inv[BOUND_PMAX][BOUND_PMAX]; };
 
-// the primes below 65280 whose product exceeds 2^(bb + 1), with Garner's constants; 0 when 7 (~112 bits) are not enough
+// the primes below 65280 whose product exceeds 2^(bb + 1), with Garner's constants; 0 when BOUND_PMAX are not enough
 inline int garner_for(double bb, Garner &g) {
-    int P = 0; double pb = 0; g = Garner{}; g.pre_lo[0] = 1;
-    for (uint32_t q = 65279; pb < bb + 1 && P < 7; q--) {
+    int P = 0; double pb = 0; g = Garner{};
+    for (uint32_t q = 65279; pb < bb + 1 && P < BOUND_PMAX; q--) {
         bool pr = true; for (uint32_t t = 2; t * t <= q && pr; t++) pr = q % t;
         if (pr) { g.q[P++] = q; pb += log2((double)q); }
     }
     if (pb < bb + 1) return 0;
     g.P = P;
-    for (int k = 0; k < P; k++) {
-        unsigned __int128 pre = (unsigned __int128)g.pre_hi[k] << 64 | g.pre_lo[k], nx = pre * g.q[k];
-        g.pre_lo[k + 1] = (unsigned long long)nx; g.pre_hi[k + 1] = (unsigned long long)(nx >> 64);
-        for (int u = 0; u < k; u++) {   // q_u^-1 mod q_k
+    for (int k = 0; k < P; k++) {        for (int u = 0; u < k; u++) {   // q_u^-1 mod q_k
             uint64_t r = 1, a = g.q[u] % g.q[k], e = g.q[k] - 2;
             for (; e; e >>= 1, a = a * a % g.q[k]) if (e & 1) r = r * a % g.q[k];
             g.inv[u][k] = (uint32_t)r;
@@ -92,20 +96,23 @@ __global__ void bound_x_panel(const float *__restrict__ LU, const float *__restr
 
 // one block per row i: B_ij from its residues (Garner, 128-bit, symmetric), sum_j B_ij^2 rounded up into sq[i]
 __global__ void __launch_bounds__(256) bound_rows(const uint16_t *__restrict__ R, size_t zr, int n, Garner g, double *sq) {
+    // B_ij by Garner as mixed-radix digits y_k. Symmetric: negative iff the digits exceed those of (M - 1) / 2, which are
+    // (q_k - 1) / 2; then |B_ij| = (M - 1 - x) + 1, whose digits are q_k - 1 - y_k. |B_ij| rounded up by Horner in double
+    // with upward rounding: no wide integers, any number of primes.
     const int i = blockIdx.x;
-    const unsigned __int128 M = (unsigned __int128)g.pre_hi[g.P] << 64 | g.pre_lo[g.P];
     double acc = 0;
     for (int j = threadIdx.x; j < n; j += 256) {
-        uint32_t v[7]; unsigned __int128 x = 0;
+        uint32_t v[BOUND_PMAX];
         for (int k = 0; k < g.P; k++) {
             uint32_t qk = g.q[k], t = (uint32_t)R[k * zr + (size_t)i * n + j];
             for (int u = 0; u < k; u++) t = (uint32_t)((uint64_t)(t + qk - v[u] % qk) % qk * g.inv[u][k] % qk);
             v[k] = t;
-            x += (unsigned __int128)t * ((unsigned __int128)g.pre_hi[k] << 64 | g.pre_lo[k]);
         }
-        if (x > M / 2) x = M - x;   // |B_ij|
-        double d = __dadd_ru(__dmul_ru(__ull2double_ru((unsigned long long)(x >> 64)), 18446744073709551616.0),
-                             __ull2double_ru((unsigned long long)x));
+        bool neg = false;
+        for (int k = g.P - 1; k >= 0; k--) { const uint32_t h = (g.q[k] - 1) / 2; if (v[k] != h) { neg = v[k] > h; break; } }
+        double d = 0;
+        for (int k = g.P - 1; k >= 0; k--) d = __dadd_ru(__dmul_ru(d, (double)g.q[k]), (double)(neg ? g.q[k] - 1 - v[k] : v[k]));
+        if (neg) d = __dadd_ru(d, 1.0);
         acc = __dadd_ru(acc, __dmul_ru(d, d));
     }
     __shared__ double red[256];
@@ -225,7 +232,9 @@ inline double det_log2_bound_panels(int n, const int8_t *dA, int s, int *primes)
 // (the caller then keeps Hadamard). *bits_B: the exact size of B's entries, *primes: how many primes that took.
 // dA: A on the device. Every launch goes to this host thread's default stream (build with --default-stream per-thread),
 // so the bound can run on its own thread while the lifting runs on another.
-inline double det_log2_bound(int n, const int8_t *dA, int s = 20, int *primes = nullptr) {
+// L > 1: entries of L byte planes (n <= 16384)
+inline double det_log2_bound(int n, const int8_t *dA, int s = 20, int *primes = nullptr, int L = 1) {
+    if (L > 1 && n > 16384) return INFINITY;
     if (n > 16384 || getenv("OZ_PANEL") || getenv("OZ_KCAP")) return det_log2_bound_panels(n, dA, s, primes);   // in place with K = n below
     const bool prof = getenv("OZ_PROF"); auto T = std::chrono::steady_clock::now();
     auto lap = [&](const char *what) {
@@ -239,7 +248,7 @@ inline double det_log2_bound(int n, const int8_t *dA, int s = 20, int *primes = 
     float *dLU, *dLi, *dUi, *dwork; int *dpiv, *dinfo, lw = 0;
     cudaMalloc(&dLU, nn * 4); cudaMalloc(&dLi, nn * 4); cudaMalloc(&dUi, nn * 4);
     cudaMalloc(&dpiv, n * 4); cudaMalloc(&dinfo, 4);
-    bound_prep<<<2048, 256>>>(dA, n, dLU, dLi, dUi);
+    bound_prep<<<2048, 256>>>(dA, n, dLU, dLi, dUi, L);
     cusolverDnSgetrf_bufferSize(sh, n, n, dLU, n, &lw); cudaMalloc(&dwork, (size_t)lw * 4);
     lap("setup");
     cusolverDnSgetrf(sh, n, n, dLU, n, dwork, dpiv, dinfo);
@@ -261,7 +270,7 @@ inline double det_log2_bound(int n, const int8_t *dA, int s = 20, int *primes = 
         cudaMemcpy(du.data(), ddu, n * 8, cudaMemcpyDeviceToHost); cudaFree(ddu);
         double mr = 0, mc = 0; for (int i = 0; i < n; i++) { mr = std::max(mr, rl[i]); mc = std::max(mc, cu[i]); }
         lap("l1+diag");
-        const double bb = log2(mr) + log2(127.0) + log2(mc) + 2;   // |B_ij| < 2^bb, and the sign
+        const double bb = log2(mr) + log2(127.0 * ((pow(256.0, L) - 1) / 255)) + log2(mc) + 2;   // |B_ij| < 2^bb, and the sign
         // PA: LAPACK's ipiv is a sequence of row swaps (1-based)
         std::vector<int> piv(n), ord(n); cudaMemcpy(piv.data(), dpiv, n * 4, cudaMemcpyDeviceToHost);
         for (int i = 0; i < n; i++) ord[i] = i;
@@ -269,15 +278,15 @@ inline double det_log2_bound(int n, const int8_t *dA, int s = 20, int *primes = 
         Garner g{}; const int P = garner_for(bb, g);
         if (P) {
             lap("PA host");
-            int8_t *dPA; int *dord; cudaMalloc(&dPA, nn); cudaMalloc(&dord, n * 4);
+            int8_t *dPA; int *dord; cudaMalloc(&dPA, L * nn); cudaMalloc(&dord, n * 4);
             cudaMemcpy(dord, ord.data(), n * 4, cudaMemcpyHostToDevice);
-            bound_rows_perm<<<2048, 256>>>(dA, dord, n, dPA); cudaFree(dord);
+            bound_rows_perm<<<2048, 256>>>(dA, dord, n, dPA, L); cudaFree(dord);
             // one prime at a time (n = 16384 fits in 12 GB): B mod q kept as 16-bit residues
             uint16_t *Bres; cudaMalloc(&Bres, nn * 2 * P);
             DetWork w; w.alloc(n, 1);
             for (int k = 0; k < P; k++) {
                 cudaMemcpy(w.P, &g.q[k], 4, cudaMemcpyHostToDevice);
-                det_init<<<dim3(256, 1), 256>>>(dPA, w.R, n, n, w.P);
+                det_init<<<dim3(256, 1), 256>>>(dPA, w.R, n, n, w.P, L);
                 mod_xw<false, long long, int32_t>(w, XL, 0, n, w.R, w.zr(), n, n, n, n, 0, 0);   // T = X_L PA
                 mod_xw<false, int32_t, long long>(w, w.R, w.zr(), n, XU, 0, n, n, n, n, 0, 0);   // B = T X_U
                 to_u16<<<2048, 256>>>(w.R, n, 0, n, Bres + k * nn);

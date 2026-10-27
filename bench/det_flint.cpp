@@ -58,3 +58,17 @@ double flint_solve(int n, const int8_t *A, const int32_t *b, int threads, const 
     fmpz_mat_clear(X); fmpz_mat_clear(Y); fmpz_mat_clear(B);
     return s;
 }
+
+// rational reconstruction num/den = X mod Q, |num| < 2^(nb-1), 0 < den < 2^(db-1) (2^(nb+db-1) <= Q), by FLINT's
+// _fmpq_reconstruct_fmpz_2 (half-gcd for large inputs; det.cu's Euclid is quadratic); false if none
+#include <flint/fmpq.h>
+bool flint_ratrec(mpz_t num, mpz_t den, const mpz_t X, const mpz_t Q, long nb, long db) {
+    fmpz_t a, m, N, D, nu, de; fmpz_init(a); fmpz_init(m); fmpz_init(N); fmpz_init(D); fmpz_init(nu); fmpz_init(de);
+    fmpz_set_mpz(m, Q); fmpz_set_mpz(a, X); fmpz_mod(a, a, m);
+    fmpz_one(N); fmpz_mul_2exp(N, N, nb - 1); fmpz_sub_ui(N, N, 1);
+    fmpz_one(D); fmpz_mul_2exp(D, D, db - 1); fmpz_sub_ui(D, D, 1);
+    const bool ok = _fmpq_reconstruct_fmpz_2(nu, de, a, m, N, D);
+    if (ok) { fmpz_get_mpz(num, nu); fmpz_get_mpz(den, de); }
+    fmpz_clear(a); fmpz_clear(m); fmpz_clear(N); fmpz_clear(D); fmpz_clear(nu); fmpz_clear(de);
+    return ok;
+}
