@@ -452,8 +452,8 @@ Checked: bit-exact against FLINT `fmpz_mat_det` in every row; a zero leading min
 (det = 0, FLINT 0) through the same path; the bounded-residue check never fired.
 
 🚫 **Moduli below 256 for X do not work** (measured): the LU without pivoting fails modulo p with probability ~1 − e^{−n/p}
-(n = 1024, p = 251: ~2 % success), and preconditioning cannot help (its randomness lives in F_p). Only the q (which need no
-A⁻¹) could be 8-bit: ~20 % of the residue chain, not done.
+(n = 1024, p = 251: ~2 % success), and preconditioning cannot help (its randomness lives in F_p). Everything else of the residue chain can be
+8-bit, and now is (next section).
 
 **SQ** — Ngritja e rendit të lartë (Storjohann 2005) te bërthamat tensor: mbetja ngrihet në katror, saktësia dyfishohet për
 nivel; zinxhiri i mbetjeve në RNS (2(s+w) GEMM modulare për nivel, matricat të transpozuara), zinxhiri i vektorit si GEMM INT8
@@ -531,11 +531,11 @@ GPU s: A⁻¹ + lifting + reconstruction + all numerators (the determinant's det
 ~78 000 bits the 16-bit primes give, it is reported as not computed — the solution does not depend on it). SPEX ran in the
 night after the GPU pass (CPU alone), limit 2 h each.
 
-What the table says: on **6 of 13 real systems FP64 has not one correct digit** — LAPACK and SuperLU alike, with the right
-order of magnitude only by accident (mhd3200a / mhd4800a: normwise error 10⁸, 90 % of the entries without a correct digit) —
+What the table says: on **7 of 13 real systems FP64 has not one correct digit** — LAPACK and SuperLU alike, with the right
+order of magnitude only by accident (mhd3200a / mhd4800a: normwise error 10⁸, 82–99 % of the entries without a correct digit) —
 while NIST's condition estimate (itself FP64) does not tell which ones (qh1484 at 5.6·10¹⁷ keeps 11 digits). The exact
 solution, certified, takes 0.2–34 s on the laptop; SPEX gives the same x bit for bit where it finishes, 23× to ~900× slower.
 
 **SQ** — 13 matricat reale më të këqija të NIST Matrix Market (n 989–5005, κ deri 3·10⁴⁷): zgjidhja e SAKTË, e certifikuar,
 për 0,2–34 s te laptopi; SPEX (vegla e dedikuar për zgjidhje të sakta të rralla) jep të njëjtën x bit për bit, 23–900× më ngadalë.
-Te 6 nga 13 sisteme FP64 (LAPACK dhe SuperLU) s'ka asnjë shifër të saktë.
+Te 7 nga 13 sisteme FP64 (LAPACK dhe SuperLU) s'ka asnjë shifër të saktë.
