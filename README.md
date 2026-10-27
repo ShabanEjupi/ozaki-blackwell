@@ -724,3 +724,25 @@ tokenë publikë) llogaritet saktë në formatin e vet NVFP4: një bllok 16 = nj
 rrumbullakim. 0 gabime (edhe te kontrolli i pavarur); motori FP32 gabon 18–49 %, kryesisht te shkallët globale. Decode i
 saktë: 405–487 GB/s. I gjithë modeli NVFP4 (352 GB) hyn në diskun e laptopit; një token lexon 51,2 GB → ~3,5 s/token, saktë.
 
+
+#### The Ultra router (`llm/router_nv.cu`)
+
+The gate of Nemotron 3 Ultra is FP32 (512 × 8192; sigmoid + `e_score_correction_bias`, top-22). An FP32 weight is exactly
+the sum of three BF16 numbers (checked for all 4 194 304), so x·Wᵀ = [x x x]·[W₁ W₂ W₃]ᵀ is **one** correctly rounded
+BF16 × BF16 product with K = 24 576 on the existing machinery (`llm/exact.cuh`): 2 097 152 logits in 91 ms, all certified.
+Student-t hidden states through the layer's real RMSNorm weight, 4096 tokens, layers 49 and 99, seeds 1 and 2:
+
+| | |
+|---|---|
+| FP32 FMA logits not correctly rounded (split-K 1 / 2 / 4 / 8) | 96.8 / 95.4 / 93.3 / 90.4 % |
+| token-layer decisions routed to another expert set (FP32 split-K 1 vs exact) | 1 of 16 384 |
+| the same, split-K 1 vs 4 | 1 of 16 384 |
+| gap between the 22nd and 23rd score, median / 1st percentile | 0.0017–0.0024 / 1.9–3.1·10⁻⁵ (ties occur: smallest 0) |
+
+Almost every logit is rounded differently, yet routing moves for about 1 decision in 16 000 — over 48 MoE layers, roughly
+one token in 340 goes through at least one different expert. The FP32 gate keeps Ultra about as stable as K3 (1 in 13 000
+per layer with a BF16 gate); exact ties are broken by index here, and an engine's top-k may break them otherwise.
+
+**SQ** — Ruteri i Ultra-s: porta FP32 ndahet saktë në 3 BF16 dhe logit-et dalin të rrumbullakosura saktë në 91 ms. Logit-et
+FP32 të zakonshme janë 90–97 % jo të sakta, por rrugëzimi ndryshon vetëm 1 herë në 16 384 vendime (≈ 1 token në 340 në
+gjithë 48 shtresat).

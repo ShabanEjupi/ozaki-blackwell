@@ -443,7 +443,9 @@ native instruction runs at 49--55~TOPS with a plain tiling and the exact path at
 registers, \texttt{m16n8k16} INT8 reaches 116~TOPS and the block-scaled FP4 instruction 465~TOPS, so with both kernels tuned
 to peak a correctly rounded prefill costs $4\times$; in decode both read the same packed bytes. The exact decode reads
 405--500~GB/s of packed weights for one token and 136--184~GB/s for eight; the whole NVFP4 checkpoint (352~GB, from its 113 safetensors headers) fits this laptop's free disk, and a token reads
-51.2~GB of it (37.8 dense, 13.4 of routed experts): $\sim$3.5~s per token with the dense part in RAM, $8\times$ sooner than K3.
+51.2~GB of it (37.8 dense, 13.4 of routed experts): $\sim$3.5~s per token with the dense part in RAM, $8\times$ sooner than K3. Its FP32 router is exactly three BF16
+matrices, so its logits are one correctly rounded product with $K=3\cdot 8192$: FP32 accumulation rounds 90--97\% of them
+differently, yet only 1 of 16\,384 token-layer routing decisions moves (2 layers, 2 seeds, 4096 tokens).
 \fussy
 
 \section{Energy}\label{sec:energy}

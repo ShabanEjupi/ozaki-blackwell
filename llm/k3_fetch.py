@@ -22,6 +22,8 @@ os.makedirs(out, exist_ok=True)
 n = struct.unpack("<Q", get(url, 0, 8))[0]
 hdr = json.loads(get(url, 8, 8 + n))
 meta, total = {}, 0
+mp = os.path.join(out, "meta.json")
+if os.path.exists(mp): meta = json.load(open(mp))   # a second fetch into the same folder adds to it
 for name, t in sorted(hdr.items(), key=lambda kv: kv[1]["data_offsets"][0] if kv[0] != "__metadata__" else -1):
     if name == "__metadata__" or not pat.search(name):
         continue
@@ -33,5 +35,5 @@ for name, t in sorted(hdr.items(), key=lambda kv: kv[1]["data_offsets"][0] if kv
         os.replace(path + ".part", path)
     meta[name] = {"dtype": t["dtype"], "shape": t["shape"]}
     total += b - a
-json.dump(meta, open(os.path.join(out, "meta.json"), "w"), indent=1)
-print("%d tensors, %.1f MB -> %s" % (len(meta), total / 1e6, out))
+json.dump(meta, open(mp, "w"), indent=1)
+print("%d tensors in the folder, %.1f MB fetched -> %s" % (len(meta), total / 1e6, out))
