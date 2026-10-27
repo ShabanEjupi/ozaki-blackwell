@@ -161,7 +161,11 @@ __global__ void __launch_bounds__(256) nv_exact(const int8_t *__restrict__ qw, c
 #pragma unroll
             for (int i = 0; i < 4; i++) {
                 int x = i & 1 ? x1 : x0, w = i < 2 ? w0 : w1;
+#ifdef NO_EPI
+                acc[s][i] += d[i] + (w ^ x);                   // timing probe only: what the loads + MMAs cost alone
+#else
                 acc[s][i] += (long long)((w & 255) * (x & 255) * d[i]) << ((w >> 8) + (x >> 8) - 64 + 18);
+#endif
             }
         }
     }
@@ -172,6 +176,80 @@ __global__ void __launch_bounds__(256) nv_exact(const int8_t *__restrict__ qw, c
             int row = m0 + g + (i < 2 ? 0 : 8), col = n0 + s * 8 + t4 * 2 + (i & 1);
             Y[(size_t)col * M + row] = round_i128((__int128)acc[s][i] * Gm, Gx - 20);
         }
+}
+// The same product with shared-memory tiles (the version above is bound by its global loads, not by the int64 epilogue:
+// without the epilogue it runs at the same speed). Block 128 rows x 64 tokens, 4 NVFP4 blocks (k = 64) per stage, cp.async
+// double buffering; warps 4 (rows) x 2 (tokens), each 32 x 32 = 2 x 4 MMAs per block of 16. Rows padded to 80 bytes so
+// that the 8 rows a fragment load touches fall in different banks (80 B, also 16-byte aligned for cp.async).
+constexpr int TBM = 128, TBN = 64, TBK = 64, TLD = TBK + 16;   // 80 B: 16-byte aligned for cp.async, 8 rows in 8 bank groups
+__device__ inline void cp16(void *s, const void *g) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"((uint32_t)__cvta_generic_to_shared(s)), "l"(g));
+}
+__global__ void __launch_bounds__(256) nv_exact2(const int8_t *__restrict__ qw, const uint8_t *__restrict__ swT,
+                                                 const int8_t *__restrict__ qa, const uint8_t *__restrict__ saT,
+                                                 long long Gm, int Gx, float *Y, int M, int N, int K, int ldsa) {
+    __shared__ __align__(16) int8_t As[2][TBM * TLD], Bs[2][TBN * TLD];
+    __shared__ __align__(16) uint8_t Ws[2][4][TBM], Xs[2][4][TBN];
+    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3, wm = warp & 3, wn = warp >> 2;
+    int m0 = blockIdx.x * TBM, n0 = blockIdx.y * TBN, B = K / 16, stages = K / TBK;
+    auto load = [&](int st, int buf) {
+        int k0 = st * TBK;
+        for (int c = tid; c < TBM * 4; c += 256) { int r = c >> 2, q = c & 3; cp16(&As[buf][r * TLD + q * 16], qw + (size_t)(m0 + r) * K + k0 + q * 16); }
+        { int r = tid >> 2, q = tid & 3; cp16(&Bs[buf][r * TLD + q * 16], qa + (size_t)(n0 + r) * K + k0 + q * 16); }
+        if (tid < 32) { int kb = tid >> 3, q = tid & 7; cp16(&Ws[buf][kb][q * 16], swT + (size_t)(st * 4 + kb) * M + m0 + q * 16); }
+        else if (tid < 48) { int kb = (tid - 32) >> 2, q = tid & 3; cp16(&Xs[buf][kb][q * 16], saT + (size_t)(st * 4 + kb) * ldsa + n0 + q * 16); }
+        asm volatile("cp.async.commit_group;\n");
+    };
+    long long acc[2][4][4] = {};
+    load(0, 0);
+    for (int st = 0; st < stages; st++) {
+        int buf = st & 1;
+        if (st + 1 < stages) { load(st + 1, buf ^ 1); asm volatile("cp.async.wait_group 1;\n"); }
+        else asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();
+#pragma unroll
+        for (int kb = 0; kb < 4; kb++) {
+            uint32_t a[2][2], bf[4]; int w[2][2], x[4][2];
+#pragma unroll
+            for (int mi = 0; mi < 2; mi++) {
+                int r = wm * 32 + mi * 16 + g;
+                a[mi][0] = *(const uint32_t *)&As[buf][r * TLD + kb * 16 + t4 * 4];
+                a[mi][1] = *(const uint32_t *)&As[buf][(r + 8) * TLD + kb * 16 + t4 * 4];
+                w[mi][0] = e4m3_sig_eps(Ws[buf][kb][r]); w[mi][1] = e4m3_sig_eps(Ws[buf][kb][r + 8]);
+            }
+#pragma unroll
+            for (int ni = 0; ni < 4; ni++) {
+                int c = wn * 32 + ni * 8;
+                bf[ni] = *(const uint32_t *)&Bs[buf][(c + g) * TLD + kb * 16 + t4 * 4];
+                x[ni][0] = e4m3_sig_eps(Xs[buf][kb][c + t4 * 2]); x[ni][1] = e4m3_sig_eps(Xs[buf][kb][c + t4 * 2 + 1]);
+            }
+#pragma unroll
+            for (int mi = 0; mi < 2; mi++)
+#pragma unroll
+                for (int ni = 0; ni < 4; ni++) {
+                    int d[4]; mma16816(d, a[mi][0], a[mi][1], bf[ni]);
+#pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        int ww = w[mi][i >> 1], xx = x[ni][i & 1];
+#ifdef NO_EPI
+                        acc[mi][ni][i] += d[i] + (ww ^ xx);
+#else
+                        acc[mi][ni][i] += (long long)((ww & 255) * (xx & 255) * d[i]) << ((ww >> 8) + (xx >> 8) - 64 + 18);
+#endif
+                    }
+                }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int mi = 0; mi < 2; mi++)
+#pragma unroll
+        for (int ni = 0; ni < 4; ni++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int row = m0 + wm * 32 + mi * 16 + g + (i < 2 ? 0 : 8), col = n0 + wn * 32 + ni * 8 + t4 * 2 + (i & 1);
+                if (row < M && col < N) Y[(size_t)col * M + row] = round_i128((__int128)acc[mi][ni][i] * Gm, Gx - 20);
+            }
 }
 // the same exact sum, one thread per output, plain integer loops: a second, independent route on the GPU
 __global__ void nv_exact_ref(const int8_t *qw, const uint8_t *sw, const int8_t *qa, const uint8_t *sa, long long Gm, int Gx,
@@ -363,6 +441,7 @@ static float *project(const std::string &dir, const std::string &pre, int M, int
     int B = K / 16;
     auto pk = load(dir + "/" + pre + ".weight.bin", (size_t)M * K / 2), sw = load(dir + "/" + pre + ".weight_scale.bin", (size_t)M * B);
     float gW = loadf(dir + "/" + pre + ".weight_scale_2.bin"), gA = loadf(dir + "/" + pre + ".input_scale.bin");
+    for (uint8_t s : sw) if ((s & 0x7F) == 0x7F || (s & 0x80)) { fprintf(stderr, "%s: scale byte 0x%02X is NaN or negative in E4M3 -- refused\n", pre.c_str(), s); exit(1); }
     uint8_t *dpk, *dsw, *dsa; int8_t *dqw, *dqa; float *Y, *Yr, *Y1, *Y4, *Yx, *Ys;
     size_t MN = (size_t)M * N;
     CK(cudaMalloc(&dpk, pk.size())); CK(cudaMalloc(&dsw, sw.size())); CK(cudaMalloc(&dqw, (size_t)M * K));
@@ -378,7 +457,7 @@ static float *project(const std::string &dir, const std::string &pre, int M, int
     int xW, xA; float fW = frexpf(gW, &xW), fA = frexpf(gA, &xA);          // gW gA = (mW mA) 2^(xW + xA - 48)
     long long Gm = (long long)ldexpf(fW, 24) * (long long)ldexpf(fA, 24); int Gx = xW + xA - 48;
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
-    auto tc = [&] { nv_exact<<<dim3((M + 127) / 128, N / 32), 256>>>(dqw, dswT, dqa, dsaT, Gm, Gx, Y, M, N, K, N); };
+    auto tc = [&] { nv_exact2<<<dim3(M / TBM, (N + TBN - 1) / TBN), 256>>>(dqw, dswT, dqa, dsaT, Gm, Gx, Y, M, N, K, N); };
     tc(); CK(cudaDeviceSynchronize());
     cudaEventRecord(e0); for (int r = 0; r < 10; r++) tc(); cudaEventRecord(e1); CK(cudaEventSynchronize(e1));
     float ms; cudaEventElapsedTime(&ms, e0, e1); ms /= 10;
@@ -387,7 +466,9 @@ static float *project(const std::string &dir, const std::string &pre, int M, int
     nv_fp32<<<(MN + 255) / 256, 256>>>(dqw, dsw, dqa, dsa, alpha, Y1, M, N, K, 1);
     nv_fp32<<<(MN + 255) / 256, 256>>>(dqw, dsw, dqa, dsa, alpha, Y4, M, N, K, 4);
     nv_fp32<<<(MN + 255) / 256, 256>>>(dqw, dsw, dqa, dsa, alpha, Yx, M, N, K, 1, Gm, Gx);
-    nv_exact<<<dim3((M + 127) / 128, 1), 256>>>(dqw, dswT, dqa, dsaT, Gm, Gx, Ys, M, 32, K, N);   // the first 32 tokens alone
+    nv_exact2<<<dim3(M / TBM, 1), 256>>>(dqw, dswT, dqa, dsaT, Gm, Gx, Ys, M, 32, K, N);   // the first 32 tokens alone
+    float *Yv1; CK(cudaMalloc(&Yv1, MN * 4));   // the untiled kernel: a third exact route
+    nv_exact<<<dim3((M + 127) / 128, N / 32), 256>>>(dqw, dswT, dqa, dsaT, Gm, Gx, Yv1, M, N, K, N);
     CK(cudaDeviceSynchronize());
     std::vector<float> hY(MN), hR(MN), h1(MN), h4(MN), hx(MN), hs((size_t)M * 32);
     CK(cudaMemcpy(hY.data(), Y, MN * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(hR.data(), Yr, MN * 4, cudaMemcpyDeviceToHost));
@@ -400,8 +481,10 @@ static float *project(const std::string &dir, const std::string &pre, int M, int
         d4 += memcmp(&hY[o], &h4[o], 4) != 0; d14 += memcmp(&h1[o], &h4[o], 4) != 0; dx += memcmp(&hY[o], &hx[o], 4) != 0; nz += hY[o] != 0.f;
     }
     for (size_t o = 0; o < hs.size(); o++) dbatch += memcmp(&hs[o], &hY[o], 4) != 0;
+    { std::vector<float> hv(MN); CK(cudaMemcpy(hv.data(), Yv1, MN * 4, cudaMemcpyDeviceToHost)); CK(cudaFree(Yv1));
+      for (size_t o = 0; o < MN; o++) dref += memcmp(&hY[o], &hv[o], 4) != 0; }
     printf("%s  M %d K %d N %d  gW %.6e gA %.6e  outputs %zu (nonzero %zu)\n", pre.c_str(), M, K, N, gW, gA, MN, nz);
-    printf("  exact (INT8 MMA m16n8k16 + int64) %.3f ms = %.1f TOPS | integer loops: %zu differ | 32 tokens alone vs batch %d: %zu differ\n",
+    printf("  exact (INT8 MMA m16n8k16 + int64) %.3f ms = %.1f TOPS | untiled kernel + integer loops: %zu differ | 32 tokens alone vs batch %d: %zu differ\n",
            ms, 2.0 * MN * K / ms / 1e9, dref, N, dbatch);
     printf("  FP32 accumulation of the block terms: split 1 not correctly rounded %zu (%.2f %%), split 4 %zu (%.2f %%), "
            "split 1 vs 4 differ %zu (%.2f %%); FP32 sum with an exact epilogue: %zu (%.2f %%)\n", d1, 100.0 * d1 / MN, d4, 100.0 * d4 / MN, d14, 100.0 * d14 / MN, dx, 100.0 * dx / MN);

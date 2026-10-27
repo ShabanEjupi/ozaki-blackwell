@@ -694,10 +694,10 @@ One routed expert end to end, real weights (expert 0 of MoE layers 49 and 99; 40
 | native, split-K 1 vs 4 differ | 0 % | 0.81 % | 0 % | 0.28 % |
 | native speed (the same plain tiling as the exact kernel) | 49.5 TOPS | 55.0 | 50.3 | 54.8 |
 | CPU (numpy BLAS + Python integers, `nv_cpu.py`), every output vs the GPU tensor cores | 0 of 20 971 520 differ | 0 of 8 388 608 | | |
-| energy, 10 s each at ~94 W (`llm/energy_nv.sh`): exact / native, GOP per joule | 155 / 435 | 156 / 477 | | |
+| energy, 10 s each at ~94 W (`llm/energy_nv.sh`): exact / native, GOP per joule | 194 / 447 | 204 / 473 | | |
 | the same FP32 sum with an exact epilogue (summation alone) | 0 % | 0.88 % | 0 % | 0.35 % |
 | split-K 1 vs 4 differ | 0 % | 0.30 % | 0 % | 0.12 % |
-| exact prefill (INT8 MMA + int64 epilogue) | 16.1 TOPS | 17.5 | 16.5 | 17.4 |
+| exact prefill (INT8 MMA + int64 epilogue, shared-memory tiles) | 20.5 TOPS | 23.2 | 20.5 | 23.2 |
 | **exact decode**, 1 token / 8 tokens (packed nibbles, dp4a + int64), GB/s of weights | **471 / 138** | 405 / 184 | 450 / 136 | 487 / 181 |
 | FP32 GEMV (our plain engine-style kernel), 1 / 8 tokens, GB/s; outputs that differ from exact | 144 / 45; 18 % | 131 / 42; 36 % | 144 / 45; 29 % | 131 / 42; 49 % |
 
@@ -705,8 +705,10 @@ So for this model most of the "engine" error is not the order of summation but t
 multiplied in FP32 (alpha rounded, then the product rounded again). Decode, the step that matters when a model streams,
 runs exactly at L2/memory speed (one expert is 5.9 MB and stays in L2 across the timed repeats). Prefill is epilogue bound
 (16 int64 shift-adds per MMA): a __constant__ scale table indexed differently by each lane is serialized and gave
-10–12.6 TOPS; scales stored transposed and decoded with bit operations give 16–17.5. Shared-memory tiles are next. With the same plain tiling the native FP4 MMA runs 50–55 TOPS: exactness costs ~3× in
-prefill and nothing in decode. The native instruction rounds 18–49 % of the outputs wrongly and changes up to 0.81 % with
+10–12.6 TOPS; scales stored transposed and decoded with bit operations give 16–17.5; shared-memory tiles (cp.async, 128 x 64
+per block, warps 32 x 32) give 20.5–23.2. Without the int64 epilogue the tiled kernel runs 25.6 TOPS: exactness itself costs
+~20 %, the rest is that an NVFP4 block needs a k = 16 INT8 MMA, four instructions where the FP4 unit issues one k = 64.
+The native FP4 MMA with a plain tiling runs 49–55 TOPS: exactness costs ~2.3× in prefill (energy 2.2–2.3×) and nothing in decode. The native instruction rounds 18–49 % of the outputs wrongly and changes up to 0.81 % with
 the split, exactly like the emulation above: the error is the format’s FP32 epilogue and accumulation, not a kernel bug. Layer 1 is
 different: its experts are 99.5 % (near) zero in the BF16 checkpoint as well (median |w| 6.6·10⁻¹⁰), so 92 % of its exact
 outputs are 0.
