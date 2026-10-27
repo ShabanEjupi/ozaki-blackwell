@@ -1,11 +1,11 @@
-# ultra_index.py -- one text index of every tensor in the Nemotron 3 Ultra NVFP4 checkpoint, from the safetensors headers
+# ultra_index.py -- one text index of every tensor in a safetensors checkpoint (Nemotron 3 Ultra, OLMo 2), from the headers
 # read from each shard (8-byte length + JSON): name dtype shape file offset nbytes.
 # python3 -I llm/ultra_index.py /opt/ozaki/nv/full > /opt/ozaki/nv/full/index.txt ; --show prints one layer of each kind
 import json, os, re, sys
 d = sys.argv[1]
 rows = []
 for f in sorted(os.listdir(d)):
-    if not re.fullmatch(r"model-\d{5}-of-00113\.safetensors", f): continue
+    if not f.endswith(".safetensors"): continue
     with open(os.path.join(d, f), "rb") as fh:
         n = int.from_bytes(fh.read(8), "little"); h = json.loads(fh.read(n)); base = 8 + n
     for k, v in h.items():

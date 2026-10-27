@@ -318,6 +318,7 @@ struct Seq {
     std::vector<std::pair<float, float>> top;
 };
 
+#ifndef ULTRA_LIB
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--selftest")) return selftest();
     if (argc < 4) { fprintf(stderr, "usage: out_ultra <model dir> <prompts> <new tokens> [modes]\n"); return 1; }
@@ -517,3 +518,4 @@ int main(int argc, char **argv) {
     printf("uncertified %lld\n", st_bad);
     for (auto &s : seqs) { printf("seq prompt %d mode %d:", s.prompt, s.mode); for (int v : s.toks) printf(" %d", v); printf("\n"); }
 }
+#endif
