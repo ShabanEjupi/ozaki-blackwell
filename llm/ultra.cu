@@ -214,8 +214,13 @@ static float scalar(const std::string &name) {   // constant across steps: read 
 struct Ahead {
     struct Job { std::string name; TI t; size_t off = 0; bool ready = false; };
     uint8_t *buf = nullptr; size_t cap = 0, nread = 0;   // q[0 .. nread) have ring space (oldest first)
+    bool quit = false;
     std::deque<Job> q; std::mutex m; std::condition_variable cv; std::thread th; std::map<std::string, int> fd;
-    void start(size_t c) { cap = c; CK(cudaMallocHost(&buf, cap)); th = std::thread([this] { run(); }); th.detach(); }
+    void start(size_t c) { cap = c; CK(cudaMallocHost(&buf, cap)); th = std::thread([this] { run(); }); }
+    void finish() {   // before exit: a thread still waiting on cv while the statics are destroyed hangs the process
+        if (!buf) return;
+        { std::lock_guard<std::mutex> l(m); quit = true; } cv.notify_all(); th.join();
+    }
     void push(const std::string &name) {   // the TI is copied here: idx is only touched by the driver's thread
         if (!buf) return;
         std::lock_guard<std::mutex> l(m); Job j; j.name = name; j.t = idx.at(name); q.push_back(j); cv.notify_all();
@@ -230,7 +235,8 @@ struct Ahead {
     void run() {
         std::unique_lock<std::mutex> l(m);
         for (size_t off = 0;;) {
-            cv.wait(l, [&] { return nread < q.size() && fits(q[nread].t.n, off); });
+            cv.wait(l, [&] { return quit || (nread < q.size() && fits(q[nread].t.n, off)); });
+            if (quit) return;
             Job &j = q[nread]; j.off = off; nread++; TI t = j.t;   // deque references survive push_back and the other pops
             l.unlock();
             if (!fd.count(t.file)) fd[t.file] = open((DIR + "/" + t.file).c_str(), O_RDONLY);
@@ -620,6 +626,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "step %zu: %.1f s (disk %.1f s, %.1f GB, %.2f GB/s), uncertified so far %lld\n", t, sec, t_disk - d0,
                 (bytes_disk - b0) / 1e9, (bytes_disk - b0) / 1e9 / std::max(1e-9, t_disk - d0), st_bad);
     }
+    ahead.finish();
     report(seqs);
 }
 #endif
