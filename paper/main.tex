@@ -30,7 +30,7 @@ $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.855~s at $n=8192$, $499
 and double-double have no correct digit, a triple-double LU on the GPU is $32\times$ faster than the same arithmetic on 24 CPU
 threads and $145\times$ faster than MPFR, and is the most accurate of the three. Counting CPU and GPU power, a double-double
 solve uses $\sim$270$\times$ less energy than the quad-precision CPU solve. Leaving 8-bit moduli for primes below $2^{16}$ and $2^{23}$ split into bytes, an \emph{exact} product of integer matrices with entries of 1\,015 to 131\,063 bits costs work linear in the bits, is bit-exact against GMP, and runs $10$--$19\times$ faster than FLINT's multimodular \texttt{fmpz\_mat\_mul} on 24 CPU threads, with $15$--$18\times$ less energy. Turning the problem around---int8 in, residues out---the exact determinant of an int8 matrix comes $224\times$ sooner than FLINT at $n=4096$ and $355\times$ at $n=8192$ (98\,139 bits), with a proved bound on $|\det A|$ tight to one bit, and $n=16\,384$ (204\,480 bits) takes 66~s, $n=32\,768$ (425\,348 bits) 594~s within the 12~GB of the GPU. For entries of 32 to 256 bits, high-order lifting on the same modular GEMMs (the residue squared in RNS, the solution vector carried through INT8 GEMMs) and a proved bound for byte-plane entries give the determinant $236\times$ sooner than FLINT at $n=2048$ with 64-bit entries, $306\times$ with 128-bit entries and $265\times$ at $n=4096$ (276\,398 bits in 3.3~s against 868~s): the ratio grows with the entry size. The laptop is power-bound ($\sim$95~W) under these
-kernels, which shapes what can and cannot be gained. On 15 of the most ill-conditioned real matrices of NIST Matrix Market ($n\le10\,000$, entries up to 154 bits) the certified exact solution takes 0.2--115~s, up to $\sim$900$\times$ sooner than SPEX; FP64 has no correct digit on 8 of them. The same units give correctly rounded MXFP4 and BF16 products: on the real weights of Kimi K3 (2.78 trillion parameters, the largest open-weights model) every output of 48 expert matrices is certified and identical for any batch, where BF16 tensor cores with FP32 accumulation round 51--83\% of them differently; at decode the exact kernel reads 94~GB/s, $18\times$ the laptop's NVMe, so reproducibility costs nothing when such a model streams from disk. On Nemotron~3 Ultra (560 billion parameters) the GPU's own NVFP4 tensor-core instruction leaves 18--49\% of an expert's outputs not correctly rounded, and the correctly rounded product costs $4\times$ at instruction peak in prefill and nothing in decode: the whole model runs from the laptop's disk with every linear map correctly rounded (1.54 billion outputs certified, 26~s per token), while FP32-accumulating engines round 13\% of its BF16 and 47\% of its router outputs differently and, on two of three prompts, depart from the exact text within 29 tokens.
+kernels, which shapes what can and cannot be gained. On 15 of the most ill-conditioned real matrices of NIST Matrix Market ($n\le10\,000$, entries up to 154 bits) the certified exact solution takes 0.2--115~s, up to $\sim$900$\times$ sooner than SPEX; FP64 has no correct digit on 8 of them. The same units give correctly rounded MXFP4 and BF16 products: on the real weights of Kimi K3 (2.78 trillion parameters, the largest open-weights model) every output of 48 expert matrices is certified and identical for any batch, where BF16 tensor cores with FP32 accumulation round 51--83\% of them differently; at decode the exact kernel reads 94~GB/s, $18\times$ the laptop's NVMe, so reproducibility costs nothing when such a model streams from disk. On Nemotron~3 Ultra (560 billion parameters) the GPU's own NVFP4 tensor-core instruction leaves 18--49\% of an expert's outputs not correctly rounded, and the correctly rounded product costs $4\times$ at instruction peak in prefill and nothing in decode: the whole model runs from the laptop's disk with every linear map correctly rounded (1.54 billion outputs certified, 19.6~s per token, as fast as FP32 accumulation), while FP32-accumulating engines round 42--49\% of its router logits differently and, on two of three prompts, depart from the exact text within 29 tokens.
 \end{abstract}
 
 \noindent\textbf{Përmbledhje (shqip).} Kartelat grafike të laptopëve e ekzekutojnë FP64 me 1/64 e shpejtësisë FP32, ndërsa
@@ -461,13 +461,15 @@ test also caught a bug: squeezing the accumulator to 78 bits widened the interva
 came out uncertified). Everything else (the Mamba-2 recurrence with its FP32 state, the causal convolution, attention
 without positional encoding, sigmoid top-22 routing, RMSNorms, residuals) runs on the host in FP64 and is rounded once to
 the precision the model keeps there, identically for every path. All 560\,B parameters stream from the laptop's NVMe: one
-sequence reads 48~GB per token in 16~s (2.95~GB/s) and takes 26~s, and ``The capital of Kosovo is'' continues
-``\,Pristina''. Three prompts (Albanian, English, $123456789\times 987654321$) then ran as nine sequences, each prompt exact
+sequence reads 48~GB per token and takes 33--37~s, or 19.5--19.7~s when a thread reads the next tensors into a 3~GB pinned
+ring while the GPU works (same digest); the FP32 engine path takes 20.3--20.9~s the same way, so exactness costs nothing at
+decode: both wait on the disk. ``The capital of Kosovo is'' continues ``\,Pristina''. Three prompts (Albanian, English, $123456789\times 987654321$) then ran as nine sequences, each prompt exact
 and on the same host code with FP32-accumulating GEMVs (split-K 1 or 4: two configurations of one engine), 45 steps of
 57--71~s (70--86~GB read): 1.54 billion correctly rounded outputs, none uncertified. On the exact path's own inputs the
-engine rounds 12.6--13.8\% of the BF16 projections and 40.6--47.3\% of the router logits differently, but only 0.003\% of
-the FP8 and NVFP4 ones (41\,914 of 1.42 billion): at BF16 output precision FP32 accumulation of the narrow formats is almost
-always exact, of the wide ones it is not. Downstream, the engine's top logit drifts up to 1.22 from the exact one (0.17--0.31
+engine rounds 40.6--47.3\% of the FP32 router logits differently but only 0.003\% of the FP8 and NVFP4 outputs (41\,914 of
+1.42 billion); a separate count (one sequence, seven steps) gives 0.01\% of the BF16 projections (561 of 4.86 million) and
+73--83\% of the FP32 output logits. What is rounded to BF16 is almost always exact under FP32 accumulation; what stays in
+FP32 is not, and the router's logits set the expert weights. Downstream, the engine's top logit drifts up to 1.22 from the exact one (0.17--0.31
 on average) while the tokens still agree, the exact top-two margin falls to 0.017, and the streams part: the Albanian one at
 the 5th generated token with split-K 4 (an indentation of 8 against 4 spaces) and at the 13th with split-K 1 (``\,ri''
 against ``\,pav''; the exact path goes on ``Kosova është vend i ri i pavarur'', the engine ``Kosova është vend i pavarur që
@@ -484,7 +486,12 @@ the infini-gram index \texttt{v4\_olmo-2-0325-32b-instruct\_llama}). No fully op
 exact GEMV drives both dense models (\texttt{llm/dense.cu}: OLMo~2's post-norm with $q$/$k$ norms; Llama with YaRN, K2's FP32
 checkpoint rounded to BF16 as an engine loads it), and every maximal span of an OLMo~2 output is looked up in its own
 training data with its count and a source document (\texttt{llm/olmo\_trace.py}): ``The capital of Kosovo is Pristina''
-occurs 224 times, one of them a DCLM page from graphicmaps.com.
+occurs 224 times, one of them a DCLM page from graphicmaps.com. On the three prompts (OLMo~2, 39 steps of 30~s, 64~GB each)
+the exact path writes ``The municipalities are divided into 10,908 settlements'' and both engines ``2,994 settlements'';
+neither number occurs before ``settlements'' anywhere in the model's training data, so both are made up, differently. Its
+wrong product ($123456789\times987654321=12345678987654321$ on every path) comes with an explanation stitched from training
+phrases (``This is a special case of a more general phenomenon: the'', 11 words, 22 times). Ultra's English continuation,
+looked up in DCLM (filtered Common Crawl, the public web its data was drawn from), has a 9-word span 11 times.
 \fussy
 
 \section{Energy}\label{sec:energy}

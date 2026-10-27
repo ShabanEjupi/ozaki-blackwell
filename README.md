@@ -62,7 +62,7 @@ Under load the laptop holds ~95 W and the SM clock drops to ~1.8 GHz (2.76 GHz o
 - cry10000 (n = 10 000) solved exactly in 122 s (D 574 553 bits); the SPEX column for the larger systems fills in the night
   runs (`/opt/ozaki/real/batch.log`; `bench/real_table.py [--tex]`).
 - ✅ 27-10: Nemotron 3 Ultra (560 B, open weights; its main pre-training data gated, internal training only) runs whole and
-  exact from disk (`llm/ultra.cu`, below). Next: read-ahead (disk 16 s of the 26 s per token), the NVFP4 prefill tiled
+  exact from disk (`llm/ultra.cu`, below), 19.6 s per token with read-ahead. Next: the NVFP4 prefill tiled
   through shared memory, and the fully open models — OLMo 2 32B traced into its whole training data, K2-Think-V2 (`llm/dense.cu`).
 - The decode kernel reads 94 GB/s of packed weights, below what the GPU memory gives (irrelevant while the weights stream from disk).
 - An 8-bit X for HOL was measured and dropped (below); the proved bound with row scaling and n = 32768 remain as before.
@@ -775,11 +775,16 @@ transformers v5.3.0 `modeling_nemotron_h.py` (production `dt_limit (0, ∞)`, no
   and 2^±60 ranges, heavy cancellation, exact ties): 0 differ, 0 uncertified. Mutants caught: a 40-bit window (3 459
   differ), ties away from zero (188). The tie test caught a real bug first: squeezing to 78 bits widened the interval even
   when no bit was lost, so every exact tie came out uncertified and on the wrong side.
-- One sequence: 48 GB per token in 16 s (2.95 GB/s), **26 s per token**; "The capital of Kosovo is" → **" Pristina"**.
+- One sequence reads 48 GB per token: 33–37 s per token; with read-ahead (`OZ_AHEAD=3`: a thread reads the next tensors,
+  in the order they will be used, into a 3 GB pinned ring) **19.5–19.7 s**, digest unchanged (`5b5a0167bdff8394`); the
+  FP32 engine path with read-ahead 20.3–20.9 s — **exactness costs nothing at decode**, both wait on the disk (measured
+  with the K2 download paused). "The capital of Kosovo is" → **" Pristina"**.
 - Three prompts × {exact, engine split-K 1, engine split-K 4} = nine sequences, 45 steps of 57–71 s (70–86 GB read per
-  step): **1.54 billion correctly rounded outputs, 0 uncertified**. Shadow (the engine GEMV on the exact path's own
-  inputs): BF16 projections 12.6–13.8 % rounded differently, FP32 router 40.6–47.3 %, FP8 and NVFP4 only 0.003 %
-  (41 914 of 1.42 billion) — at BF16 output precision FP32 accumulation of the narrow formats is almost always exact.
+  step, no read-ahead yet): **1.54 billion correctly rounded outputs, 0 uncertified**. Shadow (the engine GEMV on the
+  exact path's own inputs): FP32 router logits 40.6–47.3 % rounded differently, FP8 and NVFP4 only 0.003 % (41 914 of
+  1.42 billion). Counted apart (one sequence, 7 steps; the first count lumped the logits in with BF16): BF16 projections
+  **0.01 %** (561 of 4.86 M), FP32 output logits 73–83 %. What is rounded to BF16 is almost always exact under FP32
+  accumulation; what stays in FP32 (router, logits) is not — and the router's logits set the expert weights.
 - Downstream the engine's top logit drifts up to **1.22** from the exact one (mean 0.17–0.31) while tokens agree; the exact
   top-two margin falls to 0.017. Albanian: exact "Kryeqyteti i Kosovës është Prishtina." then "Kosova është vend i ri i
   pavarur."; split-K 1 parts at the 13th generated token ("Kosova është vend i pavarur që ka deklaruar pavarësinë më 17
@@ -795,13 +800,21 @@ training data (4.6 T tokens) is indexed for public lookup (infini-gram). `llm/de
 `llm/olmo_trace.py` finds every maximal span of an output in that data ("The capital of Kosovo is Pristina": 224 times,
 a DCLM page from graphicmaps.com); `--index v4_dclm-baseline_llama` looks Ultra's text up in the public web it was drawn
 from: in Ultra's exact English continuation the longest span found verbatim is 9 words, "Pristina is the capital and
-largest city of Kosovo." (11 times; one source albbnb.com), with nine shorter ones of 5–6 words. Queued
-(`llm/chain_open.sh`): OLMo 2 exact + traced, then K2-Think-V2 after SPEX pass 3.
+largest city of Kosovo." (11 times; one source albbnb.com), with nine shorter ones of 5–6 words.
+
+OLMo 2 32B, same three prompts (`llm/chain_open.sh`, 39 steps of 30 s, 64 GB each, 0 uncertified): the exact path writes
+"The municipalities are divided into **10,908** settlements", both engines "**2,994** settlements" (parting at the 29th
+generated token); in all 4.6 T training tokens "10,908 settlements" and "2,994 settlements" occur **0** times — both made
+up, differently. Its product is wrong on every path (`12345678987654321`), with an explanation stitched from training
+phrases ("This is a special case of a more general phenomenon: the", 11 words, 22 times). Albanian: same text on all
+paths ("Kryeqyteti i Kosovës është një qyteti në Kosovë. It is the capital and largest city of Kosovo."). Trace:
+`/opt/ozaki/chain/olmo_trace.txt`. Next: K2-Think-V2 after SPEX pass 3.
 
 **SQ** — Nemotron 3 Ultra i tërë (560 miliardë parametra) punon në laptop nga disku, token pas tokeni, me çdo prodhim
 matricë-vektor të rrumbullakosur saktë (një rrumbullakim i certifikuar, i provuar kundër një akumuluesi 2 560-bit; prova e
-barazimeve gjeti dhe ndreqi një defekt). 26 s për token. Te tri prompt-e, motori me akumulim FP32 ndryshon 13 % të daljeve
-BF16 dhe 47 % të logit-ëve të ruterit, logit-i largohet deri në 1,22, dhe teksti ndahet: shqip pas tokenit të 5-të / 13-të,
-anglisht pas të 29-tit. 123456789 × 987654321 = 121932631112635269 — saktë në të tri rrugët. Për qasje të plotë te të
+barazimeve gjeti dhe ndreqi një defekt). 19,6 s për token me lexim përpara — aq sa motori FP32: saktësia s'kushton asgjë.
+Motori me akumulim FP32 ndryshon 42–49 % të logit-ëve të ruterit (projeksionet BF16 vetëm 0,01 %), logit-i largohet deri në
+1,22, dhe teksti ndahet: shqip pas tokenit të 5-të / 13-të, anglisht pas të 29-tit. Te OLMo 2 rruga e saktë shkruan «10,908»
+vendbanime, motori «2,994» — asnjëri s'ndodhet te 4,6T tokenat e trajnimit: të dy të shpikur, ndryshe. 123456789 × 987654321 = 121932631112635269 — saktë në të tri rrugët. Për qasje të plotë te të
 dhënat: OLMo 2 32B (të gjitha të dhënat e trajnimit të kërkueshme), K2-Think-V2 (më i forti plotësisht i hapur); asnjë model
 plotësisht i hapur s'e kalon Ultra-n sot.
