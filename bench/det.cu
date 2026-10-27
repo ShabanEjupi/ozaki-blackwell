@@ -600,6 +600,12 @@ int main(int argc, char **argv) {
         mpz_clear(hq); for (auto &v : x4) mpz_clear(&v);
         dbits = mpz_sizeinbase(D, 2); t_rr = now() - t2;
         if (gFile) { if (!file_solution(n, L, dixfile ? Aorig : A, gY, D, Q, nb, db)) return 1; dbits = mpz_sizeinbase(D, 2); }
+        // OZ_NODET=1: stop at the certified solution. Above n ~ 6000 the det/d batch (Pb n^2 int32 plus its packing, ~28 GB at
+        // n = 9344) overflows the 12 GB; under WSL2 CUDA then spills into Windows memory and Windows stops the whole VM.
+        if (gFile && getenv("OZ_NODET")) {
+            printf("n=%d method %d  det/d skipped (OZ_NODET)  [A^-1 %.3f  lift %zu steps %.3f  ratrec %.3f (d %ld bits)]\n", n, method, t_inv, steps, t_lift, t_rr, dbits);
+            return 0;
+        }
 
         // 4. c = det / d from as many primes as the bound / d needs: |c| < 2^(ub - dbits + 1). ub: the proved bound of
         // src/ozaki_detbound.cuh (a few bits above log2 |det|), or Hadamard (below n = 4096, where cuSOLVER's ~0.3 s setup costs more than the primes it saves; OZ_HADAMARD=1; or FP32 LU finds A singular)
