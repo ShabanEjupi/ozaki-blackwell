@@ -432,10 +432,13 @@ block of 16 is exactly one \texttt{mma.m16n8k16} INT8 ($|p_b|\le 2304$), the pro
 $\le 225$ times $2^{\varepsilon_W+\varepsilon_A}$, and after a shift of 18 every term is below $2^{47}$: the $K/16\le 320$
 terms add in an \texttt{int64} without loss, and the 104-bit product with $g_Wg_A$ is rounded once. On expert~0 of MoE layers
 49 and 99 (real weights, 4096 tokens through the real latent projection, up, relu$^2$, down) the tensor-core path, an
-integer-loop path, 32 tokens alone and an independent check with Python rationals from the raw bytes agree in every bit,
-while FP32 accumulation with $\alpha=\mathrm{fp32}(g_Wg_A)$ leaves 18--49\% of the outputs not correctly rounded; with an
-exact epilogue the FP32 sum alone accounts for 0--0.9\%. The exact decode reads 317--409~GB/s of packed weights for one
-token and 87--121~GB/s for eight; the whole NVFP4 checkpoint ($\sim$320~GB) fits this laptop's free disk.
+integer-loop path, 32 tokens alone, Python rationals from the raw bytes (sampled) and a CPU recomputation of all
+29\,360\,128 outputs of layer 49 (BLAS block sums, Python integers) agree in every bit. The hardware's own NVFP4 instruction,
+\texttt{mma.m16n8k64.kind::mxf4nvf4.block\_scale.scale\_vec::4X} with FP32 accumulation (what inference engines run), leaves
+18--49\% of the outputs not correctly rounded and changes up to 0.81\% of them between split-K 1 and 4; an emulation with
+an exact epilogue shows that the FP32 sum alone accounts for 0--0.9\% and the rest is $\alpha=\mathrm{fp32}(g_Wg_A)$. With the
+same plain tiling the native instruction runs at 50--55~TOPS and the exact path at 16--18~TOPS. The exact decode reads 405--487~GB/s of packed weights for one
+token and 136--184~GB/s for eight; the whole NVFP4 checkpoint ($\sim$320~GB) fits this laptop's free disk.
 \fussy
 
 \section{Energy}\label{sec:energy}

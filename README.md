@@ -689,22 +689,29 @@ One routed expert end to end, real weights (expert 0 of MoE layers 49 and 99; 40
 |---|---:|---:|---:|---:|
 | exact: tensor-core path vs integer loops vs 32 tokens alone | 0 / 0 differ | 0 / 0 | 0 / 0 | 0 / 0 |
 | independent check (`nv_check.py`, Python rationals from the raw bytes), 300 outputs | 0 wrong | 0 wrong | | |
-| FP32 accumulation, alpha = fp32(gW·gA) (what block-scaled FP4 MMA + CUTLASS do): not correctly rounded | 18.5 % | 36.1 % | 30.3 % | 49.0 % |
+| FP32 accumulation, alpha = fp32(gW·gA) (emulated, one block term at a time): not correctly rounded | 18.5 % | 36.1 % | 30.3 % | 49.0 % |
+| **native NVFP4 tensor core** (`mma.m16n8k64 kind::mxf4nvf4.block_scale.scale_vec::4X`, sm_120a, FP32 accumulation — what engines run): not correctly rounded | **18.5 %** | **36.6 %** | **30.3 %** | **49.1 %** |
+| native, split-K 1 vs 4 differ | 0 % | 0.81 % | 0 % | 0.28 % |
+| native speed (the same plain tiling as the exact kernel) | 49.5 TOPS | 55.0 | 50.3 | 54.8 |
+| CPU (numpy BLAS + Python integers, `nv_cpu.py`), every output vs the GPU tensor cores | 0 of 20 971 520 differ | 0 of 8 388 608 | | |
 | the same FP32 sum with an exact epilogue (summation alone) | 0 % | 0.88 % | 0 % | 0.35 % |
 | split-K 1 vs 4 differ | 0 % | 0.30 % | 0 % | 0.12 % |
-| exact prefill (INT8 MMA + int64 epilogue) | 12.4 TOPS | 10.4 | 12.6 | 11.5 |
-| **exact decode**, 1 token / 8 tokens (packed nibbles, dp4a + int64), GB/s of weights | **395 / 121** | 321 / 87 | 409 / 121 | 317 / 90 |
+| exact prefill (INT8 MMA + int64 epilogue) | 16.1 TOPS | 17.5 | 16.5 | 17.4 |
+| **exact decode**, 1 token / 8 tokens (packed nibbles, dp4a + int64), GB/s of weights | **471 / 138** | 405 / 184 | 450 / 136 | 487 / 181 |
 | FP32 GEMV (our plain engine-style kernel), 1 / 8 tokens, GB/s; outputs that differ from exact | 144 / 45; 18 % | 131 / 42; 36 % | 144 / 45; 29 % | 131 / 42; 49 % |
 
 So for this model most of the "engine" error is not the order of summation but the epilogue: the global scales are
 multiplied in FP32 (alpha rounded, then the product rounded again). Decode, the step that matters when a model streams,
 runs exactly at L2/memory speed (one expert is 5.9 MB and stays in L2 across the timed repeats). Prefill is epilogue bound
-(16 int64 shift-adds per MMA, operands read from global memory): staging tiles in shared memory is the next step. Layer 1 is
+(16 int64 shift-adds per MMA): a __constant__ scale table indexed differently by each lane is serialized and gave
+10–12.6 TOPS; scales stored transposed and decoded with bit operations give 16–17.5. Shared-memory tiles are next. With the same plain tiling the native FP4 MMA runs 50–55 TOPS: exactness costs ~3× in
+prefill and nothing in decode. The native instruction rounds 18–49 % of the outputs wrongly and changes up to 0.81 % with
+the split, exactly like the emulation above: the error is the format’s FP32 epilogue and accumulation, not a kernel bug. Layer 1 is
 different: its experts are 99.5 % (near) zero in the BF16 checkpoint as well (median |w| 6.6·10⁻¹⁰), so 92 % of its exact
 outputs are 0.
 
 **SQ** — Modeli më i madh me pesha DHE të dhëna trajnimi të hapura (Nemotron 3 Ultra, 560 miliardë parametra, 14,8T
 tokenë publikë) llogaritet saktë në formatin e vet NVFP4: një bllok 16 = një MMA INT8, shkallët si shift në int64, një
 rrumbullakim. 0 gabime (edhe te kontrolli i pavarur); motori FP32 gabon 18–49 %, kryesisht te shkallët globale. Decode i
-saktë: 317–409 GB/s. I gjithë modeli NVFP4 (~320 GB) hyn në diskun e laptopit.
+saktë: 405–487 GB/s. I gjithë modeli NVFP4 (~320 GB) hyn në diskun e laptopit.
 

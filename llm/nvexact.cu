@@ -15,7 +15,7 @@
 // FP32 accumulator in k order, split-K slices are reduced in order, and the epilogue multiplies by alpha = gW * gA
 // rounded to FP32. Its bits change with the split.
 //
-// nvcc -O3 -arch=sm_120 -std=c++17 -o out_nv llm/nvexact.cu
+// nvcc -O3 -arch=sm_120a -std=c++17 -o out_nv llm/nvexact.cu   (sm_120a: the block-scaled FP4 MMA of the baseline)
 // out_nv <dir> <expert prefix, e.g. backbone.layers.1.mixer.experts.0> <N tokens> [seed] [outdir]
 // One routed expert end to end: X = BF16(h fc1_latent^T), h ~ N(0,1) -> up_proj -> BF16(relu(.)^2) -> down_proj.
 #include <cstdio>
@@ -128,14 +128,19 @@ __device__ __host__ inline float round_i128(__int128 a, int X) {
 // ---- the exact product on tensor cores --------------------------------------------------------------------------------
 // One warp: 16 rows x 32 tokens, one m16n8k16 INT8 MMA per (block of 16, 8 tokens) = the exact block sums p_b, then
 // acc += (c_b p_b) << (epsW + epsA + 18) in int64. Block: 8 warps = 128 rows. Y [N][M] FP32, correctly rounded.
-__constant__ int c_se[256];
 __device__ inline void mma16816(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t b0) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
                  : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(b0), "r"(0), "r"(0), "r"(0), "r"(0));
 }
-__global__ void __launch_bounds__(256) nv_exact(const int8_t *__restrict__ qw, const uint8_t *__restrict__ sw,
-                                                const int8_t *__restrict__ qa, const uint8_t *__restrict__ sa,
-                                                long long Gm, int Gx, float *Y, int M, int N, int K) {
+// Scales are read transposed (swT [B][M], saT [B][N]: one block's scales of neighbouring rows/tokens are neighbours) and
+// decoded with bit operations: a __constant__ table indexed differently by each lane is serialized (v1: 12 TOPS).
+__global__ void transpose_u8(const uint8_t *in, uint8_t *out, int R, int C) {   // in [R][C] -> out [C][R]
+    for (size_t o = blockIdx.x * (size_t)blockDim.x + threadIdx.x; o < (size_t)R * C; o += (size_t)gridDim.x * blockDim.x)
+        out[(o % C) * R + o / C] = in[o];
+}
+__global__ void __launch_bounds__(256) nv_exact(const int8_t *__restrict__ qw, const uint8_t *__restrict__ swT,
+                                                const int8_t *__restrict__ qa, const uint8_t *__restrict__ saT,
+                                                long long Gm, int Gx, float *Y, int M, int N, int K, int ldsa) {
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
     int m0 = (blockIdx.x * 8 + warp) * 16, n0 = blockIdx.y * 32, B = K / 16;
     if (m0 >= M) return;
@@ -143,17 +148,19 @@ __global__ void __launch_bounds__(256) nv_exact(const int8_t *__restrict__ qw, c
     for (int b = 0; b < B; b++) {
         uint32_t a0 = *(const uint32_t *)(qw + (size_t)(m0 + g) * K + b * 16 + t4 * 4);
         uint32_t a1 = *(const uint32_t *)(qw + (size_t)(m0 + g + 8) * K + b * 16 + t4 * 4);
-        int sw0 = c_se[sw[(size_t)(m0 + g) * B + b]], sw1 = c_se[sw[(size_t)(m0 + g + 8) * B + b]];
+        int w0 = e4m3_sig_eps(swT[(size_t)b * M + m0 + g]), w1 = e4m3_sig_eps(swT[(size_t)b * M + m0 + g + 8]);
+        uint32_t b0[4];
+#pragma unroll
+        for (int s = 0; s < 4; s++) b0[s] = *(const uint32_t *)(qa + (size_t)(n0 + s * 8 + g) * K + b * 16 + t4 * 4);
 #pragma unroll
         for (int s = 0; s < 4; s++) {
-            uint32_t b0 = *(const uint32_t *)(qa + (size_t)(n0 + s * 8 + g) * K + b * 16 + t4 * 4);
-            int d[4]; mma16816(d, a0, a1, b0);
+            int d[4]; mma16816(d, a0, a1, b0[s]);
+            uint16_t xx = *(const uint16_t *)(saT + (size_t)b * ldsa + n0 + s * 8 + t4 * 2);   // the thread's two tokens
+            int x0 = e4m3_sig_eps(xx & 255), x1 = e4m3_sig_eps(xx >> 8);
 #pragma unroll
             for (int i = 0; i < 4; i++) {
-                int col = n0 + s * 8 + t4 * 2 + (i & 1);
-                int x = c_se[sa[(size_t)col * B + b]], w = i < 2 ? sw0 : sw1;
-                int c = (w & 255) * (x & 255), sh = (w >> 8) + (x >> 8) - 64 + 18;
-                acc[s][i] += (long long)(c * d[i]) << sh;
+                int x = i & 1 ? x1 : x0, w = i < 2 ? w0 : w1;
+                acc[s][i] += (long long)((w & 255) * (x & 255) * d[i]) << ((w >> 8) + (x >> 8) - 64 + 18);
             }
         }
     }
@@ -202,6 +209,66 @@ __global__ void nv_fp32(const int8_t *qw, const uint8_t *sw, const int8_t *qa, c
     } else Y[o] = tot * alpha;
 }
 
+// ---- the hardware's own NVFP4 product: block-scaled FP4 tensor cores (sm_120a) -----------------------------------------
+// mma.sync m16n8k64 kind::mxf4nvf4 block_scale scale_vec::4X: E2M1 x E2M1 with one UE4M3 scale per 16 on each side,
+// FP32 accumulation -- the instruction NVFP4 inference engines run. Fragments (PTX ISA 9.7.16.5.11): A reg r holds the 8
+// nibbles of row g (r even) or g + 8 (r odd) at k = 8 t4 + 32 (r >= 2); B reg r the nibbles of column g at k = 8 t4 + 32 r;
+// scale_A from lanes t4 = 0 (row g) and t4 = 1 (row g + 8) with thread-id-a = 0, scale_B from lane t4 = 0 (column g).
+// Packed activations: pa [N][K/2], low nibble = even k, like the weights. Split-K in S slices, reduced in order.
+__global__ void pack_x(const int8_t *qa, uint8_t *pa, size_t n2) {
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n2; i += (size_t)gridDim.x * blockDim.x) {
+        uint8_t c[2];
+        for (int h = 0; h < 2; h++) {
+            int v = qa[2 * i + h], a = v < 0 ? -v : v;
+            int idx = a <= 4 ? a : a == 6 ? 5 : a == 8 ? 6 : 7;
+            c[h] = (uint8_t)((v < 0 ? 8 : 0) | idx);
+        }
+        pa[i] = c[0] | c[1] << 4;
+    }
+}
+__device__ inline void mma_nvf4(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, uint32_t sfa, uint32_t sfb) {
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_SPECIFIC__) || defined(__CUDA_ARCH_FAMILY_SPECIFIC__)
+    asm volatile("mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1),
+                   "r"(sfa), "h"((uint16_t)0), "h"((uint16_t)0), "r"(sfb), "h"((uint16_t)0), "h"((uint16_t)0));
+#endif
+}
+__global__ void __launch_bounds__(256) nv_native(const uint8_t *__restrict__ pk, const uint8_t *__restrict__ sw,
+                                                 const uint8_t *__restrict__ pa, const uint8_t *__restrict__ sa,
+                                                 float alpha, float *Y, int M, int N, int K, int S) {
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+    int m0 = (blockIdx.x * 8 + warp) * 16, n0 = blockIdx.y * 32, B = K / 16, C = K / 64, per = C / S;
+    if (m0 >= M) return;
+    float tot[4][4] = {};
+    for (int z = 0; z < S; z++) {
+        float acc[4][4] = {};
+        for (int kc = z * per; kc < (z == S - 1 ? C : (z + 1) * per); kc++) {
+            uint32_t a[4];
+#pragma unroll
+            for (int r = 0; r < 4; r++)
+                a[r] = *(const uint32_t *)(pk + (size_t)(m0 + g + (r & 1) * 8) * (K / 2) + kc * 32 + (r >> 1) * 16 + t4 * 4);
+            uint32_t sfa = t4 < 2 ? *(const uint32_t *)(sw + (size_t)(m0 + g + t4 * 8) * B + kc * 4) : 0u;
+#pragma unroll
+            for (int s = 0; s < 4; s++) {
+                const uint8_t *col = pa + (size_t)(n0 + s * 8 + g) * (K / 2) + kc * 32 + t4 * 4;
+                uint32_t sfb = t4 == 0 ? *(const uint32_t *)(sa + (size_t)(n0 + s * 8 + g) * B + kc * 4) : 0u;
+                mma_nvf4(acc[s], a, *(const uint32_t *)col, *(const uint32_t *)(col + 16), sfa, sfb);
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < 4; s++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) tot[s][i] += acc[s][i];
+    }
+#pragma unroll
+    for (int s = 0; s < 4; s++)
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+            Y[(size_t)(n0 + s * 8 + t4 * 2 + (i & 1)) * M + m0 + g + (i < 2 ? 0 : 8)] = tot[s][i] * alpha;
+}
+
 // ---- decode: a few tokens, the weights read once as packed 4-bit -----------------------------------------------------
 // Token generation reads every weight once per token: memory (or disk) bound. One warp per row; lane l takes the blocks
 // l, l + 32, ... (8 packed bytes + 1 scale byte each, coalesced), unpacks the nibbles through a 256-entry table, does the
@@ -226,13 +293,13 @@ __global__ void __launch_bounds__(256) nv_decode(const uint8_t *__restrict__ pk,
         uint32_t w[4];
         w[0] = lut[p.x & 255] | (uint32_t)lut[(p.x >> 8) & 255] << 16; w[1] = lut[(p.x >> 16) & 255] | (uint32_t)lut[p.x >> 24] << 16;
         w[2] = lut[p.y & 255] | (uint32_t)lut[(p.y >> 8) & 255] << 16; w[3] = lut[(p.y >> 16) & 255] | (uint32_t)lut[p.y >> 24] << 16;
-        int ws = c_se[sw[(size_t)row * B + b]];
+        int ws = e4m3_sig_eps(sw[(size_t)row * B + b]);
 #pragma unroll
         for (int t = 0; t < NT; t++) {
             uint4 a = *(const uint4 *)(qa + (size_t)t * K + b * 16);
             int d = __dp4a((int)w[0], (int)a.x, 0); d = __dp4a((int)w[1], (int)a.y, d);
             d = __dp4a((int)w[2], (int)a.z, d); d = __dp4a((int)w[3], (int)a.w, d);
-            int xs = c_se[sa[(size_t)t * B + b]];
+            int xs = e4m3_sig_eps(sa[(size_t)t * B + b]);
             acc[t] += (long long)((ws & 255) * (xs & 255) * d) << ((ws >> 8) + (xs >> 8) - 64 + 18);
         }
     }
@@ -304,11 +371,13 @@ static float *project(const std::string &dir, const std::string &pre, int M, int
     CK(cudaMemcpy(dpk, pk.data(), pk.size(), cudaMemcpyHostToDevice)); CK(cudaMemcpy(dsw, sw.data(), sw.size(), cudaMemcpyHostToDevice));
     unpack_w<<<1024, 256>>>(dpk, dqw, pk.size());
     quant_x<<<1024, 256>>>(dX, dqa, dsa, gA, (size_t)N * B);
+    uint8_t *dswT, *dsaT; CK(cudaMalloc(&dswT, (size_t)M * B)); CK(cudaMalloc(&dsaT, (size_t)N * B));
+    transpose_u8<<<1024, 256>>>(dsw, dswT, M, B); transpose_u8<<<1024, 256>>>(dsa, dsaT, N, B);
     CK(cudaGetLastError());
     int xW, xA; float fW = frexpf(gW, &xW), fA = frexpf(gA, &xA);          // gW gA = (mW mA) 2^(xW + xA - 48)
     long long Gm = (long long)ldexpf(fW, 24) * (long long)ldexpf(fA, 24); int Gx = xW + xA - 48;
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
-    auto tc = [&] { nv_exact<<<dim3((M + 127) / 128, N / 32), 256>>>(dqw, dsw, dqa, dsa, Gm, Gx, Y, M, N, K); };
+    auto tc = [&] { nv_exact<<<dim3((M + 127) / 128, N / 32), 256>>>(dqw, dswT, dqa, dsaT, Gm, Gx, Y, M, N, K, N); };
     tc(); CK(cudaDeviceSynchronize());
     cudaEventRecord(e0); for (int r = 0; r < 10; r++) tc(); cudaEventRecord(e1); CK(cudaEventSynchronize(e1));
     float ms; cudaEventElapsedTime(&ms, e0, e1); ms /= 10;
@@ -317,7 +386,7 @@ static float *project(const std::string &dir, const std::string &pre, int M, int
     nv_fp32<<<(MN + 255) / 256, 256>>>(dqw, dsw, dqa, dsa, alpha, Y1, M, N, K, 1);
     nv_fp32<<<(MN + 255) / 256, 256>>>(dqw, dsw, dqa, dsa, alpha, Y4, M, N, K, 4);
     nv_fp32<<<(MN + 255) / 256, 256>>>(dqw, dsw, dqa, dsa, alpha, Yx, M, N, K, 1, Gm, Gx);
-    nv_exact<<<dim3((M + 127) / 128, 1), 256>>>(dqw, dsw, dqa, dsa, Gm, Gx, Ys, M, 32, K);   // the first 32 tokens alone
+    nv_exact<<<dim3((M + 127) / 128, 1), 256>>>(dqw, dswT, dqa, dsaT, Gm, Gx, Ys, M, 32, K, N);   // the first 32 tokens alone
     CK(cudaDeviceSynchronize());
     std::vector<float> hY(MN), hR(MN), h1(MN), h4(MN), hx(MN), hs((size_t)M * 32);
     CK(cudaMemcpy(hY.data(), Y, MN * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(hR.data(), Yr, MN * 4, cudaMemcpyDeviceToHost));
@@ -335,6 +404,26 @@ static float *project(const std::string &dir, const std::string &pre, int M, int
            ms, 2.0 * MN * K / ms / 1e9, dref, N, dbatch);
     printf("  FP32 accumulation of the block terms: split 1 not correctly rounded %zu (%.2f %%), split 4 %zu (%.2f %%), "
            "split 1 vs 4 differ %zu (%.2f %%); FP32 sum with an exact epilogue: %zu (%.2f %%)\n", d1, 100.0 * d1 / MN, d4, 100.0 * d4 / MN, d14, 100.0 * d14 / MN, dx, 100.0 * dx / MN);
+    // the native block-scaled FP4 MMA (what engines run): split 1 timed, split 1 vs 4, against the exact bits
+    {
+        uint8_t *dpa; float *Yn1, *Yn4; CK(cudaMalloc(&dpa, (size_t)N * K / 2)); CK(cudaMalloc(&Yn1, MN * 4)); CK(cudaMalloc(&Yn4, MN * 4));
+        pack_x<<<1024, 256>>>(dqa, dpa, (size_t)N * K / 2);
+        auto nat = [&](float *o, int s) { nv_native<<<dim3((M + 127) / 128, N / 32), 256>>>(dpk, dsw, dpa, dsa, alpha, o, M, N, K, s); };
+        nat(Yn1, 1); CK(cudaDeviceSynchronize());
+        cudaEventRecord(e0); for (int r = 0; r < 10; r++) nat(Yn1, 1); cudaEventRecord(e1); CK(cudaEventSynchronize(e1));
+        float tn; cudaEventElapsedTime(&tn, e0, e1); tn /= 10;
+        nat(Yn4, 4); CK(cudaDeviceSynchronize());
+        std::vector<float> n1(MN), n4(MN); CK(cudaMemcpy(n1.data(), Yn1, MN * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(n4.data(), Yn4, MN * 4, cudaMemcpyDeviceToHost));
+        size_t e1n = 0, e4n = 0, d14n = 0; double rel = 0;
+        for (size_t o = 0; o < MN; o++) {
+            e1n += memcmp(&n1[o], &hY[o], 4) != 0; e4n += memcmp(&n4[o], &hY[o], 4) != 0; d14n += memcmp(&n1[o], &n4[o], 4) != 0;
+            if (hY[o] != 0.f) rel = fmax(rel, fabs((double)n1[o] - hY[o]) / fabs((double)hY[o]));
+        }
+        printf("  native NVFP4 MMA (m16n8k64 block_scale, FP32 acc) %.3f ms = %.1f TOPS: not correctly rounded split 1 %zu (%.2f %%), "
+               "split 4 %zu (%.2f %%), split 1 vs 4 differ %zu (%.2f %%), max rel. error %.2e\n",
+               tn, 2.0 * MN * K / tn / 1e9, e1n, 100.0 * e1n / MN, e4n, 100.0 * e4n / MN, d14n, 100.0 * d14n / MN, rel);
+        CK(cudaFree(dpa)); CK(cudaFree(Yn1)); CK(cudaFree(Yn4));
+    }
     // decode: 1 and 8 tokens straight from the packed nibbles, timed against the FP32 GEMV; bits must equal the prefill path
     float *Yd; CK(cudaMalloc(&Yd, (size_t)M * 8 * 4));
     double wbytes = (double)M * K / 2 + (double)M * B;
@@ -368,7 +457,7 @@ static float *project(const std::string &dir, const std::string &pre, int M, int
         dump("Y.f32", hY.data(), MN * 4); dump("Yb1.f32", h1.data(), MN * 4); dump("Yb4.f32", h4.data(), MN * 4);
         FILE *f = fopen((d + "/meta.txt").c_str(), "w"); fprintf(f, "%d %d %d %s\n", M, K, N, pre.c_str()); fclose(f);
     }
-    for (void *p : {(void *)dpk, (void *)dsw, (void *)dqw, (void *)dqa, (void *)dsa, (void *)Yr, (void *)Y1, (void *)Y4, (void *)Yx, (void *)Ys}) CK(cudaFree(p));
+    for (void *p : {(void *)dpk, (void *)dsw, (void *)dqw, (void *)dqa, (void *)dsa, (void *)Yr, (void *)Y1, (void *)Y4, (void *)Yx, (void *)Ys, (void *)dswT, (void *)dsaT}) CK(cudaFree(p));
     return Y;
 }
 
@@ -377,8 +466,6 @@ int main(int argc, char **argv) {
     std::string dir = argv[1], pre = argv[2];
     int N = (atoi(argv[3]) + 31) / 32 * 32; unsigned seed = argc > 4 ? atoi(argv[4]) : 1; std::string out = argc > 5 ? argv[5] : "";
     const int L = 2048, F = 5120, H = 8192;                                   // Ultra: latent, expert width, hidden
-    int se[256]; for (int b = 0; b < 256; b++) se[b] = e4m3_sig_eps((uint8_t)b);
-    CK(cudaMemcpyToSymbol(c_se, se, sizeof se));
     std::mt19937 rng(seed); std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<__nv_bfloat16> h((size_t)N * H);
     for (auto &v : h) v = __float2bfloat16(nd(rng));
