@@ -28,6 +28,7 @@
 #include <vector>
 #include <random>
 #include <algorithm>
+#include <ctime>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "../src/gemm_i8.cuh"
@@ -518,6 +519,21 @@ int main(int argc, char **argv) {
         }
     }
 
+    // MX_ENERGY=s: s seconds of exact prefill products, 3 s idle, s seconds of the BF16 baseline (llm/energy_mx.sh samples the power)
+    if (getenv("MX_ENERGY")) {
+        const double secs = atof(getenv("MX_ENERGY"));
+        int st2[3], nb2; const int Ln = run_exact(d, N, st2, &nb2);
+        auto wall = [] { struct timespec t; clock_gettime(CLOCK_REALTIME, &t); return t.tv_sec + 1e-9 * t.tv_nsec; };
+        double t0 = wall(); long it = 0;
+        while (wall() - t0 < secs) { split_x<<<Np, 256>>>(d.X, d.xs, d.Ec, d.stat, Np, K, S); run_products(d, N, Ln); CK(cudaDeviceSynchronize()); it++; }
+        const double t1 = wall();
+        printf("ENERGY exact %.3f %.3f %ld\n", t0, t1, it); fflush(stdout);
+        while (wall() - t1 < 3) {}
+        const double t2 = wall(); long ib = 0;
+        while (wall() - t2 < secs) { run_bf16(d, N, 1, Yb); CK(cudaDeviceSynchronize()); ib++; }
+        printf("ENERGY bf16 %.3f %.3f %ld\n", t2, wall(), ib);
+        return 0;
+    }
     // timing
     cudaEvent_t e0, e1, e2, e3; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2); cudaEventCreate(&e3);
     for (int n : {128, 1024, 4096}) {

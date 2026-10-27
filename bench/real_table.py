@@ -4,17 +4,20 @@
 import re, os, sys, subprocess
 K = {"west0989": "5.7e12", "qh1484": "5.6e17", "fidap032": "5.2e20", "fidap006": "3.5e21", "cry2500": "4.4e17", "fidapm07": "6.8e19",
      "fidap026": "4.7e18", "mhd3200a": "6.5e39", "fidap014": "2.6e16", "lns_3937": "1.0e17", "fidap012": "2.2e20", "mhd4800a": "3.2e47",
-     "sherman3": "6.9e16"}   # NIST Matrix Market "condition number (est.)"
+     "sherman3": "6.9e16", "fidapm15": "1.36e20", "cry10000": "6.9e20"}   # NIST Matrix Market "condition number (est.)"
 R = "/opt/ozaki/real"
 rows = []
 for N in K:
     d = f"{R}/{N}"
-    if not os.path.exists(f"{d}/gpu.log"): continue
-    c, g = open(f"{d}/conv.log").read(), open(f"{d}/gpu.log").read()
+    lg = f"{d}/gpu.log" if os.path.exists(f"{d}/gpu.log") else f"{d}/gpu_dixon.log"   # Dixon above the HOL buffers (bench/real_dixon.sh)
+    if not os.path.exists(lg) or "digest" not in open(lg).read(): continue
+    c, g = open(f"{d}/conv.log").read(), open(lg).read()
     s = open(f"{d}/spex.log").read() if os.path.exists(f"{d}/spex.log") else ""
     m = re.search(r"n (\d+) \(padded \d+\) nnz (\d+) entry bits (\d+)", c)
     t = lambda k: float(re.search(k + r" ([0-9.]+)", g).group(1))
-    tg = t(r"\[A\^-1") + t(r"steps") + t(r"ratrec") + float(re.search(r"digest [0-9a-f]+; ([0-9.]+) s", g).group(1))
+    if "[A^-1" in g: tg = t(r"\[A\^-1") + t(r"steps") + t(r"ratrec") + float(re.search(r"digest [0-9a-f]+; ([0-9.]+) s", g).group(1))
+    else:   # the run went on into det/d: the wall time to the certified solution, from the job log (bench/real_dixon.sh)
+        jl = open("/opt/ozaki/job/log").read(); tg = float(re.search(N + r":.*?\n  GPU solve ([0-9.]+) s", jl, re.S).group(1))
     dg = re.search(r"digest ([0-9a-f]+);", g).group(1); ok = g.count(": ok") == 2
     sm = re.search(r"  ([0-9.]+) s  D \d+ bits.*digest ([0-9a-f]+)", s)
     D = re.search(r"D (\d+) bits, numerators up to", g).group(1)
