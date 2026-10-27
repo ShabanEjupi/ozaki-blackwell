@@ -72,7 +72,7 @@ static std::vector<float> emb_row(const std::string &name, int tok, int H) {
     else { readt("__row", h.data()); for (auto &x : h) x = bf(x); }
     return h;
 }
-struct OSeq { int prompt, mode; std::vector<int> toks; size_t plen; std::vector<float> h; std::vector<std::vector<float>> kc, vc; };
+struct OSeq { int prompt, mode; std::vector<int> toks; size_t plen; std::vector<float> h; std::vector<std::vector<float>> kc, vc; uint64_t dig = 1469598103934665603ULL; };
 
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: out_dense <model dir> <prompts> <new tokens> [modes]\n"); return 1; }
@@ -158,10 +158,11 @@ int main(int argc, char **argv) {
             for (size_t j = 0; j < NS; j++) { auto y = gemv(W, act_plain(tmp[j]), 8, seqs[j].mode, seqs[j].mode == 0);
                 if (OLMO) { std::vector<float> n; norm(y, n2[L], n); y = n; }
                 for (int i = 0; i < D_H; i++) seqs[j].h[i] = bf((double)seqs[j].h[i] + y[i]); }
+            for (auto &s : seqs) s.dig = fnv(s.dig, s.h);   // FNV-1a of every residual stream after every layer
         }
         for (auto &s : seqs) {
             std::vector<float> hn; norm(s.h, normf, hn);
-            auto lg = gemv(LM, act_plain(hn), 24, s.mode, s.mode == 0);
+            auto lg = gemv(LM, act_plain(hn), 24, s.mode, s.mode == 0); s.dig = fnv(s.dig, lg);
             int b1 = 0; for (int v = 1; v < D_V; v++) if (lg[v] > lg[b1]) b1 = v;
             int b2 = b1 ? 0 : 1; for (int v = 0; v < D_V; v++) if (v != b1 && lg[v] > lg[b2]) b2 = v;
             if (t + 1 >= s.plen && t + 1 >= s.toks.size()) s.toks.push_back(b1);
@@ -176,5 +177,6 @@ int main(int argc, char **argv) {
         printf("shadow %s outputs %lld engine_s1_differs %lld (%.2f%%) engine_s4_differs %lld (%.2f%%)\n", fn[f], st_out[f],
                st_d1[f], 100.0 * st_d1[f] / st_out[f], st_d4[f], 100.0 * st_d4[f] / st_out[f]);
     printf("uncertified %lld\n", st_bad);
+    for (auto &s : seqs) printf("digest prompt %d mode %d: %016llx\n", s.prompt, s.mode, (unsigned long long)s.dig);
     for (auto &s : seqs) { printf("seq prompt %d mode %d:", s.prompt, s.mode); for (int v : s.toks) printf(" %d", v); printf("\n"); }
 }

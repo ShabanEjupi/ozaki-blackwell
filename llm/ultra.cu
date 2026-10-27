@@ -138,6 +138,10 @@ static float bf(double v) {   // once to BF16, nearest even
     return (float)ldexp(nearbyint(ldexp(v, -q)), q);
 }
 static float bf16f(uint16_t u) { uint32_t b = (uint32_t)u << 16; float f; memcpy(&f, &b, 4); return f; }
+static uint64_t fnv(uint64_t h, const std::vector<float> &v) {   // FNV-1a 64 over the bits: a transcript digest of the exact path
+    for (float f : v) { uint32_t b; memcpy(&b, &f, 4); for (int i = 0; i < 4; i++) { h ^= (b >> (8 * i)) & 255; h *= 1099511628211ULL; } }
+    return h;
+}
 static int bl32(uint32_t v) { return v ? 32 - __builtin_clz(v) : 0; }
 struct Act { std::vector<int32_t> m; std::vector<int16_t> e; int hix = -100000; };
 static void put(Act &a, int k, int m, int e) { a.m[k] = m; a.e[k] = (int16_t)e; if (m) a.hix = std::max(a.hix, e + bl32(std::abs(m))); }
@@ -316,6 +320,7 @@ struct Seq {
     std::map<int, std::vector<float>> conv, ssm;            // per Mamba layer: last 3 conv inputs [CONV][3], state [MH][MD][MN]
     std::map<int, std::vector<float>> kc, vc;               // per attention layer: [t][NKV*HD]
     std::vector<std::pair<float, float>> top;
+    uint64_t dig = 1469598103934665603ULL;   // FNV-1a of every residual stream after every layer and every logit vector
 };
 
 #ifndef ULTRA_LIB
@@ -497,10 +502,11 @@ int main(int argc, char **argv) {
                     for (int i = 0; i < H; i++) out[j][i] = bf((double)out[j][i] + d[i]); }
             }
             for (size_t j = 0; j < seqs.size(); j++) for (int i = 0; i < H; i++) seqs[j].h[i] = bf((double)seqs[j].h[i] + out[j][i]);
+            for (auto &s : seqs) s.dig = fnv(s.dig, s.h);
         }
         for (auto &s : seqs) {   // final norm, logits (FP32, correctly rounded on the exact path), greedy
             std::vector<float> hn(H); rmsnorm(s.h, normf, hn, 0, H);
-            auto lg = gemv(LM, act_plain(hn), 24, s.mode, s.mode == 0);
+            auto lg = gemv(LM, act_plain(hn), 24, s.mode, s.mode == 0); s.dig = fnv(s.dig, lg);
             int b1 = 0; for (int v = 1; v < VOC; v++) if (lg[v] > lg[b1]) b1 = v;
             int b2 = b1 ? 0 : 1; for (int v = 0; v < VOC; v++) if (v != b1 && lg[v] > lg[b2]) b2 = v;
             if (t + 1 >= s.plen) { if (t + 1 >= s.toks.size()) s.toks.push_back(b1); s.top.push_back({lg[b1], lg[b2]}); }
@@ -516,6 +522,7 @@ int main(int argc, char **argv) {
         printf("shadow %s outputs %lld engine_s1_differs %lld (%.2f%%) engine_s4_differs %lld (%.2f%%)\n", fn[f], st_out[f],
                st_d1[f], 100.0 * st_d1[f] / st_out[f], st_d4[f], 100.0 * st_d4[f] / st_out[f]);
     printf("uncertified %lld\n", st_bad);
+    for (auto &s : seqs) printf("digest prompt %d mode %d: %016llx\n", s.prompt, s.mode, (unsigned long long)s.dig);
     for (auto &s : seqs) { printf("seq prompt %d mode %d:", s.prompt, s.mode); for (int v : s.toks) printf(" %d", v); printf("\n"); }
 }
 #endif

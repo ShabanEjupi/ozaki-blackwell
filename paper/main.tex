@@ -425,8 +425,10 @@ of routed MXFP4 experts and 111.2~GB of dense BF16 weights (attention 72.4, shar
 PCIe~5~$\times$16, while the exact decode kernel consumes 94~GB/s. A bit-reproducible run therefore takes the same
 $\sim$27~s per token as an ordinary one, all of it reading. What this laptop lacks is 1.56~TB of storage (669~GB free).
 
-\paragraph{The largest model with open training data.} Nemotron~3 Ultra~\cite{nemotron3} publishes weights, recipe and
-pre-training data (560\,524\,578\,816 parameters in the BF16 checkpoint's metadata; 14.8T tokens in 226 datasets). Its
+\paragraph{The largest model with a published data recipe.} Nemotron~3 Ultra~\cite{nemotron3} publishes weights and recipe
+and names its pre-training data (560\,524\,578\,816 parameters in the BF16 checkpoint's metadata; 14.8T tokens in 226
+datasets), but the bulk of that data (Nemotron-CC v2 and v2.1, the code and SFT pre-training sets) is gated by manual
+approval under an agreement that allows internal training only (Hugging Face API, 27 October 2026). Its
 routed experts are NVFP4 for weights and activations: E2M1 values, one E4M3 scale per 16, an FP32 global scale. An NVFP4
 block of 16 is exactly one \texttt{mma.m16n8k16} INT8 ($|p_b|\le 2304$), the product of the two E4M3 scales is an integer
 $\le 225$ times $2^{\varepsilon_W+\varepsilon_A}$, and after a shift of 18 every term is below $2^{47}$: the $K/16\le 320$
