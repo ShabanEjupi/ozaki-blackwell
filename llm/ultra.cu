@@ -30,6 +30,10 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 
 constexpr int H = 8192, VOC = 131072, MH = 256, MD = 64, MN = 128, NG = 8, DIN = 16384, CONV = 18432, LAT = 2048,
@@ -199,7 +203,72 @@ static void readt(const std::string &name, void *dst, size_t want = 0) {
     t_disk += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); bytes_disk += t.n;
 }
 static size_t tsize(const std::string &name) { return idx.at(name).n; }
-static float scalar(const std::string &name) { float f; readt(name, &f, 4); return f; }
+static float scalar(const std::string &name) {   // constant across steps: read once
+    static std::unordered_map<std::string, float> seen;
+    auto it = seen.find(name); if (it != seen.end()) return it->second;
+    float f; readt(name, &f, 4); return seen[name] = f;
+}
+
+// ---- read-ahead (OZ_AHEAD=<GB>): one thread reads the tensors the driver announces, in the order it will ask for them,
+// into a pinned ring; the driver takes them from the front. A name that is not at the front is read synchronously.
+struct Ahead {
+    struct Job { std::string name; TI t; size_t off = 0; bool ready = false; };
+    uint8_t *buf = nullptr; size_t cap = 0, nread = 0;   // q[0 .. nread) have ring space (oldest first)
+    std::deque<Job> q; std::mutex m; std::condition_variable cv; std::thread th; std::map<std::string, int> fd;
+    void start(size_t c) { cap = c; CK(cudaMallocHost(&buf, cap)); th = std::thread([this] { run(); }); th.detach(); }
+    void push(const std::string &name) {   // the TI is copied here: idx is only touched by the driver's thread
+        if (!buf) return;
+        std::lock_guard<std::mutex> l(m); Job j; j.name = name; j.t = idx.at(name); q.push_back(j); cv.notify_all();
+    }
+    bool fits(size_t n, size_t &off) {   // contiguous space after the newest allocation and before the oldest one
+        if (nread == 0) { off = 0; return n <= cap; }
+        size_t tail = q[0].off, end = q[nread - 1].off + q[nread - 1].t.n;
+        if (end > tail) { if (cap - end >= n) { off = end; return true; } if (tail >= n) { off = 0; return true; } return false; }
+        if (tail - end >= n) { off = end; return true; }
+        return false;
+    }
+    void run() {
+        std::unique_lock<std::mutex> l(m);
+        for (size_t off = 0;;) {
+            cv.wait(l, [&] { return nread < q.size() && fits(q[nread].t.n, off); });
+            Job &j = q[nread]; j.off = off; nread++; TI t = j.t;   // deque references survive push_back and the other pops
+            l.unlock();
+            if (!fd.count(t.file)) fd[t.file] = open((DIR + "/" + t.file).c_str(), O_RDONLY);
+            for (size_t done = 0; done < t.n;) {
+                ssize_t r = pread(fd[t.file], buf + off + done, t.n - done, t.off + done);
+                if (r <= 0) { perror("read-ahead pread"); exit(1); }
+                done += r;
+            }
+            l.lock(); j.ready = true; cv.notify_all();
+        }
+    }
+    const uint8_t *take(const std::string &name) {   // the front job if it is `name`, once read; valid until release()
+        std::unique_lock<std::mutex> l(m);
+        if (q.empty() || q.front().name != name) {
+            static bool warned = false;
+            if (!q.empty() && !warned) { fprintf(stderr, "read-ahead: asked %s, front is %s (read synchronously)\n", name.c_str(), q.front().name.c_str()); warned = true; }
+            return nullptr;
+        }
+        cv.wait(l, [&] { return q.front().ready; });
+        return buf + q.front().off;
+    }
+    void release() { std::lock_guard<std::mutex> l(m); q.pop_front(); nread--; cv.notify_all(); }
+};
+static Ahead ahead;
+static bool to_dev_ahead(const std::string &name, void *dst) {   // from the ring if it is next there; the wait counts as disk time
+    if (!ahead.buf) return false;
+    auto t0 = std::chrono::steady_clock::now();
+    const uint8_t *p = ahead.take(name);
+    if (!p) return false;
+    t_disk += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); bytes_disk += tsize(name);
+    CK(cudaMemcpy(dst, p, tsize(name), cudaMemcpyHostToDevice));
+    ahead.release();
+    return true;
+}
+static void to_dev(const std::string &name, void *dst) {   // a small tensor (expert scales) to the GPU
+    if (to_dev_ahead(name, dst)) return;
+    readt(name, pin); CK(cudaMemcpy(dst, pin, tsize(name), cudaMemcpyHostToDevice));
+}
 static std::vector<float> vec_bf16(const std::string &name) {
     std::vector<uint16_t> u(tsize(name) / 2); readt(name, u.data());
     std::vector<float> v(u.size()); for (size_t i = 0; i < u.size(); i++) v[i] = bf16f(u[i]); return v;
@@ -214,6 +283,8 @@ static void gscale(DevW &W, float a, float b) {   // exact a*b as a 48-bit integ
 static DevW load_w(const std::string &name, int fmt, int M, int K, void *dst = nullptr) {
     DevW W{}; W.fmt = fmt; W.M = M; W.K = K; W.Gm = 1; W.Ge = 0; W.Gf = 1.f;
     size_t n = tsize(name); void *d = dst ? dst : dW;
+    W.w = d;
+    if (to_dev_ahead(name, d)) return W;
     for (size_t o = 0; o < n; o += PIN) {   // stream through the pinned buffer
         size_t c = std::min(PIN, n - o);
         const TI t = idx.at(name); TI part = t; part.off += o; part.n = c;
@@ -224,7 +295,7 @@ static DevW load_w(const std::string &name, int fmt, int M, int K, void *dst = n
     return W;
 }
 // stats: exact vs engine on the same input (shadow), per format
-static long long st_out[4], st_d1[4], st_d4[4], st_bad;
+static long long st_out[5], st_d1[5], st_d4[5], st_bad;   // per weight format; [4] = BF16 weights rounded to FP32 (logits)
 static std::vector<float> gemv(const DevW &W, const Act &a, int p, int mode, bool shadow = false) {
     CK(cudaMemcpy(dxm, a.m.data(), a.m.size() * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dxe, a.e.data(), a.e.size() * 2, cudaMemcpyHostToDevice));
@@ -232,15 +303,17 @@ static std::vector<float> gemv(const DevW &W, const Act &a, int p, int mode, boo
     gemv_k<<<(W.M + 7) / 8, 256>>>(W, dxm, dxe, a.hix, p, mode, dy, dbad);
     std::vector<float> y(W.M); CK(cudaMemcpy(y.data(), dy, W.M * 4, cudaMemcpyDeviceToHost));
     int nb; CK(cudaMemcpy(&nb, dbad, 4, cudaMemcpyDeviceToHost)); st_bad += nb;
-    if (shadow && mode == 0) {
+    static const bool shadow_on = !getenv("OZ_NOSHADOW");   // OZ_NOSHADOW=1: time the exact path alone
+    if (shadow && mode == 0 && shadow_on) {
         std::vector<float> z(W.M);
+        int c = W.fmt == F_BF16 && p == 24 ? 4 : W.fmt;
         for (int s : {1, 4}) {
             gemv_k<<<(W.M + 7) / 8, 256>>>(W, dxm, dxe, a.hix, p, s, dy, dbad);
             CK(cudaMemcpy(z.data(), dy, W.M * 4, cudaMemcpyDeviceToHost));
             long long d = 0; for (int i = 0; i < W.M; i++) d += z[i] != y[i];
-            (s == 1 ? st_d1 : st_d4)[W.fmt] += d;
+            (s == 1 ? st_d1 : st_d4)[c] += d;
         }
-        st_out[W.fmt] += W.M;
+        st_out[c] += W.M;
     }
     return y;
 }
@@ -335,8 +408,8 @@ static int pick(const std::vector<float> &lg, size_t t, int prompt, int mode, in
     return b1;
 }
 template <class S> static void report(const std::vector<S> &seqs) {   // shadow statistics, digests, token ids
-    const char *fn[4] = {"BF16", "FP32", "FP8", "NVFP4"};
-    for (int f = 0; f < 4; f++) if (st_out[f])
+    const char *fn[5] = {"BF16", "FP32", "FP8", "NVFP4", "BF16->FP32(logits)"};
+    for (int f = 0; f < 5; f++) if (st_out[f])
         printf("shadow %s outputs %lld engine_s1_differs %lld (%.2f%%) engine_s4_differs %lld (%.2f%%)\n", fn[f], st_out[f],
                st_d1[f], 100.0 * st_d1[f] / st_out[f], st_d4[f], 100.0 * st_d4[f] / st_out[f]);
     printf("uncertified %lld\n", st_bad);
@@ -407,6 +480,15 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "resident: lm_head + small tensors (%.1f GB read)\n", bytes_disk / 1e9);
 
+    auto part0 = [&](int L) {   // a layer's large tensors used before routing: all of them for Mamba and attention
+        std::string Q = "backbone.layers." + std::to_string(L) + ".mixer.";
+        if (types[L] == "mamba") for (const char *n : {"in_proj", "out_proj"}) ahead.push(Q + n + ".weight");
+        else if (types[L] == "attention") for (const char *n : {"q_proj", "k_proj", "v_proj", "o_proj"}) ahead.push(Q + n + ".weight");
+        else for (const char *n : {"gate", "fc1_latent_proj"}) ahead.push(Q + n + ".weight");
+    };
+    auto next0 = [&](int L, size_t t) { if (L + 1 < NL) part0(L + 1); else if (t + 1 < steps) part0(0); };
+    if (const char *a = getenv("OZ_AHEAD")) { ahead.start((size_t)(atof(a) * 1e9)); part0(0); fprintf(stderr, "read-ahead ring %.1f GB\n", atof(a)); }
+
     for (size_t t = 0; t < steps; t++) {
         auto t0 = std::chrono::steady_clock::now(); double d0 = t_disk, b0 = bytes_disk;
         for (auto &s : seqs) {   // embedding row of the current token
@@ -417,6 +499,7 @@ int main(int argc, char **argv) {
         }
         for (int L = 0; L < NL; L++) {
             std::string Q = "backbone.layers." + std::to_string(L) + ".mixer.";
+            if (types[L] != "moe") next0(L, t);   // read-ahead order = the order the tensors are used
             std::vector<std::vector<float>> x(seqs.size(), std::vector<float>(H)), out(seqs.size());
             for (size_t j = 0; j < seqs.size(); j++) rmsnorm(seqs[j].h, lnorm[L], x[j], 0, H);
             if (types[L] == "mamba") {
@@ -490,18 +573,20 @@ int main(int argc, char **argv) {
                 std::vector<std::vector<float>> lat(seqs.size()); std::vector<std::vector<double>> accd(seqs.size(), std::vector<double>(LAT, 0.0));
                 for (size_t j = 0; j < seqs.size(); j++) lat[j] = gemv(W, act_plain(x[j]), 8, seqs[j].mode, seqs[j].mode == 0);
                 std::set<int> uni; for (auto &v : ex) uni.insert(v.begin(), v.end());
+                for (int e : uni) for (const char *n : {"up_proj.weight", "up_proj.weight_scale", "down_proj.weight", "down_proj.weight_scale"})
+                    ahead.push(Q + "experts." + std::to_string(e) + "." + n);
+                for (const char *n : {"fc2_latent_proj", "shared_experts.up_proj", "shared_experts.down_proj"}) ahead.push(Q + n + ".weight");
+                next0(L, t);
                 for (int e : uni) {   // each chosen expert read once, applied to every sequence that chose it
                     std::string EP = Q + "experts." + std::to_string(e) + ".";
-                    DevW Wu = load_w(EP + "up_proj.weight", F_NVFP4, 5120, LAT); readt(EP + "up_proj.weight_scale", pin);
-                    CK(cudaMemcpy(dS, pin, tsize(EP + "up_proj.weight_scale"), cudaMemcpyHostToDevice)); Wu.sw = (uint8_t *)dS;
+                    DevW Wu = load_w(EP + "up_proj.weight", F_NVFP4, 5120, LAT); to_dev(EP + "up_proj.weight_scale", dS); Wu.sw = (uint8_t *)dS;
                     float gWu = scalar(EP + "up_proj.weight_scale_2"), gAu = scalar(EP + "up_proj.input_scale"); gscale(Wu, gWu, gAu);
                     std::vector<std::vector<float>> r(seqs.size());
                     for (size_t j = 0; j < seqs.size(); j++) if (std::count(ex[j].begin(), ex[j].end(), e)) {
                         auto u = gemv(Wu, act_nvfp4(lat[j], gAu), 8, seqs[j].mode, seqs[j].mode == 0);
                         r[j].resize(u.size()); for (size_t i = 0; i < u.size(); i++) { double v = u[i] > 0 ? u[i] : 0; r[j][i] = bf(v * v); }
                     }
-                    DevW Wd = load_w(EP + "down_proj.weight", F_NVFP4, LAT, 5120); readt(EP + "down_proj.weight_scale", pin);
-                    CK(cudaMemcpy(dS, pin, tsize(EP + "down_proj.weight_scale"), cudaMemcpyHostToDevice)); Wd.sw = (uint8_t *)dS;
+                    DevW Wd = load_w(EP + "down_proj.weight", F_NVFP4, LAT, 5120); to_dev(EP + "down_proj.weight_scale", dS); Wd.sw = (uint8_t *)dS;
                     float gWd = scalar(EP + "down_proj.weight_scale_2"), gAd = scalar(EP + "down_proj.input_scale"); gscale(Wd, gWd, gAd);
                     for (size_t j = 0; j < seqs.size(); j++) {
                         auto it = std::find(ex[j].begin(), ex[j].end(), e); if (it == ex[j].end()) continue;

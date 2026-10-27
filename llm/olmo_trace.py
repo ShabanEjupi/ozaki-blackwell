@@ -53,10 +53,14 @@ def trace(text, minw):
             return
 
 if sys.argv[1] == "--seqs":
-    minw = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+    import re
+    minw, seen = int(sys.argv[3]) if len(sys.argv) > 3 else 3, {}
     for line in open(sys.argv[2], encoding="utf-8"):
-        if line.startswith("seq "):
-            head, text = line.split(":", 1)
-            print(f"== {head}"); trace(ast.literal_eval(text.strip()), minw); print()
+        m = re.match(r"(seq prompt \d+ mode \d+):? (.*)$", line.rstrip("\n"))
+        if not m: continue
+        head, text = m.group(1), ast.literal_eval(m.group(2))
+        print(f"== {head}")
+        if text in seen: print(f"same text as {seen[text]}\n"); continue
+        seen[text] = head; trace(text, minw); print()
 else:
     trace(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 3)
