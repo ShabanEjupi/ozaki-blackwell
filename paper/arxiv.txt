@@ -21,8 +21,8 @@ most ill-conditioned real matrices of NIST Matrix Market (n up to 10,000) the ce
 up to ~900 times sooner than SPEX; FP64 has no correct digit on 8 of them. The same units give correctly rounded MXFP4 and BF16 products:
 on real weights of Kimi K3 (2.78 trillion parameters, the largest open-weights model) every output is certified and
 identical for any batch, where BF16 tensor cores with FP32 accumulation round 51-83% of them differently, and the exact
-decode kernel reads 94 GB/s, 18 times the laptop's NVMe. On Nemotron 3 Ultra (560 billion parameters, the largest model
-whose training data are published) the GPU's own NVFP4 instruction leaves 18-49% of an expert's outputs not correctly
-rounded; the correctly rounded product costs 2.3 times in prefill and nothing in decode.
+decode kernel reads 94 GB/s, 18 times the laptop's NVMe. On Nemotron 3 Ultra (560B parameters, the largest model with
+published training data) the GPU's NVFP4 instruction leaves 18-49% of an expert's outputs not correctly rounded; the
+correctly rounded product costs 4 times at instruction peak in prefill and nothing in decode.
 
 Ready: upload arxiv.tar.gz, paste the fields above.

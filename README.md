@@ -708,7 +708,10 @@ runs exactly at L2/memory speed (one expert is 5.9 MB and stays in L2 across the
 10–12.6 TOPS; scales stored transposed and decoded with bit operations give 16–17.5; shared-memory tiles (cp.async, 128 x 64
 per block, warps 32 x 32) give 20.5–23.2. Without the int64 epilogue the tiled kernel runs 25.6 TOPS: exactness itself costs
 ~20 %, the rest is that an NVFP4 block needs a k = 16 INT8 MMA, four instructions where the FP4 unit issues one k = 64.
-The native FP4 MMA with a plain tiling runs 49–55 TOPS: exactness costs ~2.3× in prefill (energy 2.2–2.3×) and nothing in decode. The native instruction rounds 18–49 % of the outputs wrongly and changes up to 0.81 % with
+The native FP4 MMA with a plain tiling runs 49–55 TOPS (energy 2.2–2.3× the exact path). The honest ceiling is the
+instruction peak (`bench/peak_fp4.cu`, registers only): `mma.m16n8k16` INT8 116 TOPS, `mma.m16n8k64 mxf4nvf4` 465 TOPS —
+with both kernels tuned to peak, exactness costs 4× in prefill; our kernels reach 18–20 % and 11 % of their peaks. In decode
+both read the same packed bytes, and exactness costs nothing. The native instruction rounds 18–49 % of the outputs wrongly and changes up to 0.81 % with
 the split, exactly like the emulation above: the error is the format’s FP32 epilogue and accumulation, not a kernel bug. Layer 1 is
 different: its experts are 99.5 % (near) zero in the BF16 checkpoint as well (median |w| 6.6·10⁻¹⁰), so 92 % of its exact
 outputs are 0.
