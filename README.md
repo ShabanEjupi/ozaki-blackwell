@@ -601,3 +601,24 @@ gave 2.9 MB/s from Hugging Face, i.e. six days for the weights.
 rrumbullakosur SAKTË, mbi tensor core INT8. Mbi peshat e vërteta (48 matrica): çdo dalje e certifikuar, e njëjtë për çdo
 batch dhe te decode; rruga e zakonshme BF16+FP32 gabon te 51–83 % e daljeve dhe ndryshon bitët sipas split-K. Prefill 8 ms
 (2,8× BF16), decode 94 GB/s — 18× më shpejt se disku, pra për një model që rrjedh nga disku saktësia s'kushton asgjë.
+
+### The router: where rounding picks the expert (`llm/router.cu`, `llm/exact.cuh`)
+
+The gate of a K3 MoE layer is logits = x·W_gᵀ in FP32 (W_g: 896 × 7168 BF16, real, layer 5), sigmoid + the learned
+`e_score_correction_bias`, top 16 of 896. `llm/exact.cuh` generalizes the exact product to any BF16 × BF16 (both sides split
+in tiers of 4 int8 digits: 64 INT8 GEMMs for the gate); inputs are Student-t hidden states through RMSNorm with the layer's
+real `post_attention_layernorm` weight. The routing step is the same CPU code for every set of logits.
+
+| | 4096 tokens (seed 1) | 16 384 (seed 2) | 16 384 (seed 3) |
+|---|---:|---:|---:|
+| exact logits: not certified | 0 | 0 | 0 |
+| ordinary logits (BF16 TC, FP32 acc.) not correctly rounded | 98.6–99.8 % | 98.6–99.8 % | 98.6–99.8 % |
+| tokens sent to a different expert set than with exact logits, split-K 1 / 2 / 4 / 8 | 1 / 1 / 2 / 1 | 2 / 2 / 0 / 0 | 0 / 0 / 2 / 0 |
+| median / 1st percentile gap between the 16th and 17th score | 1.1e-3 / 1.7e-5 | 1.1e-3 / 1.5e-5 | 1.1e-3 / 1.7e-5 |
+
+11 swaps in 147 456 (token, split) pairs: **~1 token in 13 000 per layer** changes an expert when only the rounding of its
+logits changes; over the 92 MoE layers of K3, ~1 token in 140 runs at least one different expert somewhere. With exact
+logits the choice is a function of the input alone.
+
+**SQ** — Te ruteri real i K3, vetëm rrumbullakimi i logit-ëve (split-K) e dërgon ~1 token në 13 000 te një ekspert tjetër për
+shtresë, ~1 në 140 tokenë në 92 shtresa. Me logit-ë të saktë zgjedhja varet vetëm nga hyrja.
