@@ -1,0 +1,12 @@
+qh1484 NEP/quebec/qh1484
+fidap032 SPARSKIT/fidap/fidap032
+fidap006 SPARSKIT/fidap/fidap006
+cry2500 NEP/crystal/cry2500
+fidapm07 SPARSKIT/fidap/fidapm07
+fidap026 SPARSKIT/fidap/fidap026
+mhd3200a NEP/mhd/mhd3200a
+fidap014 SPARSKIT/fidap/fidap014
+lns_3937 Harwell-Boeing/lns/lns_3937
+fidap012 SPARSKIT/fidap/fidap012
+mhd4800a NEP/mhd/mhd4800a
+sherman3 Harwell-Boeing/sherman/sherman3

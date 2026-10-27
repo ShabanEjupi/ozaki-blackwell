@@ -451,9 +451,9 @@ inline bool hol8_setup(int n, int zbits, int lgn, const uint32_t *p, int s, HolS
 
 // y = b A^-1 mod X^N, X = p_0 ... p_{s-1}. lu: the LU workspace of [A I] modulo the s primes (A^-1 mod p_t in columns
 // n..2n), freed here. dA: L planes of signed bytes. q: w primes, none among the p, prod q > 2^(zbits + 1), |R_i| < 2^zbits.
-// Returns the balanced digits of entries 0..3 of y: digit e (radix p_{e mod s}) of entry j at out[e * 4 + j], s N digits.
+// Returns the balanced digits of entries 0..nout-1 of y: digit e (radix p_{e mod s}) of entry j at out[e * nout + j], s N digits.
 inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, const uint32_t *p, int s, const uint32_t *q,
-                                     int w, const int32_t *b, int N, int zbits, HolStats &st, int *err_out) {
+                                     int w, const int32_t *b, int N, int zbits, HolStats &st, int *err_out, int nout = 4) {
     using clk = std::chrono::steady_clock;
     auto now = [] { return std::chrono::duration<double>(clk::now().time_since_epoch()).count(); };
     const int n = lu.n, sN = s * N;
@@ -623,8 +623,8 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
     }
 
 #undef OZ_SB
-    std::vector<int16_t> out((size_t)sN * 4);
-    cudaMemcpy2D(out.data(), 8, cb[cur], (size_t)n * 2, 8, sN, cudaMemcpyDeviceToHost);
+    std::vector<int16_t> out((size_t)sN * nout);   // entries 0 .. nout - 1 of every position
+    cudaMemcpy2D(out.data(), (size_t)nout * 2, cb[cur], (size_t)n * 2, (size_t)nout * 2, sN, cudaMemcpyDeviceToHost);
     cudaMemcpy(err_out, derr, 4, cudaMemcpyDeviceToHost);
     hw.free_();
     for (void *v : {(void *)B0T, (void *)PB[0], (void *)PB[1], (void *)PB[2], (void *)PB[3], (void *)Zres, (void *)Mres, (void *)Mq, (void *)AMq, (void *)Bt, (void *)cb[0],

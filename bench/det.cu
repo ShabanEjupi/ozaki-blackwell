@@ -8,6 +8,7 @@
 // Hadamard / d (a few thousand bits instead of ~50 000) and needs only that many primes. Deterministic and proved: the
 // randomness of b only decides how large d comes out.
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <cstdlib>
 #include <chrono>
@@ -28,6 +29,128 @@ static double now() { return std::chrono::duration<double>(std::chrono::steady_c
 // det mod the primes pr (a multiple of Pb of them), bad ones flagged
 static const int32_t *gU = nullptr, *gL = nullptr;   // the preconditioner, once it is needed
 static int gPlanes = 1;   // OZ_PLANES=L: entries of L bytes, sum_j A[j] 256^j
+static uint64_t invm(uint64_t a, uint64_t p);
+static const char *gFile = nullptr; static std::vector<int32_t> gB; static std::vector<__mpz_struct> gY;   // OZ_FILE: a system from bench/mm2oz.py, its right-hand side
+
+// OZ_FILE, after the lifting: the WHOLE solution y = c M^-1 (= x^T of the original system) from the digits of every entry.
+// dig: s N positions x n entries (radix p_(e mod s)); per entry the s digits of an X-digit by Horner, then base X by halves
+// (X^(2^l) precomputed: O(M(bits) log N) instead of Horner's quadratic). Y[j] in [0, Q).
+static void file_convert(const std::vector<int16_t> &dig, int n, int S, const uint32_t *p, int N, const mpz_t Q, std::vector<__mpz_struct> &Y) {
+    std::vector<__mpz_struct> pw; mpz_t X; mpz_init_set_ui(X, 1); for (int t = 0; t < S; t++) mpz_mul_ui(X, X, p[t]);
+    for (int len = N; len > 1; len = (len + 1) / 2) { pw.emplace_back(); mpz_init(&pw.back()); if (pw.size() == 1) mpz_set(&pw[0], X); else mpz_mul(&pw.back(), &pw[pw.size() - 2], &pw[pw.size() - 2]); }
+    Y.resize(n);
+#pragma omp parallel for schedule(dynamic, 4)
+    for (int j = 0; j < n; j++) {
+        std::vector<__mpz_struct> v(N);
+        for (int k = 0; k < N; k++) {
+            mpz_init(&v[k]);
+            for (int t = S - 1; t >= 0; t--) {
+                mpz_mul_ui(&v[k], &v[k], p[t]);
+                const int d = dig[((size_t)k * S + t) * n + j];
+                if (d >= 0) mpz_add_ui(&v[k], &v[k], d); else mpz_sub_ui(&v[k], &v[k], -d);
+            }
+        }
+        size_t l = 0;
+        for (int len = N; len > 1; len = (len + 1) / 2, l++)
+            for (int i = 0; 2 * i < len; i++) {
+                if (2 * i + 1 < len) { mpz_addmul(&v[2 * i], &v[2 * i + 1], &pw[l]); }
+                if (i != 2 * i) mpz_swap(&v[i], &v[2 * i]);
+            }
+        mpz_init(&Y[j]); mpz_mod(&Y[j], &v[0], Q);
+        for (auto &z : v) mpz_clear(&z);
+    }
+    for (auto &z : pw) mpz_clear(&z);
+    mpz_clear(X);
+}
+
+// OZ_FILE, once the denominator D is known from four entries: every numerator num_j = Y_j D (symmetric mod Q), an entry
+// whose numerator is not below 2^nb gets its own reconstruction (D grows to the lcm, a second pass); then y M = c is
+// CHECKED modulo two primes used nowhere else, the digest sum_j y_j r^j mod 2^61 - 1 (r = 1234567: the same as
+// bench/spex_solve.c) printed, and y written as doubles to OZ_FILE.x.
+static bool file_solution(int n, int L, const std::vector<int8_t> &A, std::vector<__mpz_struct> &Y, mpz_t D, const mpz_t Q, long nb, long db) {
+    const double t0 = now();
+    std::vector<__mpz_struct> num(n); for (auto &z : num) mpz_init(&z);
+    mpz_t hq; mpz_init(hq); mpz_fdiv_q_2exp(hq, Q, 1);
+    // the entries left over: numerators with the current D; up to 24 of the big ones get their own reconstruction
+    // (in parallel), D grows to the lcm, and only the big ones are tried again -- a few rounds, not one per entry
+    std::vector<int> todo(n); for (int j = 0; j < n; j++) todo[j] = j;
+    int rounds = 0, own = 0;
+    while (!todo.empty()) {
+        std::vector<int> big(todo.size(), 0);
+#pragma omp parallel for schedule(dynamic, 16)
+        for (size_t t = 0; t < todo.size(); t++) {
+            const int j = todo[t];
+            mpz_mul(&num[j], &Y[j], D); mpz_mod(&num[j], &num[j], Q); if (mpz_cmp(&num[j], hq) > 0) mpz_sub(&num[j], &num[j], Q);
+            big[t] = (long)mpz_sizeinbase(&num[j], 2) >= nb;
+        }
+        std::vector<int> left; for (size_t t = 0; t < todo.size(); t++) if (big[t]) left.push_back(todo[t]);
+        if (left.empty()) break;
+        if (++rounds > 200) { printf("FILE: no common denominator after 200 rounds\n"); return false; }
+        const int k = std::min<int>(24, (int)left.size()); std::vector<__mpz_struct> de(k); int fail = 0;
+#pragma omp parallel for reduction(+ : fail)
+        for (int t = 0; t < k; t++) {
+            mpz_t nu; mpz_init(nu); mpz_init(&de[t]);
+            const int j = left[(size_t)t * left.size() / k];
+            fail += !flint_ratrec(nu, &de[t], &Y[j], Q, nb, db);
+            mpz_clear(nu);
+        }
+        if (fail) { printf("FILE: RATREC failed\n"); return false; }
+        for (auto &z : de) { mpz_lcm(D, D, &z); mpz_clear(&z); }
+        own += k; todo.swap(left);
+    }
+    if (rounds) printf("  file: %d rounds, %d entries reconstructed on their own, D %zu bits\n", rounds, own, mpz_sizeinbase(D, 2));
+    if (rounds) {   // every numerator again with the final D (those that passed early were taken with a smaller one)
+        int bad = 0;
+#pragma omp parallel for schedule(dynamic, 16) reduction(+ : bad)
+        for (int j = 0; j < n; j++) {
+            mpz_mul(&num[j], &Y[j], D); mpz_mod(&num[j], &num[j], Q); if (mpz_cmp(&num[j], hq) > 0) mpz_sub(&num[j], &num[j], Q);
+            bad += (long)mpz_sizeinbase(&num[j], 2) >= nb;
+        }
+        if (bad) { printf("FILE: %d numerators above the bound with the final D\n", bad); return false; }
+    }
+    // reduce: the common denominator of the reduced fractions = D / gcd(D, all numerators)
+    mpz_t g; mpz_init_set(g, D);
+    for (int j = 0; j < n && mpz_cmp_ui(g, 1) > 0; j++) mpz_gcd(g, g, &num[j]);
+    if (mpz_cmp_ui(g, 1) > 0) { mpz_divexact(D, D, g); for (auto &z : num) mpz_divexact(&z, &z, g); }
+    mpz_clear(g);
+    size_t maxb = 0; double tot = 0;
+    for (auto &z : num) { maxb = std::max(maxb, mpz_sizeinbase(&z, 2)); tot += mpz_sizeinbase(&z, 2); }
+    // the check: y M = c mod q for two primes, M[i][k] = sum_j A[j][i][k] 256^j
+    bool ok = true;
+    for (uint64_t q : {2147483629ull, 2147483587ull}) {
+        const uint64_t dinv = invm(mpz_fdiv_ui(D, q), q);
+        std::vector<uint64_t> yq(n); for (int j = 0; j < n; j++) yq[j] = mpz_fdiv_ui(&num[j], q) * dinv % q;
+        int bad = 0;
+#pragma omp parallel for reduction(+ : bad)
+        for (int k = 0; k < n; k++) {
+            uint64_t s = 0;
+            for (int i = 0; i < n; i++) {
+                int64_t m = 0; for (int j = L - 1; j >= 0; j--) m = (m * 256 + A[(size_t)j * n * n + (size_t)i * n + k]) % (int64_t)q;
+                if (m < 0) m += q;
+                s = (s + yq[i] * (uint64_t)m) % q;
+            }
+            const uint64_t c = ((int64_t)gB[k] % (int64_t)q + q) % q;
+            bad += s != c;
+        }
+        printf("  file: y M = c mod %llu: %s\n", (unsigned long long)q, bad ? "MISMATCH" : "ok");
+        ok &= !bad;
+    }
+    const unsigned __int128 P = (1ull << 61) - 1; unsigned __int128 h = 0, rp = 1;
+    { const uint64_t dinv = [&] { uint64_t a = mpz_fdiv_ui(D, (unsigned long)P), r = 1, e = (uint64_t)P - 2; for (; e; e >>= 1, a = (uint64_t)((unsigned __int128)a * a % P)) if (e & 1) r = (uint64_t)((unsigned __int128)r * a % P); return r; }();
+      for (int j = 0; j < n; j++) {
+          mpz_t t; mpz_init(t); mpz_fdiv_r_ui(t, &num[j], (unsigned long)P);   // in [0, P)
+          const unsigned __int128 xj = (unsigned __int128)mpz_get_ui(t) * dinv % P; mpz_clear(t);
+          h = (h + xj * rp) % P; rp = rp * 1234567 % P;
+      } }
+    std::vector<double> xd(n);
+    for (int j = 0; j < n; j++) { long en, ed; const double a = mpz_get_d_2exp(&en, &num[j]), b = mpz_get_d_2exp(&ed, D); xd[j] = ldexp(a / b, (int)(en - ed)); }
+    std::string fn = std::string(gFile) + ".x"; FILE *f = fopen(fn.c_str(), "wb"); fwrite(xd.data(), 8, n, f); fclose(f);
+    printf("  file: solution x = num / D: D %zu bits, numerators up to %zu bits, %.1f Mbit in all, digest %016llx; %.3f s\n",
+           mpz_sizeinbase(D, 2), maxb, tot / 1e6, (unsigned long long)h, now() - t0);
+    for (auto &z : num) mpz_clear(&z);
+    mpz_clear(hq);
+    return ok;
+}
 
 static void det_mod_primes(int n, int Pb, const int8_t *dA, const std::vector<uint32_t> &pr, std::vector<uint32_t> &det,
                            std::vector<int> &bad) {
@@ -80,6 +203,13 @@ int main(int argc, char **argv) {
     if (L > 1 && method == 2) { printf("OZ_PLANES: methods 0 and 1 (FLINT's solve check takes int8)\n"); return 1; }
     std::vector<int8_t> A((size_t)L * n * n); uint64_t s = 12345;   // the same LCG as det_flint.cpp's main; plane 0 = the int8 matrix
     for (auto &a : A) { s = s * 6364136223846793005ull + 1442695040888963407ull; a = (int8_t)((s >> 33) % 255 - 127); }
+    if ((gFile = getenv("OZ_FILE"))) {   // a real system from bench/mm2oz.py: n and L must match its header
+        FILE *fi = fopen(gFile, "rb"); char mg[4]; int32_t hd[3];
+        if (!fi || fread(mg, 1, 4, fi) != 4 || memcmp(mg, "OZM1", 4) || fread(hd, 4, 3, fi) != 3 || hd[0] != n || hd[1] != L) { printf("OZ_FILE: header (n %d, L %d expected)\n", n, L); return 1; }
+        gB.resize(n);
+        if (fread(A.data(), 1, A.size(), fi) != A.size() || fread(gB.data(), 4, n, fi) != (size_t)n) { printf("OZ_FILE: short\n"); return 1; }
+        fclose(fi);
+    }
     if (kind == 1) for (int j = 0; j < L; j++) A[(size_t)j * n * n] = 0;   // a zero 1 x 1 leading minor (every plane)
     if (kind == 2) for (int j = 0; j < L; j++) for (int k = 0; k < n; k++) A[(size_t)j * n * n + (size_t)(n - 1) * n + k] = A[(size_t)j * n * n + k];   // singular: last row = first row
     // U unit upper, L unit lower, entries in [0, 127] off the diagonal: the same residues for every prime
@@ -167,6 +297,7 @@ int main(int argc, char **argv) {
         uint32_t p = 0; size_t pi = 0; oz::LiftPrimes lp{}; lp.s = S;
         bool singular = false;
         for (;; pi++) {   // 4 plain primes failing = a zero leading minor over Z, or det 0: precondition and try 8 more
+            if (pi == 4 && gFile && hol) { printf("OZ_FILE: a zero leading minor modulo 4 primes (the permutation of mm2oz.py did not take); HOL takes no preconditioner\n"); return 1; }
             if (pi == 4 && !gU) { make_pre(); w.preU = gU; w.preL = gL; }
             if (pi == 12) { singular = true; break; }
             std::vector<uint32_t> one(S, 1); std::vector<int> zero(S, 0), bads(S);
@@ -190,12 +321,12 @@ int main(int argc, char **argv) {
         if (hol) {   // row form y A = b: the same denominator (s_n of A and of A^T), numerators by Cramer on A^T (rows)
             t_inv = now() - t0;
             std::vector<int32_t> b(n); double bn = 0; uint64_t sb = 777;
-            for (int i = 0; i < n; i++) { sb = sb * 6364136223846793005ull + 1442695040888963407ull; b[i] = (int)((sb >> 33) % 255) - 127; bn += (double)b[i] * b[i]; }
+            for (int i = 0; i < n; i++) { sb = sb * 6364136223846793005ull + 1442695040888963407ull; b[i] = (int)((sb >> 33) % 255) - 127; if (gFile) b[i] = gB[i]; bn += (double)b[i] * b[i]; }
             nb = (long)ceil(hr - rmin + 0.5 * log2(bn)) + 2; db = (long)ceil(hb) + 2;
             double lgX = 0; for (int t = 0; t < S; t++) lgX += log2((double)lp.p[t]);
             const int N = (int)ceil((nb + db + 2) / lgX); steps = N;
             const double t1 = now(); int herr = 0; oz::HolStats hs;
-            std::vector<int16_t> dig = oz::hol_solve(w, dA, L, lp.p, S, qhol.data(), (int)qhol.size(), b.data(), N, zbits, hs, &herr);
+            std::vector<int16_t> dig = oz::hol_solve(w, dA, L, lp.p, S, qhol.data(), (int)qhol.size(), b.data(), N, zbits, hs, &herr, gFile ? n : 4);
             t_lift = now() - t1;
             if (oz::det_prof.on) printf("  HOL8 phases: Z^2 %.3f  bext %.3f  M %.3f  garner %.3f  AM %.3f  next %.3f  transpose %.3f s\n", hs.ph[0], hs.ph[1], hs.ph[2], hs.ph[3], hs.ph[4], hs.ph[5], hs.ph[6]);
             if (herr) { printf("HOL: a residue outside its bound\n"); return 1; }
@@ -203,6 +334,13 @@ int main(int argc, char **argv) {
                    S, qhol.size(), N, hs.levels, hs.gemms, hs.gemms8, hs.W, hs.WQ, hs.init, hs.rchain, hs.cchain);
             t2 = now();
             const int sN = S * N;
+            mpz_set_ui(Q, 1); for (int t = 0; t < S; t++) mpz_mul_ui(Q, Q, lp.p[t]);
+            mpz_pow_ui(Q, Q, N);
+            if (gFile) {   // every entry, by halves; the first four go on to the reconstruction below
+                file_convert(dig, n, S, lp.p, N, Q, gY);
+                for (int j = 0; j < 4; j++) mpz_set(&x4[j], &gY[j]);
+                printf("  file: %d entries converted in %.3f s\n", n, now() - t2);
+            } else {
 #pragma omp parallel for
             for (int j = 0; j < 4; j++)   // Horner over the positions from the top: x = x p_(e mod S) + d_e
                 for (int e = sN - 1; e >= 0; e--) {
@@ -210,9 +348,8 @@ int main(int argc, char **argv) {
                     const int d = dig[(size_t)e * 4 + j];
                     if (d >= 0) mpz_add_ui(&x4[j], &x4[j], d); else mpz_sub_ui(&x4[j], &x4[j], -d);
                 }
-            mpz_set_ui(Q, 1); for (int t = 0; t < S; t++) mpz_mul_ui(Q, Q, lp.p[t]);
-            mpz_pow_ui(Q, Q, N);
             for (auto &v : x4) mpz_mod(&v, &v, Q);
+            }
         } else {
         uint16_t *Ai;
         if (n <= 16384) {
@@ -416,6 +553,7 @@ int main(int argc, char **argv) {
         }
         mpz_clear(hq); for (auto &v : x4) mpz_clear(&v);
         dbits = mpz_sizeinbase(D, 2); t_rr = now() - t2;
+        if (gFile) { if (!file_solution(n, L, A, gY, D, Q, nb, db)) return 1; dbits = mpz_sizeinbase(D, 2); }
 
         // 4. c = det / d from as many primes as the bound / d needs: |c| < 2^(ub - dbits + 1). ub: the proved bound of
         // src/ozaki_detbound.cuh (a few bits above log2 |det|), or Hadamard (below n = 4096, where cuSOLVER's ~0.3 s setup costs more than the primes it saves; OZ_HADAMARD=1; or FP32 LU finds A singular)
