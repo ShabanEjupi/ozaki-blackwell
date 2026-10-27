@@ -794,7 +794,9 @@ data is wholly public is IFM's K2-Think-V2 (72.6 B, TxT360 ODC-BY); OLMo-2-0325-
 training data (4.6 T tokens) is indexed for public lookup (infini-gram). `llm/dense.cu` runs both dense models exact;
 `llm/olmo_trace.py` finds every maximal span of an output in that data ("The capital of Kosovo is Pristina": 224 times,
 a DCLM page from graphicmaps.com); `--index v4_dclm-baseline_llama` looks Ultra's text up in the public web it was drawn
-from. Queued (`llm/chain_open.sh`): OLMo 2 exact + traced, then K2-Think-V2 after SPEX pass 3.
+from: in Ultra's exact English continuation the longest span found verbatim is 9 words, "Pristina is the capital and
+largest city of Kosovo." (11 times; one source albbnb.com), with nine shorter ones of 5–6 words. Queued
+(`llm/chain_open.sh`): OLMo 2 exact + traced, then K2-Think-V2 after SPEX pass 3.
 
 **SQ** — Nemotron 3 Ultra i tërë (560 miliardë parametra) punon në laptop nga disku, token pas tokeni, me çdo prodhim
 matricë-vektor të rrumbullakosur saktë (një rrumbullakim i certifikuar, i provuar kundër një akumuluesi 2 560-bit; prova e
