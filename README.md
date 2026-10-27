@@ -645,7 +645,7 @@ of the primes; at 128-bit entries (23 primes) the chain left its bound. The wiri
 Layer 5 end to end, real weights (62 routed experts fetched on demand by `llm/k3_fetch.py`, the gate, the latent down/up
 projections, the norm, the two shared experts): router → 16 experts (w1, w3, SiTU, w2) → weighted sum → RMSNorm → up
 projection → + shared experts. Exact path: every matrix product correctly rounded to BF16 (the router to FP32), the
-weighted sum and RMSNorm in FP64 in a fixed order, rounded once. Engine path: BF16 tensor cores with FP32 accumulation,
+weighted sum and RMSNorm in FP64 in a fixed order (deterministic, not exact), then rounded to BF16. Engine path: BF16 tensor cores with FP32 accumulation,
 results cast to BF16, float reductions. 4 tokens (Student-t hidden states through the real post-attention norm):
 
 | | |
