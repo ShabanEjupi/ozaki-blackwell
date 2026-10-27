@@ -746,3 +746,12 @@ per layer with a BF16 gate); exact ties are broken by index here, and an engine'
 **SQ** — Ruteri i Ultra-s: porta FP32 ndahet saktë në 3 BF16 dhe logit-et dalin të rrumbullakosura saktë në 91 ms. Logit-et
 FP32 të zakonshme janë 90–97 % jo të sakta, por rrugëzimi ndryshon vetëm 1 herë në 16 384 vendime (≈ 1 token në 340 në
 gjithë 48 shtresat).
+
+#### A whole routed MoE block of Ultra, exact (`llm/moe_nv.cu`)
+
+Layer 49, real weights, experts fetched on demand: exact router (FP32 gate as three BF16) → top-22 → `fc1_latent_proj`
+(correctly rounded to BF16) → each expert's NVFP4 up → relu² → down (correctly rounded) → weighted sum in FP64 in expert
+order → `fc2_latent_proj` (correctly rounded to BF16). Engine path: FP32 router, BF16 tensor cores with FP32 accumulation,
+the native NVFP4 instruction, FP32 sum, split-K 1 or 4. 4 tokens (Student-t through the real norm), 75 experts: exact
+products not certified 0; **each token alone vs in the batch: 0 of 32 768 BF16 outputs differ**; engine split-K 1 vs 4:
+35 differ (0.1 %); engine vs exact: 37 (0.1 %). The shared expert (FP8 W8A8) is not in it yet.

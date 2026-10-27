@@ -560,6 +560,7 @@ static float *project(const std::string &dir, const std::string &pre, int M, int
     return Y;
 }
 
+#ifndef NV_NO_MAIN   // llm/moe_nv.cu includes the kernels above
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "out_nv <dir> <expert prefix> <N> [seed] [outdir]\n"); return 1; }
     std::string dir = argv[1], pre = argv[2];
@@ -585,3 +586,4 @@ int main(int argc, char **argv) {
     CK(cudaFree(Yup)); CK(cudaFree(Ydn));
     return 0;
 }
+#endif
