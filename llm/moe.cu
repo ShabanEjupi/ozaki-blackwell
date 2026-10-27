@@ -171,7 +171,7 @@ int main(int argc, char **argv) {
         std::vector<double> acc((size_t)n * HL, 0.0); std::vector<float> accf((size_t)n * HL, 0.f);
         std::map<int, std::vector<std::pair<int, float>>> by;   // expert -> (row in batch, weight)
         for (int a = 0; a < n; a++) for (int k = 0; k < 16; k++) by[Rv[a].e[k]].push_back({a, Rv[a].w[k]});
-        // exact: per token, the 16 terms added in expert order (fixed); engine: float, in routing order like the reference
+        // per token the 16 terms are added in expert order: exact in FP64 (each term exact), the engine in float
         std::vector<std::vector<std::pair<int, std::vector<uint16_t>>>> outs(n);
         for (auto &[e, list] : by) {
             const std::string ep = pre + "block_sparse_moe.experts." + std::to_string(e) + ".";
