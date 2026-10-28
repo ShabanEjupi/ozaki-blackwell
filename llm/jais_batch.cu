@@ -15,6 +15,7 @@
 //    prefill pass plus one pass per new token. OZ_PERPROMPT=1 ends each prompt at its own length + new tokens (a benchmark);
 //    by default all run to max length + new tokens, as out_jais does.
 //  * OZ_SCORE=id,id,...: for the last position of each prompt also print those logits (multiple choice: the letters).
+//  * OZ_GATT=1: attention on the GPU FP64 units (gatt), bit for bit attend_p; OZ_GATT=2 runs both and counts outputs that differ.
 // nvcc -O3 -arch=sm_120a -std=c++17 -Xcompiler -fopenmp -o out_jais_batch llm/jais_batch.cu -lgomp
 // out_jais_batch <model dir> <prompts file: token ids per line> <new tokens> [--validate]
 #define JAIS_LIB
@@ -109,9 +110,85 @@ static DevW fp8w(const std::string &name, int M, int K) {
     DevW W = load_w(name + ".weight", F_E4M3B, M, K); to_dev(name + ".weight_scale", dS); W.sw = (uint8_t *)dS; return W;
 }
 
+// ---- attention on the GPU (OZ_GATT=1; OZ_GATT=2 also runs attend_p and compares every output bit for bit) -----------------
+// The two long sums of attend_p go to the FP64 units in the host's own order: the scores q.k / sqrt(hd) (a product of two
+// floats is exact in double, so the order of the adds is all there is) and a = sum_u p_u v_u (__dmul_rn, __dadd_rn: no
+// contraction, as the host build, which has no FMA). The softmax between them (max, exp, the sum) stays on the host, the same
+// libm exp on the same doubles, so each output bf(a / den) is the float attend_p gives.
+__global__ void att_scores(const float *q, const float *K, const size_t *koff, const size_t *soff, const unsigned *T,
+                           int nq, int nkv, int hd, double rs, double *sc) {
+    extern __shared__ double qs[];
+    int r = blockIdx.x, hq = blockIdx.y, g = hq / (nq / nkv);
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) qs[d] = q[((size_t)r * nq + hq) * hd + d];
+    __syncthreads();
+    const float *Kr = K + koff[r]; double *s = sc + soff[r] + (size_t)hq * T[r];
+    for (unsigned u = threadIdx.x; u < T[r]; u += blockDim.x) {
+        const float *k = Kr + ((size_t)u * nkv + g) * hd; double a = 0;
+        for (int d = 0; d < hd; d++) a = __dadd_rn(a, __dmul_rn(qs[d], (double)k[d]));
+        s[u] = __ddiv_rn(a, rs);
+    }
+}
+__global__ void att_values(const double *p, const float *V, const size_t *koff, const size_t *soff, const unsigned *T,
+                           int nq, int nkv, int hd, double *out) {
+    int r = blockIdx.x, hq = blockIdx.y, g = hq / (nq / nkv), d = threadIdx.x;
+    const float *Vr = V + koff[r] + (size_t)g * hd + d; const double *pr = p + soff[r] + (size_t)hq * T[r]; double a = 0;
+    for (unsigned u = 0; u < T[r]; u++) a = __dadd_rn(a, __dmul_rn(pr[u], (double)Vr[(size_t)u * nkv * hd]));
+    out[((size_t)r * nq + hq) * hd + d] = a;
+}
+static int GATT; static double t_att; static long long st_attdiff;
+static float *ga_q, *ga_k, *ga_v; static double *ga_s, *ga_o, *ga_hs, *ga_ho; static size_t *ga_koff, *ga_soff; static unsigned *ga_T;
+static size_t GA_ROWS = 4096, GA_SC = (size_t)48 << 20, GA_KV;
+static void gatt_init(size_t maxrows) {
+    size_t QD = (size_t)D_Q * D_HD; GA_KV = maxrows * D_KV * D_HD;
+    CK(cudaMalloc(&ga_q, GA_ROWS * QD * 4)); CK(cudaMalloc(&ga_k, GA_KV * 4)); CK(cudaMalloc(&ga_v, GA_KV * 4));
+    CK(cudaMalloc(&ga_s, GA_SC * 8)); CK(cudaMalloc(&ga_o, GA_ROWS * QD * 8));
+    CK(cudaMallocHost(&ga_hs, GA_SC * 8)); CK(cudaMallocHost(&ga_ho, GA_ROWS * QD * 8));
+    CK(cudaMalloc(&ga_koff, GA_ROWS * 8)); CK(cudaMalloc(&ga_soff, GA_ROWS * 8)); CK(cudaMalloc(&ga_T, GA_ROWS * 4));
+}
+// o[r] = attention of row r (prompt rows[r].first, position rows[r].second) over its prompt's cache of layer L
+static void gatt(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>> &rows, int L, const std::vector<float> &q, std::vector<float> &o) {
+    auto t0 = std::chrono::steady_clock::now();
+    size_t R = rows.size(), QD = (size_t)D_Q * D_HD;
+    std::vector<size_t> base(S.size(), SIZE_MAX); size_t kv = 0;   // each prompt's cache once, concatenated
+    for (auto &rw : rows) if (base[rw.first] == SIZE_MAX) {
+        auto &s = S[rw.first]; base[rw.first] = kv;
+        if (kv + s.kc[L].size() > GA_KV) { fprintf(stderr, "gatt: the caches of a pass exceed %zu values\n", GA_KV); exit(1); }
+        CK(cudaMemcpy(ga_k + kv, s.kc[L].data(), s.kc[L].size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(ga_v + kv, s.vc[L].data(), s.vc[L].size() * 4, cudaMemcpyHostToDevice)); kv += s.kc[L].size();
+    }
+    double rs = sqrt((double)D_HD);
+    for (size_t r0 = 0; r0 < R;) {   // groups of rows whose scores fit GA_SC
+        size_t r1 = r0, ns = 0; std::vector<size_t> koff, soff; std::vector<unsigned> T;
+        while (r1 < R && r1 - r0 < GA_ROWS && ns + (rows[r1].second + 1) * D_Q <= GA_SC) {
+            koff.push_back(base[rows[r1].first]); soff.push_back(ns); T.push_back(rows[r1].second + 1); ns += (rows[r1].second + 1) * D_Q; r1++; }
+        if (r1 == r0) { fprintf(stderr, "gatt: one row's scores exceed %zu\n", GA_SC); exit(1); }
+        size_t n = r1 - r0;
+        CK(cudaMemcpy(ga_q, q.data() + r0 * QD, n * QD * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(ga_koff, koff.data(), n * 8, cudaMemcpyHostToDevice)); CK(cudaMemcpy(ga_soff, soff.data(), n * 8, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(ga_T, T.data(), n * 4, cudaMemcpyHostToDevice));
+        att_scores<<<dim3(n, D_Q), 128, D_HD * 8>>>(ga_q, ga_k, ga_koff, ga_soff, ga_T, D_Q, D_KV, D_HD, rs, ga_s);
+        CK(cudaMemcpy(ga_hs, ga_s, ns * 8, cudaMemcpyDeviceToHost));
+        std::vector<double> den(n * D_Q);
+        #pragma omp parallel for schedule(dynamic, 16)
+        for (size_t i = 0; i < n * D_Q; i++) {   // the softmax of attend_p, on its doubles
+            size_t j = i / D_Q; double *v = ga_hs + soff[j] + (i % D_Q) * T[j], mx = -1e300, dn = 0;
+            for (unsigned u = 0; u < T[j]; u++) mx = std::max(mx, v[u]);
+            for (unsigned u = 0; u < T[j]; u++) { v[u] = exp(v[u] - mx); dn += v[u]; }
+            den[i] = dn;
+        }
+        CK(cudaMemcpy(ga_s, ga_hs, ns * 8, cudaMemcpyHostToDevice));
+        att_values<<<dim3(n, D_Q), D_HD>>>(ga_s, ga_v, ga_koff, ga_soff, ga_T, D_Q, D_KV, D_HD, ga_o);
+        CK(cudaGetLastError()); CK(cudaMemcpy(ga_ho, ga_o, n * QD * 8, cudaMemcpyDeviceToHost));
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n * QD; i++) o[r0 * QD + i] = bf(ga_ho[i] / den[i / D_HD]);
+        r0 = r1;
+    }
+    t_att += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
 // one pass: rows (sequence, position), in increasing position within a sequence; logits for the rows marked in want
 static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>> &rows, const std::vector<bool> &want) {
-    auto t0 = std::chrono::steady_clock::now(); double d0 = t_disk, b0 = bytes_disk, g0 = t_gemm;
+    auto t0 = std::chrono::steady_clock::now(); double d0 = t_disk, b0 = bytes_disk, g0 = t_gemm, a0 = t_att;
     size_t R = rows.size(), QD = (size_t)D_Q * D_HD, KVD = (size_t)D_KV * D_HD;
     auto part0 = [&](int L) {   // read-ahead (OZ_AHEAD): a layer's tensors before routing, in the order they are used
         std::string P = "model.layers." + std::to_string(L) + ".";
@@ -139,12 +216,18 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
             s.vc[L].insert(s.vc[L].end(), v.begin() + r * KVD, v.begin() + (r + 1) * KVD);
         }
         std::vector<float> o(R * QD);
-        auto att = [&](size_t r, bool par) { auto &s = S[rows[r].first];
-            attend_p(q.data() + r * QD, s.kc[L].data(), s.vc[L].data(), rows[r].second + 1, D_Q, D_KV, D_HD, o.data() + r * QD, par); };
-        if (R >= 16) {
-            #pragma omp parallel for schedule(dynamic)
-            for (size_t r = 0; r < R; r++) att(r, false);
-        } else for (size_t r = 0; r < R; r++) att(r, true);
+        if (GATT) gatt(S, rows, L, q, o);
+        if (GATT != 1) {
+            auto ta = std::chrono::steady_clock::now(); std::vector<float> oh(R * QD);
+            auto att = [&](size_t r, bool par) { auto &s = S[rows[r].first];
+                attend_p(q.data() + r * QD, s.kc[L].data(), s.vc[L].data(), rows[r].second + 1, D_Q, D_KV, D_HD, oh.data() + r * QD, par); };
+            if (R >= 16) {
+                #pragma omp parallel for schedule(dynamic)
+                for (size_t r = 0; r < R; r++) att(r, false);
+            } else for (size_t r = 0; r < R; r++) att(r, true);
+            if (GATT) for (size_t i = 0; i < o.size(); i++) st_attdiff += memcmp(&o[i], &oh[i], 4) != 0;
+            o.swap(oh); if (!GATT) t_att += std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
+        }
         W = load_w(P + "self_attn.o_proj.weight", F_BF16, D_H, QD); add_rows(h, bmm(W, o));
         x = norm_rows(h, N2[L]);
         std::vector<float> out;
@@ -207,8 +290,9 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
     }
     fflush(stdout);
     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    fprintf(stderr, "pass %zu rows: %.1f s (disk %.1f s, %.1f GB; products %.1f s), fixup %lld, host GEMV rows %lld, uncertified %lld\n",
-            R, sec, t_disk - d0, (bytes_disk - b0) / 1e9, t_gemm - g0, st_fix, st_host, st_bad);
+    fprintf(stderr, "pass %zu rows: %.1f s (disk %.1f s, %.1f GB; products %.1f s; attention %.1f s %s), fixup %lld, host GEMV rows %lld, uncertified %lld%s\n",
+            R, sec, t_disk - d0, (bytes_disk - b0) / 1e9, t_gemm - g0, t_att - a0, GATT == 1 ? "GPU" : GATT ? "GPU + host" : "host",
+            st_fix, st_host, st_bad, GATT == 2 ? (", attention outputs differing GPU/host " + std::to_string(st_attdiff)).c_str() : "");
 }
 
 int main(int argc, char **argv) {
@@ -231,6 +315,8 @@ int main(int argc, char **argv) {
     void *dLM; CK(cudaMalloc(&dLM, (size_t)D_V * D_H * 2)); LM = load_w("lm_head.weight", F_BF16, D_V, D_H, dLM);
     if (const char *a = getenv("OZ_AHEAD")) { ahead.start((size_t)(atof(a) * 1e9)); fprintf(stderr, "read-ahead ring %.1f GB\n", atof(a)); }
     bmm_init((size_t)std::max(D_FF, 16384) * D_H, std::max(D_FF, D_Q * D_HD), std::max(D_FF, 16384));
+    GATT = getenv("OZ_GATT") ? atoi(getenv("OZ_GATT")) : 0;
+    if (GATT) { size_t mr = CHUNK; for (auto &s : all) mr = std::max(mr, s.end); gatt_init(mr); }
     bool whole = idx.count("model.norm.weight");
     NORMF = whole ? vec_bf16("model.norm.weight") : std::vector<float>(D_H, 1.f);
     N1.resize(NL); N2.resize(NL); BIAS.resize(NL);
@@ -256,8 +342,8 @@ int main(int argc, char **argv) {
         for (auto &s : S) { s.kc.clear(); s.vc.clear(); done.push_back(std::move(s)); }
         c0 = c1;
     }
-    printf("batched: %lld rows; BF16 outputs %lld, left to the fixup %lld (%.4f%%); FP32 logits %lld, fixup %lld (%.4f%%); host GEMV rows %lld\n",
-           st_rows, st_outs, st_fix, 100.0 * st_fix / std::max(1LL, st_outs), st_outs24, st_fix24, 100.0 * st_fix24 / std::max(1LL, st_outs24), st_host);
+    printf("batched: %lld rows; BF16 outputs %lld, left to the fixup %lld (%.4f%%); FP32 logits %lld, fixup %lld (%.4f%%); host GEMV rows %lld; attention outputs differing GPU/host %lld\n",
+           st_rows, st_outs, st_fix, 100.0 * st_fix / std::max(1LL, st_outs), st_outs24, st_fix24, 100.0 * st_fix24 / std::max(1LL, st_outs24), st_host, st_attdiff);
     ahead.finish();
     report(done);
 }
