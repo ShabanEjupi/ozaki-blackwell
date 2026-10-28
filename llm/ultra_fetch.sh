@@ -4,9 +4,12 @@
 # that Hugging Face lists (lfs.oid); a file is renamed into place only when its hash matches. Run by the scheduled task
 # ozaki-ultra-fetch (Shaban, 27-10-2026: "at home, however long it takes"); progress in /opt/ozaki/nv/full/fetch.log.
 # Any other repository: R=<org/name> D=<folder> (27-10: allenai/OLMo-2-0325-32B-Instruct, whose whole training data is indexed by infini-gram).
-# MINFREE=<GB>: before each file wait until the disk keeps MINFREE GB free after it (27-10: Jais-3 FP8 starts in the space K2 leaves and finishes after Ultra is deleted).
+# MINFREE=<GB>: before each file wait until the disk keeps MINFREE GB free after it, counted on the smaller of the WSL disk
+# and Windows C: (/mnt/c) -- the ext4.vhdx grows on C:, and on 27-10 18:52 it filled C: while df inside still showed 252 GB
+# free: the VM died, then would not start (28-10). Space freed inside comes back to C: only after fstrim + diskpart compact.
 R=${R:-nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4}; D=${D:-/opt/ozaki/nv/full}; mkdir -p $D; cd $D
 log() { echo "$(date '+%F %T') $*" >> $D/fetch.log; }
+avail() { local a b; a=$(df -B1 --output=avail $D | tail -1); b=$(df -B1 --output=avail /mnt/c 2>/dev/null | tail -1); echo $(( b > 0 && b < a ? b : a )); }
 curl -sf "https://huggingface.co/api/models/$R/tree/main?recursive=true" -o tree.json || { log "tree failed"; exit 1; }
 python3 -I -c '
 import json
@@ -16,8 +19,8 @@ log "start: $(wc -l < files.txt) files, $(awk '{s+=$2} END {printf "%.1f GB", s/
 while read -r p size sha; do
     [ -f "$p" ] && [ "$(stat -c %s "$p")" = "$size" ] && continue
     mkdir -p "$(dirname "$p")"
-    w=0; while [ $(( $(df -B1 --output=avail $D | tail -1) - size )) -lt $(( ${MINFREE:-0} * 1000000000 )) ]; do
-        [ $w = 0 ] && log "$p: waiting for disk space ($(df -h --output=avail $D | tail -1) free, MINFREE ${MINFREE}G)"; w=1; sleep 300; done
+    w=0; while [ $(( $(avail) - size )) -lt $(( ${MINFREE:-0} * 1000000000 )) ]; do
+        [ $w = 0 ] && log "$p: waiting for disk space ($(( $(avail) / 1000000000 )) GB free, MINFREE ${MINFREE}G)"; w=1; sleep 300; done
     for try in 1 2 3 4 5; do
         curl -sfL -C - --retry 20 --retry-delay 10 -o "$p.part" "https://huggingface.co/$R/resolve/main/$p"
         [ "$(stat -c %s "$p.part" 2>/dev/null)" = "$size" ] && break

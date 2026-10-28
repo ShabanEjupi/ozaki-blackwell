@@ -4,7 +4,9 @@
 # 1. when K2-Think-V2 is downloaded: exact vs engine s=1/s=4 on the three prompts (OLMo 2 ran on 27-10);
 # 2. Nemotron 3 Ultra run2 with read-ahead (OZ_AHEAD=3) on the same prompts as run1; when it exits 0, uncertified 0 and its
 #    exact transcripts equal run1's token for token, the 329 GiB of Ultra shards are deleted (Shaban, 27-10: "Ultra is
-#    deleted after run2") so the Jais-3 FP8 download (ozaki-jais-fetch, waits for disk space) can finish.
+#    deleted after run2") so the Jais-3 FP8 download (ozaki-jais-fetch, waits for disk space) can finish. The space
+#    comes back to Windows C: only offline: fstrim here, then compact.request asks the Windows task ozaki-compact for
+#    wsl --shutdown + diskpart compact vdisk, after which it restarts ozaki-jais-fetch (28-10: the vhdx had filled C:).
 # /opt/ozaki/chain.busy exists while the chain computes: the SPEX job (/opt/ozaki/job/run.sh, evenings) waits for it, so its
 # timings are taken on an idle machine. Frozen copy in /opt/ozaki/chain (binaries + scripts); log /opt/ozaki/chain/chain.log;
 # a heartbeat every minute in /opt/ozaki/heartbeat (the second the VM dies, with memory and VRAM in use).
@@ -27,6 +29,7 @@ same=$(cmp -s <(grep "^seq prompt . mode 0:" run1.log) <(grep "^seq prompt . mod
 log "ultra run2 rc=$rc, $(grep '^uncertified' run2.log), exact transcripts equal to run1: $same"
 if [ $rc = 0 ] && grep -q "^uncertified 0$" run2.log && [ $same = yes ]; then
     rm -f $NV/*.safetensors; log "ultra shards deleted, $(df -h --output=avail /opt/ozaki | tail -1) free"
+    log "$(fstrim -v / 2>&1)"; touch /mnt/c/Users/NB/model-lokal/wsl/compact.request
 fi
 rm -f $B
 log "chain done"
