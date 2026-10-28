@@ -62,6 +62,7 @@ int main(int argc, char **argv) {
       J_RHD = cfgnum(s, "rope_head_dim", D_HD); J_RSF = cfgnum(s, "router_scaling_factor", 1); }
     NORM_ONCE = true; rope_init(J_RHD);
     int NL = 0; while (idx.count("model.layers." + std::to_string(NL) + ".self_attn.q_proj.weight")) NL++;
+    if (const char *n = getenv("OZ_LAYERS")) NL = std::min(NL, atoi(n));   // the first n layers only (smoke tests)
     std::vector<bool> moe(NL); for (int L = 0; L < NL; L++) moe[L] = idx.count("model.layers." + std::to_string(L) + ".mlp.gate.weight");
     std::vector<OSeq> seqs;
     { std::ifstream f(argv[2]); std::string line; int pi = 0;
