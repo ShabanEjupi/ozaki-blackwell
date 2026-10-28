@@ -81,8 +81,7 @@ int main(int argc, char **argv) {
     DIR = argv[1]; int NEW = atoi(argv[3]);
     std::vector<int> modes{0, 1, 4};
     if (argc > 4) { modes.clear(); std::stringstream ss(argv[4]); std::string t; while (std::getline(ss, t, ',')) modes.push_back(atoi(t.c_str())); }
-    { std::ifstream f(DIR + "/index.txt"); std::string nm, dt, sh, fl; size_t off, n;
-      while (f >> nm >> dt >> sh >> fl >> off >> n) idx[nm] = {dt, fl, off, n}; }
+    read_index();
     { std::ifstream f(DIR + "/config.json"); std::string s((std::istreambuf_iterator<char>(f)), {});
       D_H = cfgnum(s, "hidden_size", 0); D_Q = cfgnum(s, "num_attention_heads", 0); D_KV = cfgnum(s, "num_key_value_heads", D_Q);
       D_HD = cfgnum(s, "head_dim", D_H / D_Q); D_FF = cfgnum(s, "intermediate_size", 0); D_V = cfgnum(s, "vocab_size", 0);

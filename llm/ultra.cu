@@ -203,6 +203,10 @@ struct TI { std::string dt, file; size_t off, n; };
 static std::unordered_map<std::string, TI> idx;
 static std::map<std::string, int> fds;
 static std::string DIR;
+static void read_index() {   // DIR/index.txt (llm/ultra_index.py): name dtype shape file offset nbytes
+    std::ifstream f(DIR + "/index.txt"); std::string nm, dt, sh, fl; size_t off, n;
+    while (f >> nm >> dt >> sh >> fl >> off >> n) idx[nm] = {dt, fl, off, n};
+}
 static uint8_t *pin; static size_t PIN = (size_t)300 << 20;
 static double t_disk = 0, bytes_disk = 0;
 static void readt(const std::string &name, void *dst, size_t want = 0) {
@@ -457,8 +461,7 @@ int main(int argc, char **argv) {
     DIR = argv[1]; int NEW = atoi(argv[3]);
     std::vector<int> modes{0, 1, 4};
     if (argc > 4) { modes.clear(); std::stringstream ss(argv[4]); std::string t; while (std::getline(ss, t, ',')) modes.push_back(atoi(t.c_str())); }
-    { std::ifstream f(DIR + "/index.txt"); std::string nm, dt, sh, fl; size_t off, n;
-      while (f >> nm >> dt >> sh >> fl >> off >> n) idx[nm] = {dt, fl, off, n}; }
+    read_index();
     std::vector<std::string> types;
     { std::ifstream f(DIR + "/config.json"); std::string s((std::istreambuf_iterator<char>(f)), {});
       size_t a = s.find("\"layers_block_type\""), b = s.find(']', a); std::string l = s.substr(a, b - a);

@@ -30,13 +30,30 @@ static std::vector<float> swiglu(const std::vector<float> &g, const std::vector<
     return a;
 }
 
+// --check <model dir> <tensor without .weight> <M> <K> <out dir>: one FP8 block-scaled map on a fixed wide-range input,
+// exact to BF16 and to FP32; x and both outputs as float32 files for llm/jais_check.py, which shares no code with this.
+static int check(int argc, char **argv) {
+    DIR = argv[2]; std::string T = argv[3], out = argv[6]; int M = atoi(argv[4]), K = atoi(argv[5]);
+    read_index();
+    CK(cudaMallocHost(&pin, PIN)); CK(cudaMalloc(&dW, (size_t)M * K)); CK(cudaMalloc(&dS, (size_t)8 << 20));
+    CK(cudaMalloc(&dxm, K * 4)); CK(cudaMalloc(&dxe, K * 2)); CK(cudaMalloc(&dy, M * 4)); CK(cudaMalloc(&dbad, 4));
+    std::vector<float> x(K); for (int k = 0; k < K; k++) x[k] = bf(sin(0.37 * k + 1.0) * exp2(k % 29 - 14));   // tiny groups too
+    DevW W = load_w(T + ".weight", F_E4M3B, M, K); to_dev(T + ".weight_scale", dS); W.sw = (uint8_t *)dS;
+    Act a = act_fp8g(x); auto y8 = gemv(W, a, 8, 0), y24 = gemv(W, a, 24, 0);
+    auto save = [&](const char *n, const std::vector<float> &v) { FILE *f = fopen((out + "/" + n).c_str(), "wb"); fwrite(v.data(), 4, v.size(), f); fclose(f); };
+    save("x.f32", x); save("y8.f32", y8); save("y24.f32", y24);
+    FILE *f = fopen((out + "/meta.txt").c_str(), "w"); fprintf(f, "%s %d %d %lld\n", T.c_str(), M, K, st_bad); fclose(f);
+    fprintf(stderr, "%s: %d x %d, uncertified %lld\n", T.c_str(), M, K, st_bad);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 6 && !strcmp(argv[1], "--check")) return check(argc, argv);
     if (argc < 4) { fprintf(stderr, "usage: out_jais <model dir> <prompts> <new tokens> [modes]\n"); return 1; }
     DIR = argv[1]; int NEW = atoi(argv[3]);
     std::vector<int> modes{0, 1, 4};
     if (argc > 4) { modes.clear(); std::stringstream ss(argv[4]); std::string t; while (std::getline(ss, t, ',')) modes.push_back(atoi(t.c_str())); }
-    { std::ifstream f(DIR + "/index.txt"); std::string nm, dt, sh, fl; size_t off, n;
-      while (f >> nm >> dt >> sh >> fl >> off >> n) idx[nm] = {dt, fl, off, n}; }
+    read_index();
     { std::ifstream f(DIR + "/config.json"); std::string s((std::istreambuf_iterator<char>(f)), {});
       D_H = cfgnum(s, "hidden_size", 0); D_Q = cfgnum(s, "num_attention_heads", 0); D_KV = cfgnum(s, "num_key_value_heads", D_Q);
       D_HD = cfgnum(s, "head_dim", D_H / D_Q); D_FF = cfgnum(s, "intermediate_size", 0); D_V = cfgnum(s, "vocab_size", 0);
