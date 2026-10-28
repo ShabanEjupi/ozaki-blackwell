@@ -15,6 +15,8 @@ python3 -I -c '
 import json
 for f in json.load(open("tree.json")):
     if f.get("type") == "file": print(f["path"], f["size"], (f.get("lfs") or {}).get("oid", "-"))' > files.txt
+# small files first (config, tokenizer: a partly downloaded checkpoint can already be tokenized for and smoke-tested), shards in order
+{ awk '$2 < 100000000' files.txt; awk '$2 >= 100000000' files.txt; } > files.sorted && mv files.sorted files.txt
 log "start: $(wc -l < files.txt) files, $(awk '{s+=$2} END {printf "%.1f GB", s/1e9}' files.txt)"
 while read -r p size sha; do
     [ -f "$p" ] && [ "$(stat -c %s "$p")" = "$size" ] && continue
