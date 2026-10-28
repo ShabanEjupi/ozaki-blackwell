@@ -3,6 +3,8 @@
 # transformers does: its {% generation %} tag is a no-op outside training), tokenized with tokenizer.json (the template
 # writes the BOS itself). Writes <out>.ids (one prompt per line), <out>.gt (the answer letters) and prints the ids of the
 # answer letters for OZ_SCORE.
+# PREFIX="The answer is": appended after that, since even then the model starts reasoning in the answer ("The user is
+# asking ...", 10 tokens of 148 prompts) and the letter would come hundreds of tokens later.
 # NOTHINK=1: the assistant turn opened with an empty thinking block, as the template itself writes one
 # ("<ifm|think>\n</ifm|think>" + content), so the next token is the answer: its A-D logits are read in one pass.
 # python3 -I llm/cti_prep.py <model dir> <cti-mcq.tsv> <chat_template.jinja> <out prefix> [first n]
@@ -31,6 +33,7 @@ with open(out + ".ids", "w") as fi, open(out + ".gt", "w") as fg:
     for i, r in enumerate(rows):
         s = t.render(messages=[{"role": "user", "content": r["Prompt"]}], add_generation_prompt=True, bos_token="<|ifm|begin_of_text|>")
         if os.environ.get("NOTHINK") == "1": s += "</ifm|think>"
+        s += os.environ.get("PREFIX", "")   # an answer prefix, e.g. "The answer is": the letter is the next token
         ids = tok.encode(s, add_special_tokens=False).ids
         if i == 0: sys.stderr.write(repr(s[-400:]) + "\n" + str(ids[:3]) + " ... " + str(ids[-12:]) + "\n")
         print(*ids, file=fi); print(r["GT"].strip().upper(), file=fg)
