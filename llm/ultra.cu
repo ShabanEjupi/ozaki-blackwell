@@ -38,7 +38,7 @@
 
 constexpr int H = 8192, VOC = 131072, MH = 256, MD = 64, MN = 128, NG = 8, DIN = 16384, CONV = 18432, LAT = 2048,
               E = 512, TOPK = 22, NQ = 64, NKV = 2, HD = 128;
-enum { F_BF16, F_F32, F_E4M3, F_NVFP4 };
+enum { F_BF16, F_F32, F_E4M3, F_NVFP4, F_E4M3B = 5 };   // 4 = the logits slot of the shadow statistics
 
 // ---- the GEMV --------------------------------------------------------------------------------------------------------
 struct DevW { const void *w; const uint8_t *sw; int fmt, M, K; unsigned long long Gm; int Ge; float Gf; };
@@ -53,6 +53,10 @@ __host__ __device__ inline void wdec(const DevW &W, int row, int k, int &m, int 
     } else if (W.fmt == F_E4M3) {
         uint8_t b = ((const uint8_t *)W.w)[i]; int ex = (b >> 3) & 15, f = b & 7;
         m = ex ? 8 + f : f; e = ex ? ex - 10 : -9; if (b >> 7) m = -m;
+    } else if (W.fmt == F_E4M3B) {   // FP8 E4M3 times the BF16 scale of its 128x128 block (compressed-tensors "block")
+        uint8_t b = ((const uint8_t *)W.w)[i]; int ex = (b >> 3) & 15, f = b & 7;
+        uint16_t s = ((const uint16_t *)W.sw)[(size_t)(row / 128) * (W.K / 128) + k / 128]; int sx = (s >> 7) & 255;
+        m = (ex ? 8 + f : f) * (sx ? 128 + (s & 127) : s & 127); e = (ex ? ex - 10 : -9) + (sx ? sx - 134 : -133); if (b >> 7) m = -m;
     } else {   // NVFP4: low nibble = even k, 2*E2M1 times the E4M3 scale of its block of 16
         uint8_t b = ((const uint8_t *)W.w)[i / 2]; int nib = (k & 1) ? b >> 4 : b & 15, c = nib & 7;
         int q = c < 4 ? c : (c == 7 ? 12 : 2 * (c - 2));
@@ -172,6 +176,19 @@ static Act act_nvfp4(const std::vector<float> &x, float gA) {   // ModelOpt: sA 
         float amax = 0.f; for (int i = 0; i < 16; i++) amax = fmaxf(amax, fabsf(x[b * 16 + i]));
         uint8_t s = to_e4m3(amax / (6.f * gA)); float d = e4m3_val(s) * gA; int se = e4m3_sig_eps(s);
         for (int i = 0; i < 16; i++) put(a, b * 16 + i, s ? to_2e2m1(x[b * 16 + i] / d) * (se & 255) : 0, (se >> 8) - 33);
+    }
+    return a;
+}
+static Act act_fp8g(const std::vector<float> &x) {   // dynamic FP8 per group of 128, as vLLM per_token_group_quant_fp8:
+    Act a; a.m.resize(x.size()); a.e.resize(x.size());   // s = max(amax, 1e-10) / 448 in FP32, q = E4M3(x / s) saturating, x = q s
+    for (size_t g = 0; g < x.size(); g += 128) {
+        float amax = 0.f; for (size_t i = g; i < g + 128; i++) amax = fmaxf(amax, fabsf(x[i]));
+        float s = fmaxf(amax, 1e-10f) / 448.f; int sx; int sm = (int)ldexpf(frexpf(s, &sx), 24);   // s = sm 2^(sx-24)
+        for (size_t i = g; i < g + 128; i++) {
+            float t = x[i] / s; uint8_t b = to_e4m3(fabsf(t));
+            int se = e4m3_sig_eps(b), m = b ? (se & 255) * sm : 0;
+            put(a, i, t < 0 ? -m : m, (se >> 8) - 32 + sx - 24);
+        }
     }
     return a;
 }
@@ -301,7 +318,7 @@ static DevW load_w(const std::string &name, int fmt, int M, int K, void *dst = n
     return W;
 }
 // stats: exact vs engine on the same input (shadow), per format
-static long long st_out[5], st_d1[5], st_d4[5], st_bad;   // per weight format; [4] = BF16 weights rounded to FP32 (logits)
+static long long st_out[6], st_d1[6], st_d4[6], st_bad;   // per weight format; [4] = BF16 weights rounded to FP32 (logits)
 static std::vector<float> gemv(const DevW &W, const Act &a, int p, int mode, bool shadow = false) {
     CK(cudaMemcpy(dxm, a.m.data(), a.m.size() * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dxe, a.e.data(), a.e.size() * 2, cudaMemcpyHostToDevice));
@@ -355,13 +372,14 @@ static int selftest() {
     std::mt19937_64 rng(2027); int M = 256, K = 8192, fails = 0; long long checked = 0;
     CK(cudaMalloc(&dW, (size_t)M * K * 4)); CK(cudaMalloc(&dS, (size_t)M * K / 16)); CK(cudaMalloc(&dxm, K * 4)); CK(cudaMalloc(&dxe, K * 2));
     CK(cudaMalloc(&dy, M * 4)); CK(cudaMalloc(&dbad, 4));
-    for (int fmt = 0; fmt < 4; fmt++) for (int trial = 0; trial < (fmt == F_BF16 ? 4 : 3); trial++) {
+    for (int fmt : {F_BF16, F_F32, F_E4M3, F_NVFP4, F_E4M3B}) for (int trial = 0; trial < (fmt == F_BF16 ? 4 : 3); trial++) {
         size_t wb = fmt == F_BF16 ? 2 : fmt == F_F32 ? 4 : 1; std::vector<uint8_t> w((size_t)M * K * wb), sw((size_t)M * K / 16);
         for (auto &b : w) b = rng();
         if (fmt == F_BF16) for (size_t i = 0; i < w.size(); i += 2) w[i + 1] = (w[i + 1] & 0x80) | (0x30 + rng() % (trial == 2 ? 0x40 : 0x10));   // exponents: narrow, or 2^-60 wide
         if (fmt == F_F32) for (size_t i = 0; i < w.size(); i += 4) w[i + 3] = (w[i + 3] & 0x80) | (0x30 + rng() % (trial == 2 ? 0x40 : 0x10));
-        if (fmt == F_E4M3) for (auto &b : w) if ((b & 0x7F) == 0x7F) b ^= 1;
+        if (fmt == F_E4M3 || fmt == F_E4M3B) for (auto &b : w) if ((b & 0x7F) == 0x7F) b ^= 1;
         for (auto &b : sw) b = 0x20 + rng() % 0x50;
+        if (fmt == F_E4M3B) for (size_t i = 0; i < sw.size(); i += 2) { uint16_t s = (uint16_t)(((0x68 + rng() % 0x18) << 7) | (rng() & 0x7F)); memcpy(&sw[i], &s, 2); }
         std::vector<float> x(K); std::normal_distribution<double> nd;
         for (int k = 0; k < K; k++) x[k] = bf(nd(rng) * (trial == 1 ? exp2(rng() % 40 - 20.0) : 1.0));
         if (trial == 2) for (int k = 0; k < K / 2; k++) x[K / 2 + k] = -x[k];   // heavy cancellation against w
@@ -370,10 +388,10 @@ static int selftest() {
             for (int r = 0; r < M; r++) { uint16_t w0 = (uint16_t)(0x3F80 | (rng() & 0x7F) | (r & 2 ? 0x8000 : 0)), w1 = (uint16_t)((w0 & 0x8000) | ((0x7F - (r & 1 ? 8 : 24)) << 7));
                 memcpy(&w[(size_t)r * K * 2], &w0, 2); memcpy(&w[((size_t)r * K + 1) * 2], &w1, 2); }
         }
-        Act a = fmt == F_E4M3 ? act_fp8(x, 0.0123f) : fmt == F_NVFP4 ? act_nvfp4(x, 0.00731f) : act_plain(x);
+        Act a = fmt == F_E4M3 ? act_fp8(x, 0.0123f) : fmt == F_NVFP4 ? act_nvfp4(x, 0.00731f) : fmt == F_E4M3B ? act_fp8g(x) : act_plain(x);
         CK(cudaMemcpy(dW, w.data(), w.size(), cudaMemcpyHostToDevice)); CK(cudaMemcpy(dS, sw.data(), sw.size(), cudaMemcpyHostToDevice));
         DevW W{}; W.w = dW; W.sw = (uint8_t *)dS; W.fmt = fmt; W.M = M; W.K = K; W.Gm = 1; W.Ge = 0; W.Gf = 1.f;
-        if (fmt >= F_E4M3) gscale(W, 0.0371f, fmt == F_E4M3 ? 0.0123f : 0.00731f);
+        if (fmt == F_E4M3 || fmt == F_NVFP4) gscale(W, 0.0371f, fmt == F_E4M3 ? 0.0123f : 0.00731f);
         DevW Wh = W; Wh.w = w.data(); Wh.sw = sw.data();
         for (int p : {8, 24}) {
             st_bad = 0; auto y = gemv(W, a, p, 0);
@@ -414,8 +432,8 @@ static int pick(const std::vector<float> &lg, size_t t, int prompt, int mode, in
     return b1;
 }
 template <class S> static void report(const std::vector<S> &seqs) {   // shadow statistics, digests, token ids
-    const char *fn[5] = {"BF16", "FP32", "FP8", "NVFP4", "BF16->FP32(logits)"};
-    for (int f = 0; f < 5; f++) if (st_out[f])
+    const char *fn[6] = {"BF16", "FP32", "FP8", "NVFP4", "BF16->FP32(logits)", "FP8-block128"};
+    for (int f = 0; f < 6; f++) if (st_out[f])
         printf("shadow %s outputs %lld engine_s1_differs %lld (%.2f%%) engine_s4_differs %lld (%.2f%%)\n", fn[f], st_out[f],
                st_d1[f], 100.0 * st_d1[f] / st_out[f], st_d4[f], 100.0 * st_d4[f] / st_out[f]);
     printf("uncertified %lld\n", st_bad);

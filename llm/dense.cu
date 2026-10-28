@@ -15,13 +15,14 @@
 #include "ultra.cu"
 
 static int D_H, D_Q, D_KV, D_HD = 128, D_FF, D_V; static double D_EPS, D_THETA, Y_FACTOR = 1, Y_ORIG = 0; static bool OLMO;
+static bool NORM_ONCE;   // RMSNorm = BF16(w * x/rms) (OLMo 2, Jais-3); otherwise w * BF16(x/rms) (Llama)
 static std::vector<float> inv_freq; static double attn_factor = 1;
 static double cfgnum(const std::string &s, const std::string &key, double def) {
     size_t a = s.find("\"" + key + "\""); if (a == std::string::npos) return def;
     a = s.find(':', a); return atof(s.c_str() + a + 1);
 }
-static void rope_init() {   // inv_freq[i], i < head_dim/2, in FP32 as the reference builds it; YaRN if configured
-    int dim = D_HD; inv_freq.resize(dim / 2);
+static void rope_init(int dim) {   // inv_freq[i], i < dim/2, in FP32 as the reference builds it; YaRN if configured
+    inv_freq.resize(dim / 2);
     double lo = 0, hi = 0;
     if (Y_FACTOR > 1) {
         auto corr = [&](double rot) { return dim * log(Y_ORIG / (rot * 2 * M_PI)) / (2 * log(D_THETA)); };
@@ -46,7 +47,7 @@ static void norm(const std::vector<float> &x, const std::vector<float> &w, std::
     double ss = 0; for (float v : x) ss += (double)v * v;
     double r = 1.0 / sqrt(ss / x.size() + D_EPS);
     y.resize(x.size());
-    for (size_t i = 0; i < x.size(); i++) y[i] = OLMO ? bf((double)w[i] * ((double)x[i] * r)) : bf((double)w[i] * bf((double)x[i] * r));
+    for (size_t i = 0; i < x.size(); i++) y[i] = NORM_ONCE ? bf((double)w[i] * ((double)x[i] * r)) : bf((double)w[i] * bf((double)x[i] * r));
 }
 __global__ void f32_to_bf16(const float *s, uint16_t *d, size_t n) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
@@ -74,6 +75,7 @@ static std::vector<float> emb_row(const std::string &name, int tok, int H) {
 }
 struct OSeq { int prompt, mode; std::vector<int> toks; size_t plen; std::vector<float> h; std::vector<std::vector<float>> kc, vc; uint64_t dig = 1469598103934665603ULL; };
 
+#ifndef DENSE_LIB
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: out_dense <model dir> <prompts> <new tokens> [modes]\n"); return 1; }
     DIR = argv[1]; int NEW = atoi(argv[3]);
@@ -86,8 +88,8 @@ int main(int argc, char **argv) {
       D_HD = cfgnum(s, "head_dim", D_H / D_Q); D_FF = cfgnum(s, "intermediate_size", 0); D_V = cfgnum(s, "vocab_size", 0);
       D_EPS = cfgnum(s, "rms_norm_eps", 1e-6); D_THETA = cfgnum(s, "rope_theta", 10000);
       if (s.find("\"yarn\"") != std::string::npos) { Y_FACTOR = cfgnum(s, "factor", 1); Y_ORIG = cfgnum(s, "original_max_position_embeddings", 0); } }
-    OLMO = idx.count("model.layers.0.self_attn.q_norm.weight");
-    rope_init();
+    OLMO = idx.count("model.layers.0.self_attn.q_norm.weight"); NORM_ONCE = OLMO;
+    rope_init(D_HD);
     int NL = 0; while (idx.count("model.layers." + std::to_string(NL) + ".self_attn.q_proj.weight")) NL++;
     std::vector<OSeq> seqs;
     { std::ifstream f(argv[2]); std::string line; int pi = 0;
@@ -162,3 +164,4 @@ int main(int argc, char **argv) {
     }
     report(seqs);
 }
+#endif
