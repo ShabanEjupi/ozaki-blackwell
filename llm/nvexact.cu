@@ -18,6 +18,7 @@
 // nvcc -O3 -arch=sm_120a -std=c++17 -o out_nv llm/nvexact.cu   (sm_120a: the block-scaled FP4 MMA of the baseline)
 // out_nv <dir> <expert prefix, e.g. backbone.layers.1.mixer.experts.0> <N tokens> [seed] [outdir]
 // One routed expert end to end: X = BF16(h fc1_latent^T), h ~ N(0,1) -> up_proj -> BF16(relu(.)^2) -> down_proj.
+#pragma once
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>

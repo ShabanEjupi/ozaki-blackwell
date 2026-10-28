@@ -14,6 +14,7 @@
 // Host parts in FP64, rounded once to BF16, as in ultra.cu and dense.cu. OZ_AHEAD=<GB> reads ahead as in ultra.cu.
 // nvcc -O3 -arch=sm_120a -std=c++17 -Xcompiler -fopenmp -o out_jais llm/jais.cu -lgomp
 // out_jais <model dir with index.txt and config.json> <prompts file: token ids per line> <new tokens> [modes, e.g. 0,1,4]
+#pragma once
 #define DENSE_LIB
 #include "dense.cu"
 
@@ -47,12 +48,8 @@ static int check(int argc, char **argv) {
     return 0;
 }
 
-int main(int argc, char **argv) {
-    if (argc > 6 && !strcmp(argv[1], "--check")) return check(argc, argv);
-    if (argc < 4) { fprintf(stderr, "usage: out_jais <model dir> <prompts> <new tokens> [modes]\n"); return 1; }
-    DIR = argv[1]; int NEW = atoi(argv[3]);
-    std::vector<int> modes{0, 1, 4};
-    if (argc > 4) { modes.clear(); std::stringstream ss(argv[4]); std::string t; while (std::getline(ss, t, ',')) modes.push_back(atoi(t.c_str())); }
+// DIR/index.txt and DIR/config.json -> shapes, RoPE; the layers present (OZ_LAYERS=n: the first n only) and which are MoE
+static std::vector<bool> jais_init() {
     read_index();
     { std::ifstream f(DIR + "/config.json"); std::string s((std::istreambuf_iterator<char>(f)), {});
       D_H = cfgnum(s, "hidden_size", 0); D_Q = cfgnum(s, "num_attention_heads", 0); D_KV = cfgnum(s, "num_key_value_heads", D_Q);
@@ -64,6 +61,26 @@ int main(int argc, char **argv) {
     int NL = 0; while (idx.count("model.layers." + std::to_string(NL) + ".self_attn.q_proj.weight")) NL++;
     if (const char *n = getenv("OZ_LAYERS")) NL = std::min(NL, atoi(n));   // the first n layers only (smoke tests)
     std::vector<bool> moe(NL); for (int L = 0; L < NL; L++) moe[L] = idx.count("model.layers." + std::to_string(L) + ".mlp.gate.weight");
+    return moe;
+}
+// the top J_TOPK of sigmoid + bias (lowest id on a tie), weights BF16(J_RSF sigmoid / sum of the chosen sigmoids)
+static void route(const std::vector<float> &lg, const std::vector<float> &bias, std::vector<int> &ex, std::vector<double> &wt) {
+    std::vector<float> sg(J_E); std::vector<std::pair<float, int>> c(J_E);
+    for (int e = 0; e < J_E; e++) { sg[e] = (float)(1.0 / (1.0 + exp(-(double)lg[e]))); c[e] = {sg[e] + bias[e], e}; }
+    std::partial_sort(c.begin(), c.begin() + J_TOPK, c.end(), [](auto &a, auto &b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+    double sum = 0; for (int k = 0; k < J_TOPK; k++) sum += sg[c[k].second];
+    ex.clear(); wt.clear();
+    for (int k = 0; k < J_TOPK; k++) { ex.push_back(c[k].second); wt.push_back(bf(J_RSF * sg[c[k].second] / sum)); }
+}
+
+#ifndef JAIS_LIB
+int main(int argc, char **argv) {
+    if (argc > 6 && !strcmp(argv[1], "--check")) return check(argc, argv);
+    if (argc < 4) { fprintf(stderr, "usage: out_jais <model dir> <prompts> <new tokens> [modes]\n"); return 1; }
+    DIR = argv[1]; int NEW = atoi(argv[3]);
+    std::vector<int> modes{0, 1, 4};
+    if (argc > 4) { modes.clear(); std::stringstream ss(argv[4]); std::string t; while (std::getline(ss, t, ',')) modes.push_back(atoi(t.c_str())); }
+    std::vector<bool> moe = jais_init(); int NL = moe.size();
     std::vector<OSeq> seqs;
     { std::ifstream f(argv[2]); std::string line; int pi = 0;
       while (std::getline(f, line)) { if (line.empty()) continue; std::stringstream ss(line); std::vector<int> t; int v; while (ss >> v) t.push_back(v);
@@ -127,14 +144,7 @@ int main(int argc, char **argv) {
             } else {
                 W = load_w(P + "mlp.gate.weight", F_BF16, J_E, D_H);
                 std::vector<std::vector<int>> ex(NS); std::vector<std::vector<double>> wt(NS);
-                for (size_t j = 0; j < NS; j++) {
-                    auto lg = mm(W, act_plain(x[j]), j);
-                    std::vector<float> sg(J_E); std::vector<std::pair<float, int>> c(J_E);
-                    for (int e = 0; e < J_E; e++) { sg[e] = (float)(1.0 / (1.0 + exp(-(double)lg[e]))); c[e] = {sg[e] + bias[L][e], e}; }
-                    std::partial_sort(c.begin(), c.begin() + J_TOPK, c.end(), [](auto &a, auto &b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
-                    double sum = 0; for (int k = 0; k < J_TOPK; k++) sum += sg[c[k].second];
-                    for (int k = 0; k < J_TOPK; k++) { ex[j].push_back(c[k].second); wt[j].push_back(bf(J_RSF * sg[c[k].second] / sum)); }
-                }
+                for (size_t j = 0; j < NS; j++) route(mm(W, act_plain(x[j]), j), bias[L], ex[j], wt[j]);
                 std::set<int> uni; for (auto &v : ex) uni.insert(v.begin(), v.end());
                 for (int e : uni) for (const char *n : {"gate_proj", "up_proj", "down_proj"}) for (const char *s : {".weight", ".weight_scale"})
                     ahead.push(P + "mlp.experts." + std::to_string(e) + "." + n + s);
@@ -183,3 +193,4 @@ int main(int argc, char **argv) {
     ahead.finish();
     report(seqs);
 }
+#endif

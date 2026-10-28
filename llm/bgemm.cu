@@ -17,6 +17,7 @@
 // nvcc -O3 -arch=sm_120a -std=c++17 -o out_bgemm llm/bgemm.cu
 // out_bgemm <model dir> <tensor without .weight> <M> <K> [N tokens, default 4096]: the batched product (format from the
 // checkpoint) against the per-token GEMV on the first 256 tokens (BF16 and FP32 outputs), then its time alone.
+#pragma once
 #define ULTRA_LIB
 #include "ultra.cu"
 
@@ -205,6 +206,7 @@ __global__ void bf16_fixup(const uint16_t *w, const uint16_t *xb, const unsigned
 }
 
 constexpr int DXN = 4;   // digits of a token block (BF16)
+#ifndef BGEMM_LIB
 int main(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: out_bgemm <model dir> <tensor> <M> <K> [N]\n"); return 1; }
     DIR = argv[1]; std::string T = argv[2]; int M = atoi(argv[3]), K = atoi(argv[4]), N = argc > 5 ? atoi(argv[5]) : 4096, NREF = 256, KB = K / 128;
@@ -267,3 +269,4 @@ int main(int argc, char **argv) {
     printf("batched: %.2f ms for %d tokens (activation preparation + product + fixup) = %.2f TOPS\n", ms, N, 2.0 * M * K * N / (ms * 1e9));
     return 0;
 }
+#endif

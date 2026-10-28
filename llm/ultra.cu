@@ -20,6 +20,7 @@
 // nvcc -O3 -arch=sm_120a -std=c++17 -o out_ultra llm/ultra.cu
 // out_ultra <model dir with index.txt> <prompts file: one line of token ids per prompt> <new tokens> [modes, e.g. 0,1,4]
 // prints one line per step and sequence: step prompt mode token top1 top2; stats of the shadow comparison at the end.
+#pragma once
 #define NV_NO_MAIN
 #include "nvexact.cu"
 #include <fcntl.h>
@@ -417,10 +418,9 @@ static int selftest() {
 
 // ---- shared by the model drivers (ultra.cu, dense.cu) ----------------------------------------------------------------------
 // one token's causal attention over its cache in FP64, rounded once to BF16; query head h reads KV head h / (nq / nkv)
-static void attend(const std::vector<float> &q, const std::vector<float> &K, const std::vector<float> &V, int nq, int nkv, int hd,
-                   std::vector<float> &o) {
-    size_t T = K.size() / ((size_t)nkv * hd);
-    #pragma omp parallel for schedule(static)
+// (attend_p: pointers, the first T cache rows -- a prompt's prefix in a batched pass; par: the heads in parallel)
+static void attend_p(const float *q, const float *K, const float *V, size_t T, int nq, int nkv, int hd, float *o, bool par) {
+    #pragma omp parallel for schedule(static) if (par)
     for (int hq = 0; hq < nq; hq++) {
         int g = hq / (nq / nkv); std::vector<double> sc(T); double mx = -1e300;
         for (size_t u = 0; u < T; u++) { double a = 0; for (int d = 0; d < hd; d++) a += (double)q[hq * hd + d] * K[(u * nkv + g) * hd + d];
@@ -428,6 +428,10 @@ static void attend(const std::vector<float> &q, const std::vector<float> &K, con
         double den = 0; for (auto &v : sc) { v = exp(v - mx); den += v; }
         for (int d = 0; d < hd; d++) { double a = 0; for (size_t u = 0; u < T; u++) a += sc[u] * V[(u * nkv + g) * hd + d]; o[hq * hd + d] = bf(a / den); }
     }
+}
+static void attend(const std::vector<float> &q, const std::vector<float> &K, const std::vector<float> &V, int nq, int nkv, int hd,
+                   std::vector<float> &o) {
+    attend_p(q.data(), K.data(), V.data(), K.size() / ((size_t)nkv * hd), nq, nkv, hd, o.data(), true);
 }
 // greedy: the largest logit (lowest id on a tie), printed with the runner-up
 static int pick(const std::vector<float> &lg, size_t t, int prompt, int mode, int token) {

@@ -11,6 +11,7 @@
 // Shapes, theta, eps from config.json. Host parts in FP64, rounded once to BF16 (logits FP32).
 // nvcc -O3 -arch=sm_120a -std=c++17 -Xcompiler -fopenmp -o out_dense llm/dense.cu -lgomp
 // out_dense <model dir with index.txt and config.json> <prompts file: token ids per line> <new tokens> [modes, e.g. 0,1,4]
+#pragma once
 #define ULTRA_LIB
 #include "ultra.cu"
 
