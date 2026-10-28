@@ -90,7 +90,7 @@ __global__ void __launch_bounds__(256) fp8b_gemm(const int8_t *__restrict__ wd, 
 #pragma unroll
     for (int i = 0; i < 4; i++) {
         int row = m0 + g + (i < 2 ? 0 : 8), col = tok[i & 1]; float r;
-        if (!cert_round(acc[i], tail[i], lsb[i & 1], 1, 0, p, r)) atomicAdd(nbad, 1);
+        if (!cert_round(acc[i], tail[i], lsb[i & 1], 1, 0, p, r)) { atomicAdd(nbad, 1); r = __int_as_float(0x7FC00000); }
         Y[(size_t)col * M + row] = r;
     }
 }
@@ -103,25 +103,25 @@ __global__ void bf16_digits(const uint16_t *src, int8_t *d, int16_t *lexp, uint8
         size_t base = (bi / KB) * K + (bi % KB) * 128; int top = -100000, cnt = 0;
         for (int i = 0; i < 128; i++) { uint16_t u = src[base + i]; int ex = (u >> 7) & 255, f = u & 127; if (!(u & 0x7FFF)) continue;
             top = max(top, (ex ? ex - 134 : -133) + 31 - __clz(ex ? 128 + f : f)); }
-        int l = top == -100000 ? 0 : top - (7 * nd - 2);   // |v| < 2^(7 nd - 1): nd balanced base-128 digits
+        int l = top == -100000 ? -32768 : top - (7 * nd - 2);   // |v| < 2^(7 nd - 1): nd balanced base-128 digits; -32768: all zero
         for (int i = 0; i < 128; i++) {
-            uint16_t u = src[base + i]; int ex = (u >> 7) & 255, f = u & 127, sig = ex ? 128 + f : f, sh = (ex ? ex - 134 : -133) - l, v;
+            uint16_t u = src[base + i]; int ex = (u >> 7) & 255, f = u & 127, sig = ex ? 128 + f : f, sh = (ex ? ex - 134 : -133) - l; long long v;   // up to 2^41 (6 digits)
             if (!(u & 0x7FFF)) v = 0;
-            else if (sh >= 0) v = (u >> 15) ? -(sig << sh) : sig << sh;
+            else if (sh >= 0) v = (u >> 15) ? -((long long)sig << sh) : (long long)sig << sh;
             else {   // floor: the dropped part is in [0, 1) units for both signs
                 int q = sh > -9 ? sig >> -sh : 0, rem = sh > -9 ? (sig & ((1 << -sh) - 1)) != 0 : 1; cnt += rem;
                 v = (u >> 15) ? -(q + rem) : q;
             }
-            for (int q = 0; q < nd - 1; q++) { int dq = ((v + 64) & 127) - 64; d[q * n + base + i] = (int8_t)dq; v = (v - dq) >> 7; }
+            for (int q = 0; q < nd - 1; q++) { int dq = (int)((v + 64) & 127) - 64; d[q * n + base + i] = (int8_t)dq; v = (v - dq) >> 7; }
             d[(nd - 1) * n + base + i] = (int8_t)v;
         }
         lexp[bi] = (int16_t)l; ntr[bi] = (uint8_t)cnt;
     }
 }
-// One warp: 16 rows x 8 tokens; weights in 3 digits (|vw| < 2^20), tokens in DX (|vx| < 2^(7 DX - 1)): activations spread
+// One warp: 16 rows x 8 tokens; weights in DW digits (|vw| < 2^(7 DW - 1)), tokens in DX (|vx| < 2^(7 DX - 1)): activations spread
 // over more binades than trained weights (3 digits left 3-8 % of the BF16 outputs uncertified, 4 digits ...).
 // Y [N][M]: certified outputs, NaN where the bound on dropped bits leaves the rounding open.
-template <int DX>
+template <int DW, int DX>
 __global__ void __launch_bounds__(256) bf16_gemm(const int8_t *__restrict__ wd, const int16_t *__restrict__ wl, const uint8_t *__restrict__ wn,
         const int8_t *__restrict__ xd, const int16_t *__restrict__ xl, const uint8_t *__restrict__ xn, float *Y, int M, int N, int K, int p, int *nbad) {
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
@@ -129,39 +129,40 @@ __global__ void __launch_bounds__(256) bf16_gemm(const int8_t *__restrict__ wd, 
     if (m0 >= M) return;
     size_t PW = (size_t)M * K, PX = (size_t)N * K;
     int row[4], tok[4], lsb[4];
-    for (int i = 0; i < 4; i++) {   // |S_b| < 128 2^20 2^(7 DX - 1), at most 64 blocks: |sum| < 2^(max(lw + lx) + 7 DX + 32)
+    for (int i = 0; i < 4; i++) {   // |S_b| < 128 2^(7 DW - 1) 2^(7 DX - 1), at most 64 blocks: |sum| < 2^(max(lw + lx) + 7 (DW + DX) + 11)
         row[i] = m0 + g + (i < 2 ? 0 : 8); tok[i] = n0 + t4 * 2 + (i & 1); int hi = -100000;
         for (int b = 0; b < KB; b++) hi = max(hi, wl[(size_t)row[i] * KB + b] + xl[(size_t)tok[i] * KB + b]);
-        lsb[i] = hi + 7 * DX + 32 - 125;
+        lsb[i] = hi + 7 * (DW + DX) + 11 - 125;
     }
     __int128 acc[4] = {}; unsigned __int128 tail[4] = {};
     for (int b = 0; b < KB; b++) {
-        int P[3 * DX][4] = {};
+        int P[DW * DX][4] = {};
         for (int kk = b * 128; kk < b * 128 + 128; kk += 16) {
-            uint32_t a0[3], a1[3], b0[DX];
+            uint32_t a0[DW], a1[DW], b0[DX];
 #pragma unroll
-            for (int q = 0; q < 3; q++) {
+            for (int q = 0; q < DW; q++) {
                 a0[q] = *(const uint32_t *)(wd + q * PW + (size_t)(m0 + g) * K + kk + t4 * 4);
                 a1[q] = *(const uint32_t *)(wd + q * PW + (size_t)(m0 + g + 8) * K + kk + t4 * 4);
             }
 #pragma unroll
             for (int q = 0; q < DX; q++) b0[q] = *(const uint32_t *)(xd + q * PX + (size_t)(n0 + g) * K + kk + t4 * 4);
 #pragma unroll
-            for (int pw = 0; pw < 3; pw++)
+            for (int pw = 0; pw < DW; pw++)
 #pragma unroll
                 for (int px = 0; px < DX; px++) mma16816acc(P[pw * DX + px], a0[pw], a1[pw], b0[px]);
         }
 #pragma unroll
         for (int i = 0; i < 4; i++) {
-            long long S = 0;
+            __int128 S = 0;   // |S| < 2^(7 (DW + DX) + 5): beyond int64 from 9 digits on
 #pragma unroll
-            for (int pw = 0; pw < 3; pw++)
+            for (int pw = 0; pw < DW; pw++)
 #pragma unroll
-                for (int px = 0; px < DX; px++) S += (long long)P[pw * DX + px][i] << (7 * (pw + px));
+                for (int px = 0; px < DX; px++) S += (__int128)P[pw * DX + px][i] << (7 * (pw + px));
             size_t wi = (size_t)row[i] * KB + b, xi = (size_t)tok[i] * KB + b;
+            if (wl[wi] == -32768 || xl[xi] == -32768) continue;   // a zero block: its product is exactly 0, no bound (padding rows)
             int e = wl[wi] + xl[xi] - lsb[i], nw = wn[wi], nx = xn[xi];   // the bound, in units of 2^(lw + lx):
-            unsigned long long bound = ((unsigned long long)nx << 20) + ((unsigned long long)nw << (7 * DX - 1)) + min(nw, nx);
-            if (S) { if (e >= 0) acc[i] += (__int128)S << e; else { tail[i]++; acc[i] += e > -127 ? (__int128)S >> -e : (S < 0 ? -1 : 0); } }
+            unsigned long long bound = ((unsigned long long)nx << (7 * DW - 1)) + ((unsigned long long)nw << (7 * DX - 1)) + min(nw, nx);
+            if (S) { if (e >= 0) acc[i] += S << e; else { tail[i]++; acc[i] += e > -127 ? S >> -e : (S < 0 ? -1 : 0); } }
             if (bound) tail[i] += e >= 0 ? (unsigned __int128)bound << e : ((unsigned __int128)bound >> min(-e, 127)) + 1;
         }
     }
@@ -205,7 +206,17 @@ __global__ void bf16_fixup(const uint16_t *w, const uint16_t *xb, const unsigned
     }
 }
 
-constexpr int DXN = 4;   // digits of a token block (BF16)
+constexpr int DWN = 3, DXN = 4;     // digits of a weight and of a token block (BF16), p = 8
+constexpr int DW24 = 5, DX24 = 6;   // p = 24 (FP32 logits): 3 + 4 left most outputs to the fixup
+// the BF16 product of N tokens (digit planes of the weights for the p in use already in wd): Y [N][M], NaN = uncertified
+static void bf16_gemm_p(int p, const int8_t *wd, const int16_t *wl, const uint8_t *wn, const int8_t *xd, const int16_t *xl,
+                        const uint8_t *xn, float *Y, int M, int N, int K, int *nbad) {
+    dim3 g((M + 127) / 128, N / 8);
+    if (p == 24) bf16_gemm<DW24, DX24><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
+    else bf16_gemm<DWN, DXN><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
+}
+static int wdig(int p) { return p == 24 ? DW24 : DWN; }
+static int xdig(int p) { return p == 24 ? DX24 : DXN; }
 #ifndef BGEMM_LIB
 int main(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: out_bgemm <model dir> <tensor> <M> <K> [N]\n"); return 1; }
@@ -223,21 +234,21 @@ int main(int argc, char **argv) {
         for (int k = 0; k < K; k++) x[(size_t)n * K + k] = bf(nd(rng) * sc * (rng() % 97 == 0 ? 64 : 1)); }
     std::vector<uint16_t> xb(x.size()); for (size_t i = 0; i < x.size(); i++) { uint32_t u; memcpy(&u, &x[i], 4); xb[i] = u >> 16; }
     int8_t *wd, *xd; uint8_t *xq, *wn, *xn; int16_t *wl, *xl; uint16_t *dxb; float *dx, *xsc, *Y; int *nb;
-    CK(cudaMalloc(&wd, (size_t)3 * M * K)); CK(cudaMalloc(&xd, (size_t)DXN * N * K)); CK(cudaMalloc(&xq, (size_t)N * K));
+    CK(cudaMalloc(&wd, (size_t)DW24 * M * K)); CK(cudaMalloc(&xd, (size_t)DX24 * N * K)); CK(cudaMalloc(&xq, (size_t)N * K));
     CK(cudaMalloc(&dx, (size_t)N * K * 4)); CK(cudaMalloc(&xsc, (size_t)N * KB * 4)); CK(cudaMalloc(&Y, (size_t)N * M * 4)); CK(cudaMalloc(&nb, 4));
     unsigned *list, *lcnt, cap = (unsigned)((size_t)N * M / 8); int *nb2; CK(cudaMalloc(&list, (size_t)cap * 4)); CK(cudaMalloc(&lcnt, 4)); CK(cudaMalloc(&nb2, 4));
     CK(cudaMalloc(&dxb, (size_t)N * K * 2)); CK(cudaMalloc(&wl, (size_t)M * KB * 2)); CK(cudaMalloc(&wn, (size_t)M * KB)); CK(cudaMalloc(&xl, (size_t)N * KB * 2)); CK(cudaMalloc(&xn, (size_t)N * KB));
     CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(dxb, xb.data(), xb.size() * 2, cudaMemcpyHostToDevice));
     if (fp8) fp8_digits<<<1024, 256>>>((const uint8_t *)W.w, wd, (size_t)M * K);
-    else bf16_digits<<<(M * KB + 255) / 256, 256>>>((const uint16_t *)W.w, wd, wl, wn, M, K, 3);
     auto run = [&](int p) {
+        if (!fp8) bf16_digits<<<(M * KB + 255) / 256, 256>>>((const uint16_t *)W.w, wd, wl, wn, M, K, wdig(p));
         if (fp8) {
             quant_fp8g<<<1024, 256>>>(dx, xq, xsc, (size_t)N * KB);
             fp8_digits<<<1024, 256>>>(xq, xd, (size_t)N * K);
             fp8b_gemm<<<dim3(M / 128, N / 8), 256>>>(wd, (const uint16_t *)dS, xd, xsc, Y, M, N, K, p, nb);
         } else {
-            bf16_digits<<<(N * KB + 255) / 256, 256>>>(dxb, xd, xl, xn, N, K, DXN);
-            bf16_gemm<DXN><<<dim3((M + 127) / 128, N / 8), 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nb);
+            bf16_digits<<<(N * KB + 255) / 256, 256>>>(dxb, xd, xl, xn, N, K, xdig(p));
+            bf16_gemm_p(p, wd, wl, wn, xd, xl, xn, Y, M, N, K, nb);
             CK(cudaMemset(lcnt, 0, 4)); nan_list<<<1024, 256>>>(Y, (size_t)N * M, list, lcnt, cap);
             bf16_fixup<<<1024, 256>>>((const uint16_t *)W.w, dxb, list, lcnt, cap, Y, M, K, p, nb2);
         }
