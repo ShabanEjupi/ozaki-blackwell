@@ -83,10 +83,11 @@ __host__ __device__ inline double round_p(unsigned __int128 u, int X, int p) {
     if (rem > half || (rem == half && (q & 1))) q++;
     return ldexp((double)(uint64_t)q, X + r);
 }
-// (acc +- tail) * 2^lsb * Gm 2^Ge rounded to p bits; true when both ends of the interval round to the same value
-__device__ inline bool cert_round(__int128 acc, int tail, int lsb, unsigned long long Gm, int Ge, int p, float &out) {
+// (acc +- tail) * 2^lsb * Gm 2^Ge rounded to p bits; true when both ends of the interval round to the same value.
+// tail counts units of 2^lsb: truncated terms (GEMV), or a bound on the operand bits a batched product dropped (bgemm.cu)
+__device__ inline bool cert_round(__int128 acc, unsigned __int128 tail, int lsb, unsigned long long Gm, int Ge, int p, float &out) {
     bool neg = acc < 0;
-    unsigned __int128 a = neg ? (unsigned __int128)(-acc) : (unsigned __int128)acc, t = (unsigned)tail;
+    unsigned __int128 a = neg ? (unsigned __int128)(-acc) : (unsigned __int128)acc, t = tail;
     int nb = bitlen128(a);
     if (nb > 78) {   // keep 78 bits; the interval widens only if a bit is lost (an exact tie must stay certified)
         int r = nb - 78; unsigned __int128 lost = a & (((unsigned __int128)1 << r) - 1);
