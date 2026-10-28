@@ -113,12 +113,20 @@ static DevW fp8w(const std::string &name, int M, int K) {
 static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>> &rows, const std::vector<bool> &want) {
     auto t0 = std::chrono::steady_clock::now(); double d0 = t_disk, b0 = bytes_disk, g0 = t_gemm;
     size_t R = rows.size(), QD = (size_t)D_Q * D_HD, KVD = (size_t)D_KV * D_HD;
+    auto part0 = [&](int L) {   // read-ahead (OZ_AHEAD): a layer's tensors before routing, in the order they are used
+        std::string P = "model.layers." + std::to_string(L) + ".";
+        for (const char *n : {"q_proj", "k_proj", "v_proj", "o_proj"}) ahead.push(P + "self_attn." + n + ".weight");
+        if (MOE[L]) ahead.push(P + "mlp.gate.weight");
+        else for (const char *n : {"gate_proj", "up_proj", "down_proj"}) ahead.push(P + "mlp." + n + ".weight");
+    };
+    part0(0);
     std::vector<float> h(R * D_H);
     for (size_t r = 0; r < R; r++) { auto e = emb_row("model.embed_tokens.weight", S[rows[r].first].toks[rows[r].second], D_H); std::copy(e.begin(), e.end(), h.begin() + r * D_H); }
     std::vector<std::vector<float>> hist(VALIDATE ? R : 0);   // every row's residual stream after every layer (the digest)
     for (int L = 0; L < NL; L++) {
         std::string P = "model.layers." + std::to_string(L) + ".";
         std::vector<float> x = norm_rows(h, N1[L]);
+        if (!MOE[L] && L + 1 < NL) part0(L + 1);
         DevW W = load_w(P + "self_attn.q_proj.weight", F_BF16, QD, D_H); auto q = bmm(W, x);
         rows_map(q, QD, [&](size_t r, std::vector<float> &v) { rope_part(v, D_Q, rows[r].second); });
         W = load_w(P + "self_attn.k_proj.weight", F_BF16, KVD, D_H); auto k = bmm(W, x);
@@ -151,6 +159,10 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
             for (size_t r = 0; r < R; r++) route(std::vector<float>(lg.begin() + r * J_E, lg.begin() + (r + 1) * J_E), BIAS[L], ex[r], wt[r]);
             std::vector<std::vector<std::pair<size_t, double>>> by(J_E);   // expert -> (row, weight)
             for (size_t r = 0; r < R; r++) for (int i = 0; i < J_TOPK; i++) by[ex[r][i]].push_back({r, wt[r][i]});
+            for (int e = 0; e < J_E; e++) if (!by[e].empty()) for (const char *n : {"gate_proj", "up_proj", "down_proj"}) for (const char *s : {".weight", ".weight_scale"})
+                ahead.push(P + "mlp.experts." + std::to_string(e) + "." + n + s);
+            for (const char *n : {"gate_proj", "up_proj", "down_proj"}) ahead.push(P + "mlp.shared_experts." + n + ".weight");
+            if (L + 1 < NL) part0(L + 1);
             std::vector<double> acc(R * D_H, 0.0);
             for (int e = 0; e < J_E; e++) {   // ascending id, as the std::set of jais.cu: the same FP64 sum order per row
                 if (by[e].empty()) continue;
@@ -217,6 +229,7 @@ int main(int argc, char **argv) {
     CK(cudaMallocHost(&pin, PIN)); CK(cudaMalloc(&dW, (size_t)D_FF * D_H * 2)); CK(cudaMalloc(&dS, (size_t)8 << 20));
     CK(cudaMalloc(&dxm, 32768 * 4)); CK(cudaMalloc(&dxe, 32768 * 2)); CK(cudaMalloc(&dy, (size_t)D_V * 4)); CK(cudaMalloc(&dbad, 4));
     void *dLM; CK(cudaMalloc(&dLM, (size_t)D_V * D_H * 2)); LM = load_w("lm_head.weight", F_BF16, D_V, D_H, dLM);
+    if (const char *a = getenv("OZ_AHEAD")) { ahead.start((size_t)(atof(a) * 1e9)); fprintf(stderr, "read-ahead ring %.1f GB\n", atof(a)); }
     bmm_init((size_t)std::max(D_FF, 16384) * D_H, std::max(D_FF, D_Q * D_HD), std::max(D_FF, 16384));
     bool whole = idx.count("model.norm.weight");
     NORMF = whole ? vec_bf16("model.norm.weight") : std::vector<float>(D_H, 1.f);
@@ -245,5 +258,6 @@ int main(int argc, char **argv) {
     }
     printf("batched: %lld rows; BF16 outputs %lld, left to the fixup %lld (%.4f%%); FP32 logits %lld, fixup %lld (%.4f%%); host GEMV rows %lld\n",
            st_rows, st_outs, st_fix, 100.0 * st_fix / std::max(1LL, st_outs), st_outs24, st_fix24, 100.0 * st_fix24 / std::max(1LL, st_outs24), st_host);
+    ahead.finish();
     report(done);
 }
