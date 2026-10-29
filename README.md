@@ -808,13 +808,21 @@ generated token); in all 4.6 T training tokens "10,908 settlements" and "2,994 s
 up, differently. Its product is wrong on every path (`12345678987654321`), with an explanation stitched from training
 phrases ("This is a special case of a more general phenomenon: the", 11 words, 22 times). Albanian: same text on all
 paths ("Kryeqyteti i Kosovës është një qyteti në Kosovë. It is the capital and largest city of Kosovo."). Trace:
-`/opt/ozaki/chain/olmo_trace.txt`. Next: K2-Think-V2 after SPEX pass 3.
+`/opt/ozaki/chain/olmo_trace.txt`.
+
+K2-Think-V2 72.6 B, the same nine sequences from disk (39 steps of 93–106 s, 274 GB read per step, 0 uncertified; the
+engine rounds 0.01–0.02 % of the BF16 outputs and 69–81 % of the FP32 logits differently). Both engines agree with each
+other and part from the exact path: Albanian at the 8th generated token (exact "Prishtina, **qyteti më i madh në vend**",
+engines "Prishtina, **qytet i vendosur në pjesën qendrore të vendit**"), English at the 27th ("confirmation **or
+correction?**" against "confirmation **or maybe they are stating a fact**"). Both texts are true; the rounding picks which
+one. The product prompt is still reasoning after 30 generated tokens, identically on all paths. Log:
+`/opt/ozaki/chain/k2.{log,txt}`.
 
 **SQ** — Nemotron 3 Ultra i tërë (560 miliardë parametra) punon në laptop nga disku, token pas tokeni, me çdo prodhim
 matricë-vektor të rrumbullakosur saktë (një rrumbullakim i certifikuar, i provuar kundër një akumuluesi 2 560-bit; prova e
 barazimeve gjeti dhe ndreqi një defekt). 19,6 s për token me lexim përpara — aq sa motori FP32: saktësia s'kushton asgjë.
 Motori me akumulim FP32 ndryshon 42–49 % të logit-ëve të ruterit (projeksionet BF16 vetëm 0,01 %), logit-i largohet deri në
 1,22, dhe teksti ndahet: shqip pas tokenit të 5-të / 13-të, anglisht pas të 29-tit. Te OLMo 2 rruga e saktë shkruan «10,908»
-vendbanime, motori «2,994» — asnjëri s'ndodhet te 4,6T tokenat e trajnimit: të dy të shpikur, ndryshe. 123456789 × 987654321 = 121932631112635269 — saktë në të tri rrugët. Për qasje të plotë te të
+vendbanime, motori «2,994» — asnjëri s'ndodhet te 4,6T tokenat e trajnimit: të dy të shpikur, ndryshe. 123456789 × 987654321 = 121932631112635269 — saktë në të tri rrugët. Te K2-Think-V2 (72,6 B, nga disku, 0 të pacertifikuara) të dy motorët bien dakord mes tyre dhe ndahen nga rruga e saktë: shqip pas tokenit të 8-të (e sakta «qyteti më i madh në vend», motorët «qytet i vendosur në pjesën qendrore të vendit»), anglisht pas të 27-tit — të dyja të vërteta, rrumbullakimi zgjedh cilën. Për qasje të plotë te të
 dhënat: OLMo 2 32B (të gjitha të dhënat e trajnimit të kërkueshme), K2-Think-V2 (më i forti plotësisht i hapur); asnjë model
 plotësisht i hapur s'e kalon Ultra-n sot.

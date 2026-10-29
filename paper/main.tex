@@ -490,7 +490,13 @@ occurs 224 times, one of them a DCLM page from graphicmaps.com. On the three pro
 the exact path writes ``The municipalities are divided into 10,908 settlements'' and both engines ``2,994 settlements'';
 neither number occurs before ``settlements'' anywhere in the model's training data, so both are made up, differently. Its
 wrong product ($123456789\times987654321=12345678987654321$ on every path) comes with an explanation stitched from training
-phrases (``This is a special case of a more general phenomenon: the'', 11 words, 22 times). Ultra's English continuation,
+phrases (``This is a special case of a more general phenomenon: the'', 11 words, 22 times). K2-Think-V2 runs the same nine
+sequences from disk (39 steps of 93--106~s, 274~GB read per step, none uncertified; the engine rounds 0.01--0.02\% of the
+BF16 outputs and 69--81\% of the FP32 logits differently). Both engines agree with each other and part from the exact path:
+in Albanian at the 8th generated token (exact ``Prishtina, qyteti më i madh në vend'', the largest city; engines ``Prishtina,
+qytet i vendosur në pjesën qendrore të vendit'', in the centre of the country), in English at the 27th (``confirmation or
+correction?'' against ``confirmation or maybe they are stating a fact''). Both texts are true; the rounding picks which
+one. On the product all three paths still reason identically after 30 generated tokens. Ultra's English continuation,
 looked up in DCLM (filtered Common Crawl, the public web its data was drawn from), has a 9-word span 11 times.
 
 \paragraph{Many tokens at once, still exact.} Decoding one token at a time reads the whole model per token; a benchmark needs
