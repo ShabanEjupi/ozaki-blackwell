@@ -5,7 +5,7 @@ Authors:    Shaban Ejupi
 Primary:    cs.MS (Mathematical Software)
 Cross-list: cs.DC, cs.SC, math.NA
 License:    CC BY 4.0
-Comments:   14 pages. Code and every measurement: https://git.spacecode.tech/shaban/ozaki-blackwell
+Comments:   15 pages. Code and every measurement: https://git.spacecode.tech/shaban/ozaki-blackwell
 
 Abstract (plain text, under arXiv's 1920 characters):
 Laptop GPUs run FP64 at 1/64 of their FP32 rate, while their INT8 tensor cores are hundreds of times faster: on a laptop
