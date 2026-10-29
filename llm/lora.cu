@@ -196,7 +196,7 @@ int main(int argc, char **argv) {
     // exmm leaves [RP][D] (row = adapter column), bfmm [RP][D] too: part[z][Np][M] with M = D, Np = RP
     long nbr = 0; double mx = 0, sum = 0; int cnt = 0;
     for (int q = 0; q < r; q++) for (int i = 0; i < D; i++) {
-        const size_t t = (size_t)q * D + i; const float c = F.dBt[t] / 2;
+        const size_t t = (size_t)q * D + i; const float c = ldexpf(F.dBt[t], -ls);   // undo s (exact)
         nbr += fbits(b1[t]) != fbits(c); const double u = ulps(b1[t], c); mx = std::max(mx, u); sum += u; cnt++;
     }
     printf("    split-K 1 vs 4: %d differ   forward vs reverse order: %d differ   (of %d)\n",
