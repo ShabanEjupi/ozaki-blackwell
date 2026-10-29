@@ -131,14 +131,15 @@ template <int... T> __device__ __forceinline__ void touts(const int (*m)[49], in
 
 // O[K - K0] (s x s, packed) = the sub-blocks of X that combination K names, summed mod p; 16 bytes per thread
 template <bool isB>
-__global__ void two_ops(const int8_t *X, int ld, int s, int8_t *O, int K0, int cnt) {   // combinations K0 .. K0 + cnt - 1
+__global__ void two_ops(const int8_t *X, int ld, int s, int8_t *O, int K0, int cnt, unsigned use) {   // combinations K0 .. K0 + cnt - 1;
+    // use: the sub-blocks they name (bit t), the only ones read: a chunk of the 49 needs 4-16 of the 16
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x, w = s / 16;
     if (i >= (size_t)s * w) return;
     const size_t r = i / w, c = (i % w) * 16;
     int x[4][16];
 #pragma unroll
     for (int t = 0; t < 16; t++) {
-        const int4 v = *(const int4 *)&X[((t / 4) * (size_t)s + r) * ld + (t % 4) * s + c];
+        const int4 v = use >> t & 1 ? *(const int4 *)&X[((t / 4) * (size_t)s + r) * ld + (t % 4) * s + c] : make_int4(0, 0, 0, 0);
         x[0][t] = v.x; x[1][t] = v.y; x[2][t] = v.z; x[3][t] = v.w;
     }
     tops<isB ? 1 : 0>(x, K0, cnt, O, (size_t)s * s, r * s + c, std::make_integer_sequence<int, 49>{});
@@ -186,6 +187,13 @@ static void leaf_run(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t
     else leaf_go<32, 3>(A, lda, Bt, ldb, C, ldc, h, z, st);
 }
 
+// the sub-blocks of A (isB = 0) or Bt (1) that combinations K0 .. K0 + cnt - 1 read
+static unsigned two_use(bool isB, int K0, int cnt) {
+    static constexpr Tab tab = two_tab(); unsigned m = 0;
+    for (int K = K0; K < K0 + cnt; K++) { const Term &T = isB ? tab.b[K] : tab.a[K]; for (int e = 0; e < T.n; e++) m |= 1u << T.idx[e]; }
+    return m;
+}
+
 static void two_rec(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t *C, int ldc, int h, int L, int t) {
     const int s = h / 4; const size_t ss = (size_t)s * s; const unsigned g = (unsigned)((ss / 16 + 255) / 256), go = (unsigned)((ss / 8 + 255) / 256);
     const TwoBuf &b = two.tb[t];
@@ -193,8 +201,8 @@ static void two_rec(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t 
         const int cnt = 49 - K0 < b.cap ? 49 - K0 : b.cap;
         const bool pr = profon && L == 2;
         if (pr) cudaEventRecord(pe[0]);
-        two_ops<false><<<g, 256>>>(A, lda, s, b.SA, K0, cnt);
-        two_ops<true><<<g, 256>>>(Bt, ldb, s, b.SB, K0, cnt);
+        two_ops<false><<<g, 256>>>(A, lda, s, b.SA, K0, cnt, two_use(false, K0, cnt));
+        two_ops<true><<<g, 256>>>(Bt, ldb, s, b.SB, K0, cnt, two_use(true, K0, cnt));
         if (pr) cudaEventRecord(pe[1]);
         if (L == 2) leaf_run(b.SA, 0, b.SB, 0, b.M + K0 * ss, 0, s, cnt, 0);
         else if (L == 4 && two.ov) {   // children are two-level nodes: their passes (DRAM) overlap the products (tensor cores)
@@ -205,8 +213,8 @@ static void two_rec(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t 
             for (int z = 0; z < cnt; z++) {
                 const int j = z & 1; int8_t *SA = j ? c.SA2 : c.SA, *SB = j ? c.SB2 : c.SB, *M = j ? c.M2 : c.M;
                 cudaStreamWaitEvent(two.st[0], two.ev[j][1]);
-                two_ops<false><<<gc, 256, 0, two.st[0]>>>(b.SA + z * ss, s, sc, SA, 0, 49);
-                two_ops<true><<<gc, 256, 0, two.st[0]>>>(b.SB + z * ss, s, sc, SB, 0, 49);
+                two_ops<false><<<gc, 256, 0, two.st[0]>>>(b.SA + z * ss, s, sc, SA, 0, 49, 0xffff);
+                two_ops<true><<<gc, 256, 0, two.st[0]>>>(b.SB + z * ss, s, sc, SB, 0, 49, 0xffff);
                 cudaEventRecord(two.ev[j][0], two.st[0]);
                 cudaStreamWaitEvent(two.st[1], two.ev[j][0]); cudaStreamWaitEvent(two.st[1], two.ev[j][2]);
                 leaf_run(SA, 0, SB, 0, M, 0, sc, 49, two.st[1]);

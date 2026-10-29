@@ -143,8 +143,12 @@ __global__ void __launch_bounds__(THREADS, 1) gemm_i8w(const int8_t *__restrict_
 // OZ_NARROW=1 forces 128 x 128 (A/B measurements in one binary).
 inline void gemm_i8_run(const int8_t *A, const int8_t *Bt, int32_t *C, int M, int N, int K, int Z = 1, cudaStream_t st = 0) {
     static const bool wide = [] {
-        cudaFuncSetAttribute(gemm_i8w, cudaFuncAttributeMaxDynamicSharedMemorySize, gemm_smem<64, 3>());
-        const char *e = getenv("OZ_NARROW"); return !(e && *e == '1');
+        const char *e = getenv("OZ_NARROW"); if (e && *e == '1') return false;
+        // a GPU that cannot grant 72 KB of shared memory per block keeps the 128 x 128 tile
+        if (cudaFuncSetAttribute(gemm_i8w, cudaFuncAttributeMaxDynamicSharedMemorySize, gemm_smem<64, 3>()) != cudaSuccess) {
+            cudaGetLastError(); return false;
+        }
+        return true;
     }();
     if (wide && N % 256 == 0 && (size_t)M * N * Z >= (1ull << 26)) gemm_i8w<<<dim3(N / 256, M / BM, Z), THREADS, gemm_smem<64, 3>(), st>>>(A, Bt, C, M, N, K);
     else gemm_i8<<<dim3(N / BN, M / BM, Z), THREADS, 0, st>>>(A, Bt, C, M, N, K);
