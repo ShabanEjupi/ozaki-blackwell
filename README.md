@@ -86,6 +86,11 @@ a mutant byte that must be counted). n = 32768, residues uniform in [−125, 125
   fused into the leaf GEMM's loads).
 - Fewer toggling bits draw fewer watts: operands in [0, 15] instead of [−125, 125] gave +7 % (SM 1910 → 2062 MHz), not
   enough to pay for a smaller modulus (that would need +60 %).
+- **Literature (checked 29-10-2026)**: no work found that combines Strassen with Ozaki-II / CRT emulation; the Ozaki-I
+  line sets Strassen aside for floating-point stability. Over Z/m the question does not arise: Strassen is exact in any
+  commutative ring, so every modulus of Ozaki-II (256, 255, 253, ... composite ones too) can use it and the CRT result is
+  bit-identical to the classical one. It pays from n ≈ 16384 on this card, where 16 residue planes (8.6 GB) and the FP64
+  matrices (6 GB) no longer fit 12 GB together: the next step streams the moduli.
 - The power limit itself: `nvidia-smi -pl` is refused on this HP ZBook (the OEM firmware sets it; the vBIOS allows 120 W,
   Dynamic Boost gives ~100–113 W with the CPU idle), and NVML reports a V/F offset range of [0, 0] (`tools/vf-offset.ps1`).
 
