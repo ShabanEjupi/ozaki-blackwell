@@ -21,3 +21,12 @@ for s in 11 12; do for e in 0.004 -0.004; do
     until ac; do sleep 60; done
     log "fd seed $s eps $e: $(OZ_AHEAD=3 OZ_DSEED=$s OZ_EPS=$e ./out_jlora $J $D/gzk2512.ids 1024 16 32 2>/dev/null | grep -o 'loss [0-9.]*')"
 done; done
+# the public corpus (Kosovo institutions, crawled 29-10): 3 steps on a batch of 4 sequences x 1024 tokens of the shuffled
+# sample (4096 tokens per step: 4x the tokens for the same 750 GB of reads), then the whole public part tokenized
+C=/opt/ozaki/jlora/corpus
+until ac; do sleep 60; done
+log "corpus: 3 steps, batch 4 x 1024 (sample.u32 from 100)"
+OZ_AHEAD=3 OZ_BATCH=4 OZ_FIRST=100 OZ_STEPS=3 OZ_LR=1e-4 ./out_jlora $J $C/sample.u32 1024 16 32 > $D/corpus.log 2> $D/corpus.err
+log "rc=$? $(grep -h ' loss \|loss by\|digest\|time' $D/corpus.log | tr '\n' ' ')"
+[ -s $C/public-2910.u32 ] || python3 -I $(pwd)/llm/korpusi_prep.py tok $J $C/public-2910.jsonl $C/public-2910 1024 >> $D/run.log 2>&1
+log "public corpus: $(head -c 300 $C/public-2910.json 2>/dev/null | tr '\n' ' ')"

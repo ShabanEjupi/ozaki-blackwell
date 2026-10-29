@@ -158,6 +158,7 @@ static void attend_back(const std::vector<float> &q, const std::vector<float> &k
 
 // ---- LoRA -----------------------------------------------------------------------------------------------------------------
 static int RK = 16; static double SC = 2.0;   // rank, alpha / rank (a power of two: the scaling is exact)
+static size_t SEQ;   // tokens per sequence: row r is position r % SEQ of sequence r / SEQ
 // A and B in FP32 (the master copy), used as BF16 in every product; m, v: Adam's moments of Bq, Bv, Aq, Av
 struct Lora { std::vector<float> Aq, Av, dBq, dBv, Bq, Bv, dAq, dAv; std::vector<double> m[4], v[4]; };
 static std::vector<Lora> LO; static void *dLA[2];
@@ -273,12 +274,12 @@ static void back_layer(int L, const std::vector<float> &h, size_t N, std::vector
     auto x1 = norm_rows(h, N1[L]);
     DevW Wq = load_w(P + "self_attn.q_proj.weight", F_BF16, QD, D_H, dAt[0]), Wk = load_w(P + "self_attn.k_proj.weight", F_BF16, KVD, D_H, dAt[1]);
     DevW Wv = load_w(P + "self_attn.v_proj.weight", F_BF16, KVD, D_H, dAt[2]), Wo = load_w(P + "self_attn.o_proj.weight", F_BF16, D_H, QD, dAt[3]);
-    auto q = lora_proj(L, 0, Wq, x1); rows_map(q, QD, [&](size_t r, std::vector<float> &v) { rope_part(v, D_Q, r); });
-    auto k = bmm(Wk, x1); rows_map(k, KVD, [&](size_t r, std::vector<float> &v) { rope_part(v, D_KV, r); });
+    auto q = lora_proj(L, 0, Wq, x1); rows_map(q, QD, [&](size_t r, std::vector<float> &v) { rope_part(v, D_Q, r % SEQ); });
+    auto k = bmm(Wk, x1); rows_map(k, KVD, [&](size_t r, std::vector<float> &v) { rope_part(v, D_KV, r % SEQ); });
     auto v = lora_proj(L, 1, Wv, x1);
     std::vector<float> o(N * QD);
     #pragma omp parallel for schedule(dynamic)
-    for (size_t r = 0; r < N; r++) attend_p(q.data() + r * QD, k.data(), v.data(), r + 1, D_Q, D_KV, D_HD, o.data() + r * QD, false);
+    for (size_t r = 0; r < N; r++) attend_p(q.data() + r * QD, k.data() + r / SEQ * SEQ * KVD, v.data() + r / SEQ * SEQ * KVD, r % SEQ + 1, D_Q, D_KV, D_HD, o.data() + r * QD, false);
     std::vector<float> hp = h; add_rows(hp, bmm(Wo, o));
     auto x2 = norm_rows(hp, N2[L]);
     // the MLP half and its backward
@@ -296,9 +297,14 @@ static void back_layer(int L, const std::vector<float> &h, size_t N, std::vector
     double tmlp = secs(t1); t_back_mlp += tmlp;
     // the attention backward
     std::vector<double> dO(N * QD, 0.0), dq, dk, dv; dgrad({Wo}, {&gh}, N, dO);
-    attend_back(q, k, v, dO, N, dq, dk, dv);
+    dq.assign(N * QD, 0.0); dk.assign(N * KVD, 0.0); dv.assign(N * KVD, 0.0);
+    for (size_t j = 0; j < N / SEQ; j++) {   // each sequence attends only to itself
+        auto cut = [&](auto &a, size_t w) { return std::vector<typename std::decay_t<decltype(a)>::value_type>(a.begin() + j * SEQ * w, a.begin() + (j + 1) * SEQ * w); };
+        std::vector<double> sq, sk, sv; attend_back(cut(q, QD), cut(k, KVD), cut(v, KVD), cut(dO, QD), SEQ, sq, sk, sv);
+        std::copy(sq.begin(), sq.end(), dq.begin() + j * SEQ * QD); std::copy(sk.begin(), sk.end(), dk.begin() + j * SEQ * KVD); std::copy(sv.begin(), sv.end(), dv.begin() + j * SEQ * KVD);
+    }
     #pragma omp parallel for schedule(static)
-    for (size_t r = 0; r < N; r++) { rope_back(dq.data() + r * QD, D_Q, r); rope_back(dk.data() + r * KVD, D_KV, r); }
+    for (size_t r = 0; r < N; r++) { rope_back(dq.data() + r * QD, D_Q, r % SEQ); rope_back(dk.data() + r * KVD, D_KV, r % SEQ); }
     lo.dBq = lora_db(dq, QD, lora_h(lo.Aq, x1), N); lo.dBv = lora_db(dv, KVD, lora_h(lo.Av, x1), N);
     std::vector<double> dx1(N * D_H, 0.0);
     if (lo.Bq.empty()) dgrad({Wq, Wk, Wv}, {&dq, &dk, &dv}, N, dx1);   // B = 0: G B = 0, no dA and no adapter term in dx1
@@ -314,30 +320,31 @@ static void back_layer(int L, const std::vector<float> &h, size_t N, std::vector
 }
 
 // ---- the loss and the backward of lm_head ---------------------------------------------------------------------------------
-static double loss_back(const std::vector<float> &hN, const std::vector<int> &toks, size_t N, std::vector<double> *g) {
-    auto hn = norm_rows(hN, NORMF); const size_t T = N - 1;
+// tgt[r]: the token row r predicts, -1 for none (the last position of each sequence)
+static double loss_back(const std::vector<float> &hN, const std::vector<int> &tgt, size_t N, std::vector<double> *g) {
+    auto hn = norm_rows(hN, NORMF); size_t T = 0; for (int y : tgt) T += y >= 0;
     std::vector<float> lg(N * (size_t)D_V);
     for (int v0 = 0; v0 < D_V; v0 += 16384) {
         DevW Ls = LM; Ls.M = std::min(16384, D_V - v0); Ls.w = (const uint16_t *)LM.w + (size_t)v0 * D_H;
         std::vector<float> y(N * Ls.M); bmm(Ls, hn.data(), N, 24, y.data());
         for (size_t r = 0; r < N; r++) std::copy(y.begin() + r * Ls.M, y.begin() + (r + 1) * Ls.M, lg.begin() + r * D_V + v0);
     }
-    std::vector<double> lr(T), mx(T), den(T);
+    std::vector<double> lr(N, 0.0), mx(N), den(N);
     #pragma omp parallel for schedule(static)
-    for (size_t r = 0; r < T; r++) { const float *l = lg.data() + r * D_V; double m = -1e300, s = 0;
+    for (size_t r = 0; r < N; r++) { if (tgt[r] < 0) continue; const float *l = lg.data() + r * D_V; double m = -1e300, s = 0;
         for (int v = 0; v < D_V; v++) m = std::max(m, (double)l[v]);
         for (int v = 0; v < D_V; v++) s += exp(l[v] - m);
-        mx[r] = m; den[r] = s; lr[r] = m + log(s) - l[toks[r + 1]]; }
-    double loss = 0; for (size_t r = 0; r < T; r++) loss += lr[r]; loss /= T;
+        mx[r] = m; den[r] = s; lr[r] = m + log(s) - l[tgt[r]]; }
+    double loss = 0; for (size_t r = 0; r < N; r++) loss += lr[r]; loss /= T;
     if (!g) return loss;
     std::vector<double> dhn(N * D_H, 0.0);
     for (int v0 = 0; v0 < D_V; v0 += 16384) {   // dL/dlogit = (softmax - onehot) / T, by slices
         DevW Ls = LM; Ls.M = std::min(16384, D_V - v0); Ls.w = (const uint16_t *)LM.w + (size_t)v0 * D_H;
         std::vector<double> d(N * (size_t)Ls.M, 0.0);
         #pragma omp parallel for schedule(static)
-        for (size_t r = 0; r < T; r++) { const float *l = lg.data() + r * D_V + v0; double *dr = d.data() + r * Ls.M;
+        for (size_t r = 0; r < N; r++) { if (tgt[r] < 0) continue; const float *l = lg.data() + r * D_V + v0; double *dr = d.data() + r * Ls.M;
             for (int v = 0; v < Ls.M; v++) dr[v] = exp(l[v] - mx[r]) / den[r] / T;
-            int y = toks[r + 1] - v0; if (y >= 0 && y < Ls.M) dr[y] -= 1.0 / T; }
+            int y = tgt[r] - v0; if (y >= 0 && y < Ls.M) dr[y] -= 1.0 / T; }
         dgrad({Ls}, {&d}, N, dhn);
     }
     norm_back(hN, NORMF, dhn, *g);
@@ -414,8 +421,20 @@ int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "--selftest")) { DIR = argv[2]; MOE = jais_init(); return back_selftest(); }
     if (argc < 3) { fprintf(stderr, "usage: out_jlora <model dir> <token ids> [tokens N] [rank r] [alpha] [dB dir] | --selftest <model dir>\n"); return 1; }
     DIR = argv[1];
-    std::vector<int> toks; { std::ifstream f(argv[2]); int v; while (f >> v) toks.push_back(v); }
-    size_t N = std::min(toks.size(), (size_t)(argc > 3 ? atol(argv[3]) : 512)); toks.resize(N);
+    // the data: a file of token ids (one sequence), or a .u32 file of sequences cut to OZ_CUT (1024) tokens: OZ_BATCH of them
+    // from number OZ_FIRST, the first N tokens of each
+    std::vector<std::vector<int>> seqs; size_t N = argc > 3 ? atol(argv[3]) : 512; std::string inp = argv[2];
+    if (inp.size() > 4 && inp.substr(inp.size() - 4) == ".u32") {
+        int B = getenv("OZ_BATCH") ? atoi(getenv("OZ_BATCH")) : 1; size_t first = getenv("OZ_FIRST") ? atol(getenv("OZ_FIRST")) : 0;
+        size_t CUT = getenv("OZ_CUT") ? atol(getenv("OZ_CUT")) : 1024; std::vector<uint32_t> b(CUT); N = std::min(N, CUT);
+        FILE *f = fopen(inp.c_str(), "rb"); if (!f) { perror(inp.c_str()); return 1; }
+        for (int j = 0; j < B; j++) { fseeko(f, (off_t)((first + j) * CUT * 4), SEEK_SET);
+            if (fread(b.data(), 4, CUT, f) != CUT) { fprintf(stderr, "%s holds no sequence %zu\n", inp.c_str(), first + j); return 1; }
+            seqs.emplace_back(b.begin(), b.begin() + N); }
+        fclose(f);
+    } else { std::vector<int> toks; std::ifstream f(inp); int v; while (f >> v) toks.push_back(v); N = std::min(toks.size(), N); toks.resize(N); seqs.push_back(toks); }
+    SEQ = N; const size_t R = seqs.size() * N;   // rows: sequence after sequence
+    std::vector<int> tgt(R, -1); for (size_t j = 0; j < seqs.size(); j++) for (size_t t = 0; t + 1 < N; t++) tgt[j * N + t] = seqs[j][t + 1];
     RK = argc > 4 ? atoi(argv[4]) : 16; double alpha = argc > 5 ? atof(argv[5]) : 32; SC = alpha / RK;
     std::string out = argc > 6 ? argv[6] : "";
     EPS = getenv("OZ_EPS") ? atof(getenv("OZ_EPS")) : 0; if (getenv("OZ_DSEED")) DSEED = strtoull(getenv("OZ_DSEED"), 0, 0); std::vector<double> FDEPS;
@@ -444,21 +463,22 @@ int main(int argc, char **argv) {
     PROJ = lora_proj; double prev = 0, predicted = 0;
     for (int st = 1; st <= STEPS; st++) {
         auto t0 = std::chrono::steady_clock::now(); t_back_mlp = t_back_att = 0;
-        BSeq s; s.prompt = 0; s.toks = toks; s.plen = N; s.end = N; s.kc.resize(NL); s.vc.resize(NL);
-        std::vector<BSeq> S{s}; std::vector<std::pair<int, size_t>> rows; for (size_t t = 0; t < N; t++) rows.push_back({0, t});
+        std::vector<BSeq> S(seqs.size()); std::vector<std::pair<int, size_t>> rows;
+        for (size_t j = 0; j < seqs.size(); j++) { auto &s = S[j]; s.prompt = j; s.toks = seqs[j]; s.plen = N; s.end = N; s.kc.resize(NL); s.vc.resize(NL);
+            for (size_t t = 0; t < N; t++) rows.push_back({(int)j, t}); }
         std::vector<std::vector<float>> HS; HSAVE = &HS; if (EPS) HEMB = perturb;
-        pass(S, rows, std::vector<bool>(N, false)); HSAVE = nullptr; S.clear();
-        std::vector<double> g(N * D_H, 0.0);
-        double loss = loss_back(HS[NL], toks, N, EPS ? nullptr : &g);
+        pass(S, rows, std::vector<bool>(R, false)); HSAVE = nullptr; S.clear();
+        std::vector<double> g(R * D_H, 0.0);
+        double loss = loss_back(HS[NL], tgt, R, EPS ? nullptr : &g);
         double tf = secs(t0);
-        printf("step %d loss %.17g (perplexity %.6g) over %zu predictions; forward %.1f s\n", st, loss, exp(loss), N - 1, tf);
+        printf("step %d loss %.17g (perplexity %.6g) over %zu predictions; forward %.1f s\n", st, loss, exp(loss), seqs.size() * (N - 1), tf);
         if (st > 1) printf("step %d: the update changed the loss by %.9e, its first-order prediction %.9e\n", st, loss - prev, predicted);
         if (EPS) return 0;
         printf("layer %d |g| %.6e\n", NL, norm2(g));
         double d0 = t_disk, b0 = bytes_disk;
         for (int L = NL - 1; L >= 0; L--) {
             auto tl = std::chrono::steady_clock::now();
-            back_layer(L, HS[L], N, g, lo[L]);
+            back_layer(L, HS[L], R, g, lo[L]);
             printf("layer %d |g| %.6e |dBq| %.6e |dBv| %.6e |dAq| %.6e |dAv| %.6e  %.1f s\n", L, norm2(g), norm2f(lo[L].dBq), norm2f(lo[L].dBv),
                    norm2f(lo[L].dAq), norm2f(lo[L].dAv), secs(tl)); fflush(stdout);
         }
