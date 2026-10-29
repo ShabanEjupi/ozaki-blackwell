@@ -10,7 +10,7 @@
 #include <utility>
 #include <cuda_runtime.h>
 #include "../src/gemm_i8.cuh"
-#define CK(x) do { cudaError_t e = (x); if (e) { printf("%s: %s\n", #x, cudaGetErrorString(e)); exit(1); } } while (0)
+#define CK(x) do { cudaError_t ck_ = (x); if (ck_) { printf("%s: %s\n", #x, cudaGetErrorString(ck_)); exit(1); } } while (0)
 
 constexpr int P = 251, HP = (P - 1) / 2;   // the largest prime below 256; residues in [-125, 125]
 
@@ -78,8 +78,8 @@ static cudaEvent_t &evt(int d, int j, int kind) { return pp.ev[(d * 2 + j) * 3 +
 // is read once and each of the 49 leaf operands written once (A: h^2 + 49/16 h^2), the 49 products run as ONE batched
 // launch, and C's 16 sub-blocks are written once from them, never read (~8 h^2 in all). Sub-block (R, c) of a 4 x 4 grid
 // is quadrant (R/2, c/2) of the outer level and (R%2, c%2) of the inner one.
-struct TwoBuf { int8_t *SA, *SB, *M; int cap; };
-struct Two { bool on = false; std::vector<TwoBuf> tb; };
+struct TwoBuf { int8_t *SA, *SB, *M, *SA2, *SB2, *M2; int cap; };   // set 2: the overlapped schedule below
+struct Two { bool on = false, ov = false; std::vector<TwoBuf> tb; cudaStream_t st[3]; cudaEvent_t ev[2][3]; };
 static Two two;
 
 struct Term { int n, idx[16], sgn[16]; };          // a linear combination of sub-blocks (A, Bt) or products (C)
@@ -121,33 +121,36 @@ template <int W, int K> __device__ __forceinline__ int tpack(const int *x) {   /
     for (int b = 0; b < 4; b++) o |= (fold(tsum<W, K>(x, b, std::make_integer_sequence<int, 16>{})) & 0xff) << (8 * b);
     return o;
 }
-template <int W, int... K> __device__ __forceinline__ void tops(const int *x, int K0, int cnt, int8_t *O, size_t ss, size_t pos, std::integer_sequence<int, K...>) {
-    ((K >= K0 && K < K0 + cnt ? (void)(*(int *)&O[(size_t)(K - K0) * ss + pos] = tpack<W, K>(x)) : (void)0), ...);
+template <int W, int... K> __device__ __forceinline__ void tops(const int (*x)[16], int K0, int cnt, int8_t *O, size_t ss, size_t pos, std::integer_sequence<int, K...>) {
+    ((K >= K0 && K < K0 + cnt ? (void)(*(int4 *)&O[(size_t)(K - K0) * ss + pos] = make_int4(tpack<W, K>(x[0]), tpack<W, K>(x[1]), tpack<W, K>(x[2]), tpack<W, K>(x[3]))) : (void)0), ...);
 }
-template <int... T> __device__ __forceinline__ void touts(const int *m, int8_t *C, int s, int ldc, size_t r, size_t c, std::integer_sequence<int, T...>) {
-    ((*(int *)&C[((T / 4) * (size_t)s + r) * ldc + (T % 4) * s + c] = tpack<2, T>(m)), ...);
+template <int... T> __device__ __forceinline__ void touts(const int (*m)[49], int8_t *C, int s, int ldc, size_t r, size_t c, std::integer_sequence<int, T...>) {
+    ((*(int2 *)&C[((T / 4) * (size_t)s + r) * ldc + (T % 4) * s + c] = make_int2(tpack<2, T>(m[0]), tpack<2, T>(m[1]))), ...);
 }
 
-// O[K - K0] (s x s, packed) = the sub-blocks of X that combination K names, summed mod p; one thread per 4 bytes
+// O[K - K0] (s x s, packed) = the sub-blocks of X that combination K names, summed mod p; 16 bytes per thread
 template <bool isB>
 __global__ void two_ops(const int8_t *X, int ld, int s, int8_t *O, int K0, int cnt) {   // combinations K0 .. K0 + cnt - 1
-    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x, w = s / 4;
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x, w = s / 16;
     if (i >= (size_t)s * w) return;
-    const size_t r = i / w, c = (i % w) * 4;
-    int x[16];
+    const size_t r = i / w, c = (i % w) * 16;
+    int x[4][16];
 #pragma unroll
-    for (int t = 0; t < 16; t++) x[t] = *(const int *)&X[((t / 4) * (size_t)s + r) * ld + (t % 4) * s + c];
+    for (int t = 0; t < 16; t++) {
+        const int4 v = *(const int4 *)&X[((t / 4) * (size_t)s + r) * ld + (t % 4) * s + c];
+        x[0][t] = v.x; x[1][t] = v.y; x[2][t] = v.z; x[3][t] = v.w;
+    }
     tops<isB ? 1 : 0>(x, K0, cnt, O, (size_t)s * s, r * s + c, std::make_integer_sequence<int, 49>{});
 }
 
-// C's 16 sub-blocks = their combinations of the 49 products, mod p (written, never read)
+// C's 16 sub-blocks = their combinations of the 49 products, mod p (written, never read); 8 bytes per thread
 __global__ void two_out(const int8_t *M, int s, int8_t *C, int ldc) {
-    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x, w = s / 4;
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x, w = s / 8;
     if (i >= (size_t)s * w) return;
-    const size_t r = i / w, c = (i % w) * 4;
-    int m[49];
+    const size_t r = i / w, c = (i % w) * 8;
+    int m[2][49];
 #pragma unroll
-    for (int K = 0; K < 49; K++) m[K] = *(const int *)&M[(size_t)K * s * s + r * s + c];
+    for (int K = 0; K < 49; K++) { const int2 v = *(const int2 *)&M[(size_t)K * s * s + r * s + c]; m[0][K] = v.x; m[1][K] = v.y; }
     touts(m, C, s, ldc, r, c, std::make_integer_sequence<int, 16>{});
 }
 
@@ -165,7 +168,7 @@ __global__ void __launch_bounds__(oz::THREADS) leafz(const int8_t *A, const int8
 static float prof[3]; static bool profon = false;   // ms in operand sums, products, output sums (depth 0, L = 2)
 static cudaEvent_t pe[4];
 static void two_rec(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t *C, int ldc, int h, int L, int t) {
-    const int s = h / 4; const size_t ss = (size_t)s * s; const unsigned g = (unsigned)((ss / 4 + 255) / 256);
+    const int s = h / 4; const size_t ss = (size_t)s * s; const unsigned g = (unsigned)((ss / 16 + 255) / 256), go = (unsigned)((ss / 8 + 255) / 256);
     const TwoBuf &b = two.tb[t];
     for (int K0 = 0; K0 < 49; K0 += b.cap) {
         const int cnt = 49 - K0 < b.cap ? 49 - K0 : b.cap;
@@ -175,10 +178,29 @@ static void two_rec(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t 
         two_ops<true><<<g, 256>>>(Bt, ldb, s, b.SB, K0, cnt);
         if (pr) cudaEventRecord(pe[1]);
         if (L == 2) leafz<<<dim3(s / oz::BN, s / oz::BM, cnt), oz::THREADS>>>(b.SA, b.SB, b.M + K0 * ss, s, G);
+        else if (L == 4 && two.ov) {   // children are two-level nodes: their passes (DRAM) overlap the products (tensor cores)
+            // of their neighbours. Child z uses set z & 1; a set's operands are rewritten once its products are done (ev 1),
+            // its products once its output pass is done (ev 2). The legacy stream (parent passes) waits for all three.
+            const TwoBuf &c = two.tb[t + 1]; const int sc = s / 4; const size_t ssc = (size_t)sc * sc;
+            const unsigned gc = (unsigned)((ssc / 16 + 255) / 256), gco = (unsigned)((ssc / 8 + 255) / 256);
+            for (int z = 0; z < cnt; z++) {
+                const int j = z & 1; int8_t *SA = j ? c.SA2 : c.SA, *SB = j ? c.SB2 : c.SB, *M = j ? c.M2 : c.M;
+                cudaStreamWaitEvent(two.st[0], two.ev[j][1]);
+                two_ops<false><<<gc, 256, 0, two.st[0]>>>(b.SA + z * ss, s, sc, SA, 0, 49);
+                two_ops<true><<<gc, 256, 0, two.st[0]>>>(b.SB + z * ss, s, sc, SB, 0, 49);
+                cudaEventRecord(two.ev[j][0], two.st[0]);
+                cudaStreamWaitEvent(two.st[1], two.ev[j][0]); cudaStreamWaitEvent(two.st[1], two.ev[j][2]);
+                leafz<<<dim3(sc / oz::BN, sc / oz::BM, 49), oz::THREADS, 0, two.st[1]>>>(SA, SB, M, sc, G);
+                cudaEventRecord(two.ev[j][1], two.st[1]);
+                cudaStreamWaitEvent(two.st[2], two.ev[j][1]);
+                two_out<<<gco, 256, 0, two.st[2]>>>(M, sc, b.M + (K0 + z) * ss, s);
+                cudaEventRecord(two.ev[j][2], two.st[2]);
+            }
+        }
         else for (int z = 0; z < cnt; z++) two_rec(b.SA + z * ss, s, b.SB + z * ss, s, b.M + (K0 + z) * ss, s, s, L - 2, t + 1);
     }
     if (profon && L == 2) cudaEventRecord(pe[2]);
-    two_out<<<g, 256>>>(b.M, s, C, ldc);
+    two_out<<<go, 256>>>(b.M, s, C, ldc);
     if (profon && L == 2) { float a, b2, c2; cudaEventRecord(pe[3]); cudaEventSynchronize(pe[3]); cudaEventElapsedTime(&a, pe[0], pe[1]);
         cudaEventElapsedTime(&b2, pe[1], pe[2]); cudaEventElapsedTime(&c2, pe[2], pe[3]); prof[0] += a; prof[1] += b2; prof[2] += c2; }
 }
@@ -238,7 +260,7 @@ static unsigned long long differing(const int8_t *C, const std::vector<int8_t> &
 }
 
 int main(int argc, char **argv) {
-    // strassen_p [maxL [G [lo hi [modes [n]]]]]: modes = bit mask, 1 serial, 2 pipelined, 4 two levels per pass
+    // strassen_p [maxL [G [lo hi [modes [n]]]]]: modes = bit mask, 1 serial, 2 pipelined, 4 two levels per pass, 8 the same overlapped
     const int maxL = argc > 1 ? atoi(argv[1]) : 4;
     if (argc > 2) G = atoi(argv[2]);
     // argv[3], argv[4]: operand range (default all residues). The GEMM is power-bound, and fewer toggling bits draw fewer watts
@@ -253,6 +275,9 @@ int main(int argc, char **argv) {
     CK(cudaStreamCreate(&pp.mm));   // blocking streams: the legacy stream (timing events, memcpy) waits for all three
     pp.ev.resize(2 * 3 * (maxL + 1));
     for (auto &ev : pp.ev) CK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    CK(cudaStreamCreateWithPriority(&two.st[0], cudaStreamDefault, phi)); CK(cudaStreamCreate(&two.st[1]));
+    CK(cudaStreamCreateWithPriority(&two.st[2], cudaStreamDefault, phi));
+    for (auto &r : two.ev) for (auto &e : r) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     for (int n : sizes) {
         const size_t nn = (size_t)n * n;
         int8_t *A, *Bt, *C;   // the reference C lives on the host: the device memory goes to the two-level buffers
@@ -265,7 +290,7 @@ int main(int argc, char **argv) {
             if (j == 0 || (modes & 2)) { CK(cudaMalloc(&w.S, s)); CK(cudaMalloc(&w.T, s)); CK(cudaMalloc(&w.M, s)); }
             ws.push_back(w);
         }
-        if ((modes & 4) && maxL >= 2) {   // depth t holds nodes of n / 4^t: deeper ones in full, depth 0 in chunks that fit
+        if ((modes & 12) && maxL >= 2) {   // depth t holds nodes of n / 4^t: deeper ones in full, depth 0 in chunks that fit
             const int T = maxL / 2; two.tb.assign(T, TwoBuf{});
             for (int t = T - 1; t >= 0; t--) {
                 const size_t s = (size_t)(n >> (2 * t + 2)), ss = s * s; int cap = 49;
@@ -273,15 +298,16 @@ int main(int argc, char **argv) {
                           cap = fr > keep + 49 * ss ? (int)((fr - keep - 49 * ss) / (2 * ss)) : 0; cap = cap > 49 ? 49 : cap; }
                 if (cap < 1) { printf("n=%d: no room for the two-level buffers\n", n); return 1; }
                 CK(cudaMalloc(&two.tb[t].SA, cap * ss)); CK(cudaMalloc(&two.tb[t].SB, cap * ss)); CK(cudaMalloc(&two.tb[t].M, 49 * ss));
+                if (t && (modes & 8)) { CK(cudaMalloc(&two.tb[t].SA2, cap * ss)); CK(cudaMalloc(&two.tb[t].SB2, cap * ss)); CK(cudaMalloc(&two.tb[t].M2, 49 * ss)); }
                 two.tb[t].cap = cap;
             }
             printf("n=%5d two-level chunk at depth 0: %d of 49 products\n", n, two.tb[0].cap);
         }
         bool mutant = false;
         cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
-        for (int L = 0; L <= maxL && (n >> L) >= 1024; L++) for (int mode = 0; mode < 3; mode++) {   // 0 serial, 1 pipelined, 2 two levels per pass
-            if (L ? !(modes >> mode & 1) || (mode == 1 && L < 1) || (mode == 2 && L < 2) : mode) continue;
-            pp.on = mode == 1; two.on = mode == 2;
+        for (int L = 0; L <= maxL && (n >> L) >= 1024; L++) for (int mode = 0; mode < 4; mode++) {   // 0 serial, 1 pipelined, 2 two levels per pass, 3 overlapped
+            if (L ? !(modes >> mode & 1) || (mode == 1 && L < 1) || (mode >= 2 && L < 2) : mode) continue;
+            pp.on = mode == 1; two.on = mode >= 2; two.ov = mode == 3;
             Pipe saved = pp; if (!pp.on) pp.add = pp.mm = pp.ac = 0;
             strassen(A, n, Bt, n, C, n, n, L, ws, 0);   // warm-up (and the L = 0 reference)
             const int reps = n >= 32768 ? 2 : 3;
@@ -313,7 +339,7 @@ int main(int argc, char **argv) {
             }
             CK(cudaGetLastError()); pp = saved;
             printf("n=%5d L=%d %s %8.2f ms  effective %6.1f TOPS  differing %llu\n",
-                   n, L, mode == 2 ? "two   " : mode ? "pipe  " : "serial", ms, 2.0 * n * n * (double)n / (ms * 1e-3) / 1e12, nb);
+                   n, L, mode == 3 ? "two-ov" : mode == 2 ? "two   " : mode ? "pipe  " : "serial", ms, 2.0 * n * n * (double)n / (ms * 1e-3) / 1e12, nb);
             if (mode == 2 && getenv("OZ_PROF")) {   // one more run, synchronised per pass: where the time goes (last chunk only when chunked)
                 for (auto &e : pe) cudaEventCreate(&e);
                 prof[0] = prof[1] = prof[2] = 0; profon = true; two.on = true; strassen(A, n, Bt, n, C, n, n, L, ws, 0); profon = false; two.on = false;
@@ -322,8 +348,8 @@ int main(int argc, char **argv) {
             fflush(stdout);
         }
         for (auto &w : ws) { cudaFree(w.S); cudaFree(w.T); cudaFree(w.M); }
-        for (auto &b : two.tb) { cudaFree(b.SA); cudaFree(b.SB); cudaFree(b.M); }
-        two = Two();
+        for (auto &b : two.tb) { cudaFree(b.SA); cudaFree(b.SB); cudaFree(b.M); cudaFree(b.SA2); cudaFree(b.SB2); cudaFree(b.M2); }
+        two.tb.clear();
         cudaFree(A); cudaFree(Bt); cudaFree(C);
     }
     return 0;
