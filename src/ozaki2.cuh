@@ -79,8 +79,8 @@ __global__ void residues(const double *X, int rows, int len, long long sRow, lon
 
 // Garner: balanced mixed-radix digits, then Horner from the top digit in FP64, then undo the two scales.
 // |v - x[t]| < 512 and the inverse < 256: the products fit int32.
-template <int NM>
-__global__ void crt(const int32_t *Cl, size_t plane, int M, int N, int ldc, const int *sa, const int *sb, double *C) {
+template <int NM, class In = int32_t>
+__global__ void crt(const In *Cl, size_t plane, int M, int N, int ldc, const int *sa, const int *sb, double *C) {
     int j = blockIdx.x * blockDim.x + threadIdx.x, i = blockIdx.y;
     if (j >= N) return;
     int x[NM];
@@ -98,6 +98,21 @@ __global__ void crt(const int32_t *Cl, size_t plane, int M, int N, int ldc, cons
 
 static int inv_mod(int a, int m) { for (int x = 1; x < m; x++) if (a * x % m == 1) return x; return 0; }
 
+// the scaling bits for nm moduli at inner dimension K: the integer product is exact while sum_k |A'||B'| < P/2
+inline int bits_for(int nm, int K, int maxbits = 62) {
+    double log2P = 0;
+    for (int l = 0; l < nm; l++) log2P += log2((double)MODULI[l]);
+    if (K >= 131072) { fprintf(stderr, "ozaki2: K=%d, the int32 accumulators hold K < 131072 (127^2 * K < 2^31)\n", K); abort(); }
+    const int b = (int)floor((log2P - 2 - log2((double)K)) / 2);
+    return b > maxbits ? maxbits : b;
+}
+inline void init_moduli() {   // c_mod, c_inv
+    int mods[MAXM], inv[MAXM][MAXM] = {};
+    for (int l = 0; l < MAXM; l++) mods[l] = MODULI[l];
+    for (int t = 0; t < MAXM; t++) for (int l = t + 1; l < MAXM; l++) inv[t][l] = inv_mod(MODULI[t] % MODULI[l], MODULI[l]);
+    cudaMemcpyToSymbol(c_mod, mods, sizeof mods); cudaMemcpyToSymbol(c_inv, inv, sizeof inv);
+}
+
 struct Plan {
     int M, N, K, Mp, Np, Kp, nm, bits;
     int8_t *Ar, *Br; int32_t *Cl; int *sa, *sb;
@@ -106,15 +121,8 @@ struct Plan {
 // A: M x K row-major, B: K x N row-major, C: M x N row-major, all device FP64
 inline Plan plan(int M, int N, int K, int nm, int maxbits = 62) {   // 62: llrint into int64; the dd path takes ~106
     Plan p{M, N, K, (M + BM - 1) / BM * BM, (N + BN - 1) / BN * BN, (K + BK - 1) / BK * BK, nm, 0};
-    double log2P = 0;
-    for (int l = 0; l < nm; l++) log2P += log2((double)MODULI[l]);
-    if (K >= 131072) { fprintf(stderr, "ozaki2: K=%d, the int32 accumulators hold K < 131072 (127^2 * K < 2^31)\n", K); abort(); }
-    p.bits = (int)floor((log2P - 2 - log2((double)K)) / 2);
-    if (p.bits > maxbits) p.bits = maxbits;
-    int mods[MAXM], inv[MAXM][MAXM] = {};
-    for (int l = 0; l < MAXM; l++) mods[l] = MODULI[l];
-    for (int t = 0; t < MAXM; t++) for (int l = t + 1; l < MAXM; l++) inv[t][l] = inv_mod(MODULI[t] % MODULI[l], MODULI[l]);
-    cudaMemcpyToSymbol(c_mod, mods, sizeof mods); cudaMemcpyToSymbol(c_inv, inv, sizeof inv);
+    p.bits = bits_for(nm, K, maxbits);
+    init_moduli();
     cudaMalloc(&p.Ar, (size_t)nm * p.Mp * p.Kp); cudaMalloc(&p.Br, (size_t)nm * p.Np * p.Kp);
     cudaMalloc(&p.Cl, (size_t)nm * p.Mp * p.Np * 4);
     cudaMemset(p.Ar, 0, (size_t)nm * p.Mp * p.Kp); cudaMemset(p.Br, 0, (size_t)nm * p.Np * p.Kp);   // padding stays 0
