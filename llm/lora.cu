@@ -85,21 +85,51 @@ static FV exmm(const char *name, const BF &A, const BF &X, int M, int N, int K, 
     CK(cudaMemcpy(dA, A.data(), A.size() * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(dX, X.data(), X.size() * 2, cudaMemcpyHostToDevice));
     CK(cudaMalloc(&digA, (size_t)TM * S * M * K)); CK(cudaMalloc(&digX, (size_t)TM * S * N * K));
     CK(cudaMalloc(&BA, (size_t)TM * M * 4)); CK(cudaMalloc(&BX, (size_t)TM * N * 4)); CK(cudaMalloc(&stat, 24)); CK(cudaMalloc(&nbad, 4));
-    CK(cudaMemset(stat, 0, 24)); CK(cudaMemset(nbad, 0, 4));
-    ex::split_rows<<<M, 256>>>(dA, digA, BA, stat, M, K, S, TM);
-    ex::split_rows<<<N, 256>>>(dX, digX, BX, stat + 3, N, K, S, TM);
-    int st[6]; CK(cudaMemcpy(st, stat, 24, cudaMemcpyDeviceToHost));
-    if (st[1] || st[2] || st[4] || st[5]) { fprintf(stderr, "%s: left over %d %d, inf/nan %d %d (more tiers needed)\n", name, st[1], st[4], st[2], st[5]); exit(1); }
-    ex::Digits Wd{digA, BA, std::max(st[0], 1), S, M, K}, Xd{digX, BX, std::max(st[3], 1), S, N, K};
-    const int Z = Wd.T * S * Xd.T * S;
-    int32_t *P; CK(cudaMalloc(&P, (size_t)Z * M * N * 4)); CK(cudaMalloc(&Y, (size_t)M * N * 4));
-    cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0);
-    ex::gemm_pairs<<<dim3(N / oz::BN, M / oz::BM, Z), oz::THREADS>>>(Wd, Xd, P, Xd.T);
-    ex::combine<<<dim3((M + 255) / 256, N), 256>>>(P, Wd, Xd, Wd.T, Xd.T, p, Y, M, nbad);
-    cudaEventRecord(e1); CK(cudaEventSynchronize(e1)); float ms; cudaEventElapsedTime(&ms, e0, e1);
+    CK(cudaMemset(stat, 0, 24)); CK(cudaMemset(nbad, 0, 4)); CK(cudaMalloc(&Y, (size_t)M * N * 4));
+    cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0);   // the time includes the split
+    int Z = 0, st[6]; float ms; char how[48];
+    bool window = !getenv("OZ_DENSE");
+    if (window) {   // each row's densest window in S digits + at most C sparse elements: S^2 planes instead of (T S)^2
+        const int C = 64; int *em, *idx, *cnt;
+        CK(cudaMalloc(&em, (size_t)(M + N) * 4)); CK(cudaMalloc(&idx, (size_t)(M + N) * C * 4)); CK(cudaMalloc(&cnt, (size_t)(M + N) * 4));
+        int32_t *P; CK(cudaMalloc(&P, (size_t)S * S * M * N * 4));   // allocated outside the timed part
+        cudaEvent_t t1, t2; cudaEventCreate(&t1); cudaEventCreate(&t2); cudaEventRecord(e0);
+        ex::split_window<<<M, 256>>>(dA, digA, BA, em, idx, cnt, stat, M, K, S, C);
+        ex::split_window<<<N, 256>>>(dX, digX, BX, em + M, idx + (size_t)M * C, cnt + M, stat + 3, N, K, S, C);
+        CK(cudaMemcpy(st, stat, 24, cudaMemcpyDeviceToHost));
+        if (st[2] || st[5]) { fprintf(stderr, "%s: inf/nan %d %d\n", name, st[2], st[5]); exit(1); }
+        if (!st[1] && !st[4]) {
+            ex::Digits Wd{digA, BA, 1, S, M, K}, Xd{digX, BX, 1, S, N, K};
+            Z = S * S;
+            cudaEventRecord(t1);
+            ex::gemm_pairs<<<dim3(N / oz::BN, M / oz::BM, Z), oz::THREADS>>>(Wd, Xd, P, 1);
+            cudaEventRecord(t2);
+            ex::combine_window<<<dim3((N + 255) / 256, M), 256>>>(P, Wd, Xd, ex::Window{dA, em, idx, cnt, C},
+                ex::Window{dX, em + M, idx + (size_t)M * C, cnt + M, C}, p, Y, M, nbad);
+            cudaEventRecord(e1); CK(cudaEventSynchronize(e1)); cudaEventElapsedTime(&ms, e0, e1);
+            if (getenv("OZ_PROF")) { float a, b; cudaEventElapsedTime(&a, e0, t1); cudaEventElapsedTime(&b, t1, t2); printf("      split %.1f  gemm %.1f  combine %.1f ms\n", a, b, ms - a - b); }
+            snprintf(how, sizeof how, "window, sparse <= %d,%d", st[0], st[3]);
+        } else { window = false; CK(cudaMemset(stat, 0, 24)); cudaEventRecord(e0); }   // a row has more than C: the tiers
+        for (void *q : {(void *)em, (void *)idx, (void *)cnt, (void *)P}) CK(cudaFree(q));
+    }
+    if (!window) {
+        ex::split_rows<<<M, 256>>>(dA, digA, BA, stat, M, K, S, TM);
+        ex::split_rows<<<N, 256>>>(dX, digX, BX, stat + 3, N, K, S, TM);
+        CK(cudaMemcpy(st, stat, 24, cudaMemcpyDeviceToHost));
+        if (st[1] || st[2] || st[4] || st[5]) { fprintf(stderr, "%s: left over %d %d, inf/nan %d %d (more tiers needed)\n", name, st[1], st[4], st[2], st[5]); exit(1); }
+        ex::Digits Wd{digA, BA, std::max(st[0], 1), S, M, K}, Xd{digX, BX, std::max(st[3], 1), S, N, K};
+        Z = Wd.T * S * Xd.T * S;
+        int32_t *P; CK(cudaMalloc(&P, (size_t)Z * M * N * 4));
+        cudaEventRecord(e0);   // the tiers are timed without their split, as before 29-10 (the window path includes its own)
+        ex::gemm_pairs<<<dim3(N / oz::BN, M / oz::BM, Z), oz::THREADS>>>(Wd, Xd, P, Xd.T);
+        ex::combine<<<dim3((M + 255) / 256, N), 256>>>(P, Wd, Xd, Wd.T, Xd.T, p, Y, M, nbad);
+        cudaEventRecord(e1); CK(cudaEventSynchronize(e1)); cudaEventElapsedTime(&ms, e0, e1);
+        CK(cudaFree(P));
+        snprintf(how, sizeof how, "tiers %d,%d", Wd.T, Xd.T);
+    }
     FV out((size_t)N * M); int bad;
     CK(cudaMemcpy(out.data(), Y, out.size() * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(&bad, nbad, 4, cudaMemcpyDeviceToHost));
-    for (void *q : {(void *)dA, (void *)dX, (void *)digA, (void *)digX, (void *)BA, (void *)BX, (void *)stat, (void *)nbad, (void *)P, (void *)Y}) CK(cudaFree(q));
+    for (void *q : {(void *)dA, (void *)dX, (void *)digA, (void *)digX, (void *)BA, (void *)BX, (void *)stat, (void *)nbad, (void *)Y}) CK(cudaFree(q));
     int fail = 0;
     for (int s = 0; s < samples; s++) {
         const int i = rng() % M, j = rng() % N;
@@ -107,8 +137,8 @@ static FV exmm(const char *name, const BF &A, const BF &X, int M, int N, int K, 
         if (fbits(r) != fbits(g)) { if (fail++ < 3) fprintf(stderr, "  %s (%d,%d): got %a, exact %a\n", name, i, j, g, r); }
     }
     g_checked += samples; g_fail += fail; g_nan += bad;
-    printf("  %-3s %5d x %5d x %5d  tiers %d,%d  %3d planes  %7.1f ms  %5.1f effective TOPS  uncertified %d  sampled %d, differ %d\n",
-           name, M, N, K, Wd.T, Xd.T, Z, ms, 2.0 * M * N * K / ms / 1e9, bad, samples, fail);
+    printf("  %-3s %5d x %5d x %5d  %-22s %3d planes  %7.1f ms  %5.1f effective TOPS  uncertified %d  sampled %d, differ %d\n",
+           name, M, N, K, how, Z, ms, 2.0 * M * N * K / ms / 1e9, bad, samples, fail);
     return out;
 }
 

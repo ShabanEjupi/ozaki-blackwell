@@ -165,6 +165,105 @@ __global__ void combine(const int32_t *__restrict__ P, Digits W, Digits X, int T
 }
 
 constexpr int BM = 64, BN = 64, THREADS = 256;
+
+// ---- one dense window + a sparse remainder ---------------------------------------------------------------------------
+// The tiers above cost T^2 times the planes, yet in a Gaussian (or outlier-heavy) row the second and third tiers hold a
+// handful of elements. split_window puts each row's densest Dc-bit exponent window into the S digit planes (one tier)
+// and lists the other elements (above or below it, at most C per row) by column; combine_window adds those products
+// exactly from the raw BF16 values: sparse(A) x all(X) + window(A) x sparse(X) + window x window (the planes) = A X.
+// em[row] = the row's largest exponent (value = m 2^e, |m| < 256), so the accumulator's base covers every term.
+__global__ void split_window(const __nv_bfloat16 *X, int8_t *dig, int *Bt, int *em, int *idx, int *cnt, int *stat, int rows, int K, int S, int C) {
+    const int j = blockIdx.x, Dc = 7 * S - 8;
+    __shared__ int hist[256], top, n;
+    for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
+    if (threadIdx.x == 0) n = 0;
+    __syncthreads();
+    int bad = 0;
+    for (int k0 = 0; k0 < K; k0 += blockDim.x) {   // K a multiple of the block: the whole warp is here
+        const int k = k0 + threadIdx.x;
+        const uint16_t b = k < K ? __bfloat16_as_ushort(X[(size_t)j * K + k]) : 0;
+        const int ex = (b >> 7) & 255, bin = ex == 255 || !(b & 0x7FFF) ? 0 : ex ? ex : 1;
+        bad += ex == 255;
+        const unsigned same = __match_any_sync(~0u, bin);   // one shared atomic per distinct exponent in the warp
+        if (bin && (threadIdx.x & 31) == __ffs(same) - 1) atomicAdd(&hist[bin], __popc(same));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {   // the window [T - Dc, T] holding the most elements; ties go to the higher one
+        int best = -1, T = -1, hi = -1, s = 0;
+        for (int t = 1; t < 255; t++) {
+            s += hist[t] - (t - Dc - 1 >= 1 ? hist[t - Dc - 1] : 0);
+            if (hist[t]) hi = t;
+            if (s >= best && s > 0) { best = s; T = t; }
+        }
+        top = T < 0 ? EMPTY : T - 134;
+        Bt[j] = T < 0 ? EMPTY : T - 134 - Dc;
+        em[j] = hi < 0 ? EMPTY : hi - 134;
+    }
+    __syncthreads();
+    const int E = top;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        const uint16_t b = __bfloat16_as_ushort(X[(size_t)j * K + k]);
+        const int ex = (b >> 7) & 255, man = b & 127, e = ex ? ex - 134 : -133;
+        int m = ex ? (man | 128) : man, Av = 0;
+        if (b & 0x8000) m = -m;
+        if (m && ex != 255) {
+            if (e <= E && E - e <= Dc) Av = m * (1 << (Dc - (E - e)));
+            else { const int p = atomicAdd(&n, 1); if (p < C) idx[(size_t)j * C + p] = k; }
+        }
+        for (int d = 0; d < S; d++) dig[(size_t)d * rows * K + (size_t)j * K + k] = (int8_t)(d < S - 1 ? (Av >> (7 * d)) & 127 : Av >> (7 * d));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) { cnt[j] = min(n, C); atomicMax(&stat[0], n); if (n > C) atomicAdd(&stat[1], 1); }
+    if (bad) atomicAdd(&stat[2], bad);
+}
+
+struct Window { const __nv_bfloat16 *raw; const int *em, *idx, *cnt; int C; };
+
+__device__ inline bool bf_parts(uint16_t b, int &m, int &e) {   // value = m 2^e; false for zero
+    const int ex = (b >> 7) & 255, man = b & 127;
+    m = ex ? (man | 128) : man; e = ex ? ex - 134 : -133;
+    if (b & 0x8000) m = -m;
+    return m != 0;
+}
+
+// Y[j][i] = the correctly rounded A_i . X_j, from the S x S planes of the two windows and the sparse lists
+__global__ void combine_window(const int32_t *__restrict__ P, Digits W, Digits X, Window wa, Window wx, int p, float *Y, int ldy, int *nbad) {
+    // a block per row i of W, threads along j: the P planes ([z][M][Np]) are read coalesced, A_i's sparse list is shared
+    const int j = blockIdx.x * blockDim.x + threadIdx.x, i = blockIdx.y, M = W.rows, Np = X.rows, K = W.K, Dc = 7 * W.S - 8;
+    if (j >= Np) return;
+    float f = 0.f;
+    if (wa.em[i] != EMPTY && wx.em[j] != EMPTY) {
+        const int base = wa.em[i] + wx.em[j] - 89, bw = W.B[i], bx = X.B[j];
+        __int128 acc = 0;
+        int lost = 0;
+        auto add = [&](long long v, int sh) {
+            if (sh >= 0) acc += (__int128)v << sh;
+            else { acc += (__int128)(v >> min(-sh, 62)); lost++; }
+        };
+        if (bw != EMPTY && bx != EMPTY)
+            for (int dw = 0; dw < W.S; dw++)
+                for (int dx = 0; dx < X.S; dx++) {
+                    const int v = P[((size_t)(dw * X.S + dx) * M + i) * Np + j];
+                    if (v) add(v, bw + bx + 7 * (dw + dx) - base);
+                }
+        const __nv_bfloat16 *ar = wa.raw + (size_t)i * K, *xr = wx.raw + (size_t)j * K;
+        int ma, ea, mx, ex;
+        for (int s = 0; s < wa.cnt[i]; s++) {   // A's sparse elements times every element of X_j
+            const int k = wa.idx[(size_t)i * wa.C + s];
+            if (bf_parts(__bfloat16_as_ushort(ar[k]), ma, ea) && bf_parts(__bfloat16_as_ushort(xr[k]), mx, ex)) add((long long)ma * mx, ea + ex - base);
+        }
+        const int Ea = bw + Dc;
+        for (int s = 0; s < wx.cnt[j]; s++) {   // X_j's sparse elements times A's window elements (the sparse ones are counted above)
+            const int k = wx.idx[(size_t)j * wx.C + s];
+            if (bf_parts(__bfloat16_as_ushort(xr[k]), mx, ex) && bf_parts(__bfloat16_as_ushort(ar[k]), ma, ea) && bw != EMPTY && ea <= Ea && Ea - ea <= Dc)
+                add((long long)ma * mx, ea + ex - base);
+        }
+        f = (float)round_i128(acc, base, p);
+        if (lost && (float)round_i128(acc + lost, base, p) != f) { atomicAdd(nbad, 1); f = __int_as_float(0x7fc00000); }
+    }
+    Y[(size_t)j * ldy + i] = f;
+}
+
 // ---- baseline: BF16 tensor cores, FP32 accumulation, split-K ---------------------------------------------------------
 // part [S][Np][M]: slice z of K; reduce adds the slices in order z = 0..S-1 (what cuBLAS / CUTLASS split-K does)
 __global__ void __launch_bounds__(THREADS) bf16_gemm(const __nv_bfloat16 *__restrict__ Wb, const __nv_bfloat16 *__restrict__ X,
