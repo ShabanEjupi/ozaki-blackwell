@@ -19,6 +19,7 @@
 #include <random>
 #include <algorithm>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include "exact.cuh"
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); exit(1); } } while (0)
@@ -203,6 +204,20 @@ int main(int argc, char **argv) {
            diff(b1.data(), b4.data(), (size_t)r * D), diff(b1.data(), br.data(), (size_t)r * D), r * D);
     printf("    split-K 1 vs correctly rounded: %ld differ, mean %.2f ulp, max %.0f ulp\n", nbr, sum / cnt, mx);
 
+    {   // the speed baseline: cuBLAS BF16 tensor cores, FP32 accumulation, the shape of Y (best of 5 after a warm-up)
+        const BF a = hcat(W, D, Bp, RP, D), x = hcat(X, D, tobf(F.H, ldexpf(1.f, ls)), RP, N); const int K = D + RP;
+        __nv_bfloat16 *da, *dx; float *dy; CK(cudaMalloc(&da, a.size() * 2)); CK(cudaMalloc(&dx, x.size() * 2)); CK(cudaMalloc(&dy, (size_t)D * N * 4));
+        CK(cudaMemcpy(da, a.data(), a.size() * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+        cublasHandle_t h; cublasCreate(&h); const float one = 1, zero = 0; float best = 1e30f;
+        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+        for (int it = 0; it < 6; it++) {
+            cudaEventRecord(e0);
+            cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, D, N, K, &one, da, CUDA_R_16BF, K, dx, CUDA_R_16BF, K, &zero, dy, CUDA_R_32F, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            cudaEventRecord(e1); CK(cudaEventSynchronize(e1)); float ms; cudaEventElapsedTime(&ms, e0, e1); if (it) best = std::min(best, ms);
+        }
+        printf("[5] cuBLAS BF16 (FP32 sums) for Y, %d x %d x %d: %.1f ms = %.1f TFLOPS\n", D, N, K, best, 2.0 * D * N * K / best / 1e9);
+        cublasDestroy(h); for (void *q : {(void *)da, (void *)dx, (void *)dy}) CK(cudaFree(q));
+    }
     printf("reference: %lld sampled outputs against the 640-bit fixed-point sum, %lld differ, %lld uncertified\n", g_checked, g_fail, g_nan);
     return g_fail || g_nan ? 2 : 0;
 }
