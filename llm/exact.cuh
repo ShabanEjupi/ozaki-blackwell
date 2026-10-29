@@ -168,48 +168,62 @@ constexpr int BM = 64, BN = 64, THREADS = 256;
 
 // ---- one dense window + a sparse remainder ---------------------------------------------------------------------------
 // The tiers above cost T^2 times the planes, yet in a Gaussian (or outlier-heavy) row the second and third tiers hold a
-// handful of elements. split_window puts each row's densest Dc-bit exponent window into the S digit planes (one tier)
-// and lists the other elements (above or below it, at most C per row) by column; combine_window adds those products
-// exactly from the raw BF16 values: sparse(A) x all(X) + window(A) x sparse(X) + window x window (the planes) = A X.
+// handful of elements. split_window puts each row's densest window into the S digit planes (one tier) and lists the other
+// elements (at most C per row); combine_window adds those products exactly from their BF16 bits:
+// sparse(A) x all(X) + window(A) x sparse(X) + window x window (the planes) = A X.
+// The window is a base L per row: an element m 2^e with its trailing zero bits dropped, m' 2^l (|m'| < 2^w), fits when
+// l >= L and its top bit l + w - 1 <= L + 7S - 1 (the top digit is a signed int8); then Av = m' 2^(l - L) and value = Av 2^L.
+// A BF16 value has w <= 8, so S = 3 gives every element 14 exponents of room; a value of narrow significand (MXFP4 or FP8
+// weights held in BF16: w = 2 or 4) gets 7S - w, so one or two digits carry a quantized row. L is the point most
+// elements' allowed ranges [top - 7S + 1, l] contain (interval stabbing, ties to the higher L).
 // idx [C][rows] (entry s of row j at s rows + j: a warp of rows reads one line), each (BF16 bits << 16) | column,
-// so a combine needs no second read of the sparse value.| column, so a combine needs no second read of the sparse value.
+// so a combine needs no second read of the sparse value.
 // em[row] = the row's largest exponent (value = m 2^e, |m| < 256), so the accumulator's base covers every term.
+__device__ inline bool bf_lsb(uint16_t b, int &m, int &l, int &top) {   // value = m 2^l, m odd; top = l + bits(|m|) - 1
+    const int ex = (b >> 7) & 255, man = b & 127;
+    int a = ex ? (man | 128) : man;
+    if (!a || ex == 255) return false;
+    const int tz = __ffs(a) - 1;
+    a >>= tz; l = (ex ? ex - 134 : -133) + tz; top = l + 31 - __clz(a);
+    m = b & 0x8000 ? -a : a;
+    return true;
+}
+constexpr int LOFF = 160, LBINS = 320;   // L + LOFF in [0, LBINS): l >= -133, top <= 127
 __global__ void split_window(const __nv_bfloat16 *X, int8_t *dig, int *Bt, int *em, int *idx, int *cnt, int *stat, int rows, int K, int S, int C) {
-    const int j = blockIdx.x, Dc = 7 * S - 8;
-    __shared__ int hist[256], top, n;
-    for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
-    if (threadIdx.x == 0) n = 0;
+    const int j = blockIdx.x, R = 7 * S - 1;   // top - L <= R: the top digit is an int8, bits 7(S-1)..7(S-1)+6 and the sign
+    __shared__ int dif[LBINS + 1], Ls, n, emax;
+    for (int b = threadIdx.x; b <= LBINS; b += blockDim.x) dif[b] = 0;
+    if (threadIdx.x == 0) { n = 0; emax = EMPTY; }
     __syncthreads();
-    int bad = 0;
-    for (int k0 = 0; k0 < K; k0 += blockDim.x) {   // K a multiple of the block: the whole warp is here
+    int bad = 0, mymax = EMPTY;
+    for (int k0 = 0; k0 < K; k0 += blockDim.x) {   // the whole warp is here, also past K
         const int k = k0 + threadIdx.x;
         const uint16_t b = k < K ? __bfloat16_as_ushort(X[(size_t)j * K + k]) : 0;
-        const int ex = (b >> 7) & 255, bin = ex == 255 || !(b & 0x7FFF) ? 0 : ex ? ex : 1;
-        bad += ex == 255;
-        const unsigned same = __match_any_sync(~0u, bin);   // one shared atomic per distinct exponent in the warp
-        if (bin && (threadIdx.x & 31) == __ffs(same) - 1) atomicAdd(&hist[bin], __popc(same));
+        bad += ((b >> 7) & 255) == 255;
+        int m, l = 0, top = 0, lo = -1, hi = -1;
+        if (bf_lsb(b, m, l, top)) { lo = top - R + LOFF; hi = l + LOFF; mymax = max(mymax, ((b >> 7) & 255 ? ((b >> 7) & 255) - 134 : -133)); }
+        if (lo > hi) lo = hi = -1;   // never for BF16: top - l <= 7 <= R
+        // one shared atomic per distinct bound in the warp
+        unsigned same = __match_any_sync(~0u, lo);
+        if (lo >= 0 && (threadIdx.x & 31) == __ffs(same) - 1) atomicAdd(&dif[max(lo, 0)], __popc(same));
+        same = __match_any_sync(~0u, hi);
+        if (hi >= 0 && (threadIdx.x & 31) == __ffs(same) - 1) atomicAdd(&dif[hi + 1], -__popc(same));
+    }
+    for (int o = 16; o; o >>= 1) mymax = max(mymax, __shfl_xor_sync(~0u, mymax, o));
+    if ((threadIdx.x & 31) == 0) atomicMax(&emax, mymax);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int s = 0, best = 0, L = EMPTY;
+        for (int b = 0; b < LBINS; b++) { s += dif[b]; if (s >= best && s > 0) { best = s; L = b - LOFF; } }
+        Ls = L; Bt[j] = L; em[j] = emax;
     }
     __syncthreads();
-    if (threadIdx.x == 0) {   // the window [T - Dc, T] holding the most elements; ties go to the higher one
-        int best = -1, T = -1, hi = -1, s = 0;
-        for (int t = 1; t < 255; t++) {
-            s += hist[t] - (t - Dc - 1 >= 1 ? hist[t - Dc - 1] : 0);
-            if (hist[t]) hi = t;
-            if (s >= best && s > 0) { best = s; T = t; }
-        }
-        top = T < 0 ? EMPTY : T - 134;
-        Bt[j] = T < 0 ? EMPTY : T - 134 - Dc;
-        em[j] = hi < 0 ? EMPTY : hi - 134;
-    }
-    __syncthreads();
-    const int E = top;
+    const int L = Ls;
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
         const uint16_t b = __bfloat16_as_ushort(X[(size_t)j * K + k]);
-        const int ex = (b >> 7) & 255, man = b & 127, e = ex ? ex - 134 : -133;
-        int m = ex ? (man | 128) : man, Av = 0;
-        if (b & 0x8000) m = -m;
-        if (m && ex != 255) {
-            if (e <= E && E - e <= Dc) Av = m * (1 << (Dc - (E - e)));
+        int m, l, top, Av = 0;
+        if (bf_lsb(b, m, l, top)) {
+            if (L != EMPTY && l >= L && top - L <= R) Av = m * (1 << (l - L));
             else { const int p = atomicAdd(&n, 1); if (p < C) idx[(size_t)p * rows + j] = (int)((uint32_t)b << 16 | (uint32_t)k); }   // the value rides with its column (K < 65536)
         }
         for (int d = 0; d < S; d++) dig[(size_t)d * rows * K + (size_t)j * K + k] = (int8_t)(d < S - 1 ? (Av >> (7 * d)) & 127 : Av >> (7 * d));
@@ -231,7 +245,7 @@ __device__ inline bool bf_parts(uint16_t b, int &m, int &e) {   // value = m 2^e
 // Y[j][i] = the correctly rounded A_i . X_j, from the S x S planes of the two windows and the sparse lists
 __global__ void combine_window(const int32_t *__restrict__ P, Digits W, Digits X, Window wa, Window wx, int p, float *Y, int ldy, int *nbad) {
     // a block per row i of W, threads along j: the P planes ([z][M][Np]) are read coalesced, A_i's sparse list is shared
-    const int j = blockIdx.x * blockDim.x + threadIdx.x, i = blockIdx.y, M = W.rows, Np = X.rows, K = W.K, Dc = 7 * W.S - 8;
+    const int j = blockIdx.x * blockDim.x + threadIdx.x, i = blockIdx.y, M = W.rows, Np = X.rows, K = W.K;
     if (j >= Np) return;
     float f = 0.f;
     if (wa.em[i] != EMPTY && wx.em[j] != EMPTY) {
@@ -254,11 +268,12 @@ __global__ void combine_window(const int32_t *__restrict__ P, Digits W, Digits X
             const uint32_t e_ = wa.idx[(size_t)s * wa.rows + i]; const int k = e_ & 0xFFFF;
             if (bf_parts(e_ >> 16, ma, ea) && bf_parts(__bfloat16_as_ushort(xr[k]), mx, ex)) add((long long)ma * mx, ea + ex - base);
         }
-        const int Ea = bw + Dc;
+        const int R = 7 * W.S - 1;   // split_window's rule: A_ik is in the window when l >= bw and top - bw <= R
         for (int s = 0; s < wx.cnt[j]; s++) {   // X_j's sparse elements times A's window elements (the sparse ones are counted above)
             const uint32_t e_ = wx.idx[(size_t)s * wx.rows + j]; const int k = e_ & 0xFFFF;
-            if (bf_parts(e_ >> 16, mx, ex) && bf_parts(__bfloat16_as_ushort(ar[k]), ma, ea) && bw != EMPTY && ea <= Ea && Ea - ea <= Dc)
-                add((long long)ma * mx, ea + ex - base);
+            int la, ta;
+            if (bf_parts(e_ >> 16, mx, ex) && bw != EMPTY && bf_lsb(__bfloat16_as_ushort(ar[k]), ma, la, ta) && la >= bw && ta - bw <= R)
+                add((long long)ma * mx, la + ex - base);
         }
         f = (float)round_i128(acc, base, p);
         if (lost && (float)round_i128(acc + lost, base, p) != f) { atomicAdd(nbad, 1); f = __int_as_float(0x7fc00000); }
