@@ -55,6 +55,46 @@ per INT8 operation (fewer moduli, fewer bit flips), not in latency hiding.
 
 Under load the laptop holds ~95 W and the SM clock drops to ~1.8 GHz (2.76 GHz on the FP64 units alone).
 
+## Past the classical ceiling: Strassen over Z/p on the tensor cores / Përtej tavanit klasik (29-10-2026, `bench/strassen_p.cu`)
+
+An Ozaki-II modulus multiplies residues mod p < 256. The sum of two residues reduced mod p is again a residue, so Strassen's
+operand sums stay int8 at every level (over the integers each level adds a bit). Effective rate = 2n³ / time, the classical
+operation count; every run is compared byte for byte with the classical product (64 entries of that checked on the CPU, plus
+a mutant byte that must be counted). n = 32768, residues uniform in [−125, 125]:
+
+| | ms | effective TOPS |
+|---|---|---|
+| classical, 128×128 tile (before today) | 553 | 127.1 |
+| classical, 128×256 tile, memory clock 9001 MHz | 443–470 | 149.7–158.7 |
+| Strassen L = 2, level by level | 456 | 154.1 |
+| **Strassen L = 2, two levels in one pass, 128×256 tile, 9001 MHz** | **375** | **187.8** |
+
+- **What the hardware gives at this power**: 46 SMs × 2048 INT8 ops/clock × 2195 MHz (measured under load, 100 W) =
+  206.8 TOPS. The 232 TOPS of the spec need ~2.46 GHz, which the laptop does not hold. Classical reaches 72–77 % of the
+  206.8; Strassen mod p reaches **91 %** of it, measured in classical operations.
+- **Two levels in one pass**: the two levels are one bilinear algorithm with 49 products whose coefficients are the
+  Kronecker products U⊗U, V⊗V, W⊗W. The 16 sub-blocks are read once, the 49 operands written once, the 49 products run as
+  one batched launch, and C's 16 sub-blocks are written once and never read: ~8 h² bytes per node instead of ~39 h².
+  n = 32768, L = 3: 125.9 → 168.5 TOPS. Table entries are template arguments; a runtime index had put the 16 sub-blocks in
+  local memory.
+- **The power cap is an energy budget (measured)**: a pure DRAM copy draws 84 W at 460 GB/s, the GEMM ~100–110 W. Putting
+  the memory passes on their own streams beside the products gained nothing twice (L = 1–3 pipelined: ±1 %; L = 4 with the
+  child passes overlapped: 433.7 vs 433.2 ms). Under a power cap time ≈ energy / P, so only fewer joules help. Lowering the
+  memory clock to 9001 MHz moves watts to the SMs (2001 → 2126 MHz): classical +10 %, Strassen +6 %.
+- **L = 4** (two passes of two levels): the 2401 products alone take 272–288 ms = **245 effective TOPS, above the 232 of the
+  spec**, but the memory passes (~180 ms at ~84 W) take it back: 164 TOPS end to end. They are the next target (operand sums
+  fused into the leaf GEMM's loads).
+- Fewer toggling bits draw fewer watts: operands in [0, 15] instead of [−125, 125] gave +7 % (SM 1910 → 2062 MHz), not
+  enough to pay for a smaller modulus (that would need +60 %).
+- The power limit itself: `nvidia-smi -pl` is refused on this HP ZBook (the OEM firmware sets it; the vBIOS allows 120 W,
+  Dynamic Boost gives ~100–113 W with the CPU idle), and NVML reports a V/F offset range of [0, 0] (`tools/vf-offset.ps1`).
+
+**SQ** — Strassen mbi Z/p te bërthamat tensor: shumat e operandëve mbeten mbetje int8 në çdo nivel. Dy nivele në një kalim
+(49 produkte me koeficientë Kronecker, një lëshim) + pllaka 128×256 + memorja 9001 MHz: **187,8 TOPS efektive te n = 32768
+= 91 % e asaj që GPU-ja jep me këtë fuqi** (206,8 TOPS te 2195 MHz), ndërsa klasiku arrin 72–77 %. Kufiri i fuqisë është
+buxhet energjie: kalimet e kujtesës (84 W) s'fshihen pas GEMM-it; te L = 4 vetë produktet japin 245 TOPS efektive (> 232),
+por kalimet e marrin mbrapsht.
+
 ## Next / Më tej (27-10-2026)
 - Kimi K3 end to end on this laptop needs 1.56 TB of storage (669 GB free; the office link gave 2.9 MB/s): an external NVMe
   and the K3 attention (KDA linear attention + MLA) on the exact products; then the whole model streams at ~27 s per token.
