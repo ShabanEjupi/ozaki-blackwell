@@ -90,7 +90,7 @@ static FV exmm(const char *name, const BF &A, const BF &X, int M, int N, int K, 
     int Z = 0, st[6]; float ms; char how[48];
     bool window = !getenv("OZ_DENSE");
     if (window) {   // each row's densest window in S digits + at most C sparse elements: S^2 planes instead of (T S)^2
-        const int C = 64; int *em, *idx, *cnt;
+        const int C = getenv("OZ_C") ? atoi(getenv("OZ_C")) : 64; int *em, *idx, *cnt;
         CK(cudaMalloc(&em, (size_t)(M + N) * 4)); CK(cudaMalloc(&idx, (size_t)(M + N) * C * 4)); CK(cudaMalloc(&cnt, (size_t)(M + N) * 4));
         int32_t *P; CK(cudaMalloc(&P, (size_t)S * S * M * N * 4));   // allocated outside the timed part
         cudaEvent_t t1, t2; cudaEventCreate(&t1); cudaEventCreate(&t2); cudaEventRecord(e0);
@@ -195,6 +195,8 @@ int main(int argc, char **argv) {
     BF W((size_t)D * D), X((size_t)N * D), G((size_t)N * D), Ap((size_t)RP * D, 0), Bp((size_t)D * RP, 0);
     for (auto &w : W) w = f2b((float)(0.02 * td(rng)));                           // heavy-tailed frozen weights
     for (int j = 0; j < N; j++) { const double sc = exp2(rng() % 8 - 4.0); for (int k = 0; k < D; k++) X[(size_t)j * D + k] = f2b((float)(sc * nd(rng))); }
+    if (const char *o = getenv("OZ_OUTLIERS"))   // LLM-style outlier channels: the same few features 2^7 larger in every token
+        for (int c = 0, n = atoi(o); c < n; c++) { const int k = rng() % D; for (int j = 0; j < N; j++) X[(size_t)j * D + k] = f2b(128.f * b2f(X[(size_t)j * D + k])); }
     for (auto &g : G) g = f2b((float)(1e-4 * td(rng)));                           // upstream gradient
     for (int q = 0; q < r; q++) for (int k = 0; k < D; k++) Ap[(size_t)q * D + k] = f2b((float)(nd(rng) / sqrt((double)D)));
     for (int i = 0; i < D; i++) for (int q = 0; q < r; q++) Bp[(size_t)i * RP + q] = f2b((float)(1e-3 * nd(rng)));
