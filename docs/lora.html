@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="sq"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LoRA i saktë — Exact LoRA step</title>
+<style>
+:root{--bg:#fbfaf7;--fg:#1d1d1b;--mut:#6b6b66;--line:#e3e0d8;--acc:#1f5f8b;--ok:#2e7d4f;--bad:#a33a2b}
+@media(prefers-color-scheme:dark){:root{--bg:#161615;--fg:#ecebe6;--mut:#9a9890;--line:#2e2d2a;--acc:#7fb3d9;--ok:#7cc79a;--bad:#e08b7e}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:28px 18px 60px}
+h1{font-size:1.55rem;margin:0 0 4px}h2{font-size:1.15rem;margin:34px 0 8px;border-bottom:1px solid var(--line);padding-bottom:4px}
+.sub{color:var(--mut);margin:0 0 20px}
+.lang{display:flex;gap:8px;margin:0 0 18px}.lang button{border:1px solid var(--line);background:none;color:var(--fg);padding:5px 12px;border-radius:6px;cursor:pointer}
+.lang button[aria-pressed=true]{background:var(--acc);color:#fff;border-color:var(--acc)}
+body.en [lang=sq], body:not(.en) [lang=en]{display:none}
+.kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin:14px 0}
+.kpi div{border:1px solid var(--line);border-radius:8px;padding:10px 12px}.kpi b{display:block;font-size:1.45rem;font-variant-numeric:tabular-nums}
+.kpi span{color:var(--mut);font-size:.85rem}
+.tw{overflow-x:auto}table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;font-size:.92rem}
+th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}
+th{color:var(--mut);font-weight:600}.ok{color:var(--ok)}.bad{color:var(--bad)}
+code{font-size:.88em;background:var(--line);padding:1px 4px;border-radius:4px}
+li{margin:4px 0}
+</style></head>
+<body><main>
+<div class="lang"><button id="bsq" aria-pressed="true">Shqip</button><button id="ben" aria-pressed="false">English</button></div>
+<h1><span lang="sq">LoRA i saktë mbi bërthamat tensor INT8</span><span lang="en">Exact LoRA on INT8 tensor cores</span></h1>
+<p class="sub"><span lang="sq">Laptop me RTX Blackwell (12 GB), 29-10-2026. Çdo produkt i rrumbullakuar saktë, një herë.</span><span lang="en">Laptop RTX Blackwell (12 GB), 2026-10-29. Every product correctly rounded, once.</span></p>
+
+<div class="kpi">
+<div><b class="ok">0 / 73 728</b><span lang="sq">mostra ndryshojnë nga referenca 640-bit</span><span lang="en">samples differ from the 640-bit reference</span></div>
+<div><b class="ok">0</b><span lang="sq">bit ndryshojnë: grup 256 vs 1024, tokenat së prapthi</span><span lang="en">bits differ: batch 256 vs 1024, tokens reversed</span></div>
+<div><b class="bad">98 %</b><span lang="sq">e dB ndryshojnë te BF16/FP32 (split-K 1 vs 4)</span><span lang="en">of dB differ in BF16/FP32 (split-K 1 vs 4)</span></div>
+<div><b>4,3×</b><span lang="sq">më shpejt se sesioni i mëparshëm (Y, D=8192)</span><span lang="en">faster than this morning (Y, D=8192)</span></div>
+</div>
+
+<h2><span lang="sq">Shpejtësia: Y = [W | B] · [X | sH]</span><span lang="en">Speed: Y = [W | B] · [X | sH]</span></h2>
+<div class="tw"><table>
+<tr><th>D</th><th><span lang="sq">mënyra</span><span lang="en">method</span></th><th><span lang="sq">plane INT8</span><span lang="en">INT8 planes</span></th><th>ms</th><th><span lang="sq">kundër cuBLAS BF16</span><span lang="en">vs cuBLAS BF16</span></th></tr>
+<tr><td>8192</td><td><span lang="sq">shtresa (mëngjes)</span><span lang="en">tiers (morning)</span></td><td>54</td><td>52,3</td><td class="bad">30×</td></tr>
+<tr><td>8192</td><td><span lang="sq">dritare + mbetje e rrallë</span><span lang="en">window + sparse rest</span></td><td>9</td><td>12,2</td><td>7,6×</td></tr>
+<tr><td>8192</td><td>cuBLAS BF16, FP32 <span lang="sq">shuma (jo i saktë)</span><span lang="en">sums (not exact)</span></td><td>—</td><td>1,6</td><td>1×</td></tr>
+<tr><td>16384</td><td><span lang="sq">shtresa</span><span lang="en">tiers</span></td><td>54</td><td>223</td><td class="bad">37×</td></tr>
+<tr><td>16384</td><td><span lang="sq">dritare + mbetje e rrallë</span><span lang="en">window + sparse rest</span></td><td>9</td><td>42,3</td><td>7,2×</td></tr>
+<tr><td>16384</td><td>cuBLAS BF16</td><td>—</td><td>5,9</td><td>1×</td></tr>
+</table></div>
+<p lang="sq">Fazat te D=8192: ndarja 1,9 ms · GEMM-i 7,1 ms (≈177 TOPS INT8, afër tavanit) · bashkimi 3,1 ms. Koha e dritares përfshin edhe ndarjen; ajo e shtresave jo.</p>
+<p lang="en">Phases at D=8192: split 1.9 ms · GEMM 7.1 ms (≈177 INT8 TOPS, near the ceiling) · combine 3.1 ms. The window time includes its split; the tiers' does not.</p>
+
+<h2><span lang="sq">Ideja</span><span lang="en">The idea</span></h2>
+<p lang="sq">Te çdo rresht, dritarja 13-bitëshe e eksponentëve me më shumë elemente shkon te 3 plane shifrash INT8. Elementet jashtë saj (6–31 për rresht, sipër ose poshtë) shtohen saktë nga vlera BF16 e papërpunuar, brenda të njëjtit akumulator 128-bitësh. Kështu duhen 9 plane në vend të 54–81, dhe rezultati mbetet bit për bit i njëjtë.</p>
+<p lang="en">Each row's densest 13-bit exponent window goes into 3 INT8 digit planes. The elements outside it (6–31 per row, above or below) are added exactly from the raw BF16 value, into the same 128-bit accumulator. That is 9 planes instead of 54–81, with the result unchanged to the bit.</p>
+
+<h2><span lang="sq">Prova kundërshtare</span><span lang="en">Adversarial checks</span></h2>
+<ul>
+<li lang="sq">6 kanale «outlier» 2⁷ si te LLM-të: mbetet te dritarja, Y 15 ms, i saktë.</li><li lang="en">6 LLM-style outlier channels (2⁷): stays on the window path, Y 15 ms, exact.</li>
+<li lang="sq">200 kanale outlier ose kufi C=8: kalon vetë te shtresat (81 plane), i saktë.</li><li lang="en">200 outlier channels or cap C=8: falls back to the tiers (81 planes), exact.</li>
+<li lang="sq">X me 2 shifra (6 plane): GEMM 4,9 ms, por 250–363 të rralla për rresht e çojnë bashkimin te 88 ms. Rezultat negativ, u la si çelës.</li><li lang="en">X with 2 digits (6 planes): GEMM 4.9 ms, but 250–363 sparse elements per row push the combine to 88 ms. Negative result, kept as a switch.</li>
+</ul>
+
+<h2><span lang="sq">Caku i radhës (≥10× përtej këtij)</span><span lang="en">Next target (≥10× beyond this)</span></h2>
+<ol>
+<li lang="sq"><b>Një kernel i bashkuar:</b> 3+3 plane ngarkohen një herë, 9 MMA, bashkimi në regjistra. Kështu zhduket shkrim-leximi i 300 MB P.</li><li lang="en"><b>One fused kernel:</b> 3+3 planes loaded once, 9 MMAs, combine in registers. This removes the 300 MB P round trip.</li>
+<li lang="sq"><b>W i ngrirë:</b> ndarja e peshave bëhet një herë për gjithë trajnimin. Peshat MXFP4 (një brez) japin 3–6 plane dhe 4× më pak bajtë nga SSD-ja.</li><li lang="en"><b>Frozen W:</b> the weights are split once for the whole run. MXFP4 weights (one band) give 3–6 planes and 4× fewer bytes from the SSD.</li>
+<li lang="sq"><b>Modeli që s'nxë në asnjë GPU:</b> q/v të Jais-3 dhe Llama rrjedhin nga SSD-ja, me hap LoRA bit për bit të riprodhueshëm. Kjo është diçka që grupi BF16 i H100-ve nuk e jep me asnjë shpejtësi.</li><li lang="en"><b>A model that fits on no GPU:</b> Jais-3 and Llama q/v streamed from the SSD, with a bit-reproducible LoRA step. A BF16 H100 cluster cannot give this at any speed.</li>
+</ol>
+<p class="sub">Kodi: <code>llm/lora.cu</code>, <code>llm/exact.cuh</code> · commit-et 29-10-2026</p>
+</main>
+<script>
+const s=document.getElementById('bsq'),e=document.getElementById('ben');
+function L(en){document.body.classList.toggle('en',en);s.setAttribute('aria-pressed',!en);e.setAttribute('aria-pressed',en);document.documentElement.lang=en?'en':'sq'}
+s.onclick=()=>L(false);e.onclick=()=>L(true);
+</script>
+</body></html>
