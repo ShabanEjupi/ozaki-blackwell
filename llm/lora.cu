@@ -91,16 +91,17 @@ static FV exmm(const char *name, const BF &A, const BF &X, int M, int N, int K, 
     bool window = !getenv("OZ_DENSE");
     if (window) {   // each row's densest window in S digits + at most C sparse elements: S^2 planes instead of (T S)^2
         const int C = getenv("OZ_C") ? atoi(getenv("OZ_C")) : 64; int *em, *idx, *cnt;
+        const int SX = getenv("OZ_SX") ? atoi(getenv("OZ_SX")) : S;   // the digits of X (the tokens): 2 = a 6-bit window, more sparse
         CK(cudaMalloc(&em, (size_t)(M + N) * 4)); CK(cudaMalloc(&idx, (size_t)(M + N) * C * 4)); CK(cudaMalloc(&cnt, (size_t)(M + N) * 4));
         int32_t *P; CK(cudaMalloc(&P, (size_t)S * S * M * N * 4));   // allocated outside the timed part
         cudaEvent_t t1, t2; cudaEventCreate(&t1); cudaEventCreate(&t2); cudaEventRecord(e0);
         ex::split_window<<<M, 256>>>(dA, digA, BA, em, idx, cnt, stat, M, K, S, C);
-        ex::split_window<<<N, 256>>>(dX, digX, BX, em + M, idx + (size_t)M * C, cnt + M, stat + 3, N, K, S, C);
+        ex::split_window<<<N, 256>>>(dX, digX, BX, em + M, idx + (size_t)M * C, cnt + M, stat + 3, N, K, SX, C);
         CK(cudaMemcpy(st, stat, 24, cudaMemcpyDeviceToHost));
         if (st[2] || st[5]) { fprintf(stderr, "%s: inf/nan %d %d\n", name, st[2], st[5]); exit(1); }
         if (!st[1] && !st[4]) {
-            ex::Digits Wd{digA, BA, 1, S, M, K}, Xd{digX, BX, 1, S, N, K};
-            Z = S * S;
+            ex::Digits Wd{digA, BA, 1, S, M, K}, Xd{digX, BX, 1, SX, N, K};
+            Z = S * SX;
             cudaEventRecord(t1);
             ex::gemm_pairs<<<dim3(N / oz::BN, M / oz::BM, Z), oz::THREADS>>>(Wd, Xd, P, 1);
             cudaEventRecord(t2);
