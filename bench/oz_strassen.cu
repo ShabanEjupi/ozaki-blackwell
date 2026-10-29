@@ -92,7 +92,8 @@ __global__ void scales_norm(const double *X, int len, int beta, int *s) {
     for (int k = threadIdx.x; k < len; k += blockDim.x) { const double v = ldexp(x[k], -e); ss = fma(v, v, ss); }
     ss = reduce(ss, false);
     // 1 + 2^-30 covers the rounding of the sum (K 2^-53) and of sqrt; the rounding of the entries (sqrt(K) / 2) sits in beta
-    if (threadIdx.x == 0) s[blockIdx.x] = mx == 0 ? 0 : beta - 1 - ilogb(ldexp(sqrt(ss) * (1 + 0x1p-30), e));
+    // the exponent of the norm as e + that of the scaled norm (in [1, 2 sqrt(K)]): no ldexp back, so no overflow near DBL_MAX
+    if (threadIdx.x == 0) s[blockIdx.x] = mx == 0 ? 0 : beta - 1 - (e + ilogb(sqrt(ss) * (1 + 0x1p-30)));
 }
 
 template <int L0, int G>
@@ -131,7 +132,7 @@ __global__ void crt_int(const int8_t *Cl, size_t plane, int n, const int *sa, co
     __int128 y = x[NM - 1];
 #pragma unroll
     for (int l = NM - 2; l >= 0; l--) y = y * oz::modulus(l) + x[l];
-    const long long hi = (long long)(y >> 64); const unsigned long long lo = (unsigned long long)y;   // |y| < 2^126: hi exact in FP64
+    const long long hi = (long long)(y >> 64); const unsigned long long lo = (unsigned long long)y;   // hi is exact in FP64 while |y| < 2^117 (nm <= 15); at 16 moduli one more rounding
     C[(size_t)i * n + j] = ldexp(fma((double)hi, 0x1p64, (double)lo), -(sa[i] + sb[j]));
 }
 

@@ -128,7 +128,9 @@ double-double reference; energy = NVML power samples every 2 ms, integrated over
   l), Bt's two moduli per read (residues 142 → 91 ms); the CRT ends in 128-bit integer Horner, one rounding instead of 13 in
   FP64 at 1/64 rate (75 → 60 ms).
 - **Bit-identical**: the residue planes of C with Strassen equal the classical ones byte for byte (0 of 3 758 096 384 differ),
-  so every FP64 entry is identical; a flipped byte (mutant) is seen. Over Z/m there is no stability question.
+  so every FP64 entry is identical; a flipped byte (mutant) is seen. Over Z/m there is no stability question. The same at
+  n = 8192 and 12288 with 14 and 16 moduli; 14 moduli stay below the native error at every size (1.45 vs 2.65, 1.34 vs 2.09,
+  2.03 vs 2.82). Below n = 16384 Strassen saves joules, not time (n = 12288: 409 → 407 ms, 45.1 → 39.5 J).
 - **Scale from the 2-norm** (`scales_norm`): |C′ᵢⱼ| ≤ ‖a′ᵢ‖·‖b′ⱼ‖ (Cauchy–Schwarz) < P/2 when every row norm, rounding
   included, is below 2^β, β = ⌊(log₂P − 1.001)/2⌋. K leaves the bound and a row spread over K entries keeps
   log₂(‖aᵢ‖/max|aᵢₖ|) more bits (~3 at K = 16384): 14 moduli reach the error 15 had with the max scale. Exact for any data.
