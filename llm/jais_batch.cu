@@ -86,6 +86,8 @@ struct BSeq { int prompt, mode = 0; std::vector<int> toks; size_t plen, end; std
               uint64_t dig = 1469598103934665603ULL; };
 static int NL; static std::vector<bool> MOE; static std::vector<std::vector<float>> N1, N2, BIAS; static std::vector<float> NORMF;
 static DevW LM; static bool VALIDATE; static std::vector<int> SCORE;
+// jais_lora.cu: HSAVE collects the residual stream entering every layer and leaving the last; HEMB may change the embeddings
+static std::vector<std::vector<float>> *HSAVE; static void (*HEMB)(std::vector<float> &);
 
 // the rows' function f(row vector) -> row vector, in parallel over rows: the per-token host code on each row as it is
 template <class F> static void rows_map(std::vector<float> &A, int K, F f) {
@@ -199,8 +201,10 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
     part0(0);
     std::vector<float> h(R * D_H);
     for (size_t r = 0; r < R; r++) { auto e = emb_row("model.embed_tokens.weight", S[rows[r].first].toks[rows[r].second], D_H); std::copy(e.begin(), e.end(), h.begin() + r * D_H); }
+    if (HEMB) HEMB(h);
     std::vector<std::vector<float>> hist(VALIDATE ? R : 0);   // every row's residual stream after every layer (the digest)
     for (int L = 0; L < NL; L++) {
+        if (HSAVE) HSAVE->push_back(h);
         std::string P = "model.layers." + std::to_string(L) + ".";
         std::vector<float> x = norm_rows(h, N1[L]);
         if (!MOE[L] && L + 1 < NL) part0(L + 1);
@@ -268,6 +272,7 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
         add_rows(h, out);
         if (VALIDATE) for (size_t r = 0; r < R; r++) hist[r].insert(hist[r].end(), h.begin() + r * D_H, h.begin() + (r + 1) * D_H);
     }
+    if (HSAVE) HSAVE->push_back(h);
     // logits of the wanted rows: lm_head in slices of 16384 vocabulary rows (the digit planes of a slice fit the GPU)
     std::vector<size_t> wr; for (size_t r = 0; r < R; r++) if (want[r]) wr.push_back(r);
     std::vector<float> hn(wr.size() * D_H), lg(wr.size() * (size_t)D_V);
@@ -295,6 +300,22 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
             st_fix, st_host, st_bad, GATT == 2 ? (", attention outputs differing GPU/host " + std::to_string(st_attdiff)).c_str() : "");
 }
 
+// the device buffers, lm_head, the norms and router biases of the NL layers (after jais_init; also jais_lora.cu's)
+static void jb_init() {
+    CK(cudaMallocHost(&pin, PIN)); CK(cudaMalloc(&dW, (size_t)D_FF * D_H * 2)); CK(cudaMalloc(&dS, (size_t)8 << 20));
+    CK(cudaMalloc(&dxm, 32768 * 4)); CK(cudaMalloc(&dxe, 32768 * 2)); CK(cudaMalloc(&dy, (size_t)D_V * 4)); CK(cudaMalloc(&dbad, 4));
+    void *dLM; CK(cudaMalloc(&dLM, (size_t)D_V * D_H * 2)); LM = load_w("lm_head.weight", F_BF16, D_V, D_H, dLM);
+    if (const char *a = getenv("OZ_AHEAD")) { ahead.start((size_t)(atof(a) * 1e9)); fprintf(stderr, "read-ahead ring %.1f GB\n", atof(a)); }
+    bmm_init((size_t)std::max(D_FF, 16384) * D_H, std::max(D_FF, D_Q * D_HD), std::max(D_FF, 16384));
+    bool whole = idx.count("model.norm.weight");
+    NORMF = whole ? vec_bf16("model.norm.weight") : std::vector<float>(D_H, 1.f);
+    N1.resize(NL); N2.resize(NL); BIAS.resize(NL);
+    for (int L = 0; L < NL; L++) { std::string P = "model.layers." + std::to_string(L) + ".";
+        N1[L] = vec_bf16(P + "input_layernorm.weight"); N2[L] = vec_bf16(P + "post_attention_layernorm.weight");
+        if (MOE[L]) BIAS[L] = vec_bf16(P + "mlp.gate.bias"); }
+}
+
+#ifndef JAIS_BATCH_LIB
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: out_jais_batch <model dir> <prompts> <new tokens> [--validate]\n"); return 1; }
     DIR = argv[1]; int NEW = atoi(argv[3]); VALIDATE = argc > 4 && !strcmp(argv[4], "--validate");
@@ -310,19 +331,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "jais_batch: %d layers (%d MoE), %zu prompts, %d new tokens%s, chunks of %zu tokens%s\n", NL,
             (int)std::count(MOE.begin(), MOE.end(), true), all.size(), NEW, per ? " each" : " (to the longest)", CHUNK, VALIDATE ? ", validate" : "");
 
-    CK(cudaMallocHost(&pin, PIN)); CK(cudaMalloc(&dW, (size_t)D_FF * D_H * 2)); CK(cudaMalloc(&dS, (size_t)8 << 20));
-    CK(cudaMalloc(&dxm, 32768 * 4)); CK(cudaMalloc(&dxe, 32768 * 2)); CK(cudaMalloc(&dy, (size_t)D_V * 4)); CK(cudaMalloc(&dbad, 4));
-    void *dLM; CK(cudaMalloc(&dLM, (size_t)D_V * D_H * 2)); LM = load_w("lm_head.weight", F_BF16, D_V, D_H, dLM);
-    if (const char *a = getenv("OZ_AHEAD")) { ahead.start((size_t)(atof(a) * 1e9)); fprintf(stderr, "read-ahead ring %.1f GB\n", atof(a)); }
-    bmm_init((size_t)std::max(D_FF, 16384) * D_H, std::max(D_FF, D_Q * D_HD), std::max(D_FF, 16384));
+    jb_init();
     GATT = getenv("OZ_GATT") ? atoi(getenv("OZ_GATT")) : 0;
     if (GATT) { size_t mr = CHUNK; for (auto &s : all) mr = std::max(mr, s.end); gatt_init(mr); }
-    bool whole = idx.count("model.norm.weight");
-    NORMF = whole ? vec_bf16("model.norm.weight") : std::vector<float>(D_H, 1.f);
-    N1.resize(NL); N2.resize(NL); BIAS.resize(NL);
-    for (int L = 0; L < NL; L++) { std::string P = "model.layers." + std::to_string(L) + ".";
-        N1[L] = vec_bf16(P + "input_layernorm.weight"); N2[L] = vec_bf16(P + "post_attention_layernorm.weight");
-        if (MOE[L]) BIAS[L] = vec_bf16(P + "mlp.gate.bias"); }
 
     std::vector<BSeq> done;
     for (size_t c0 = 0; c0 < all.size();) {
@@ -347,3 +358,4 @@ int main(int argc, char **argv) {
     ahead.finish();
     report(done);
 }
+#endif
