@@ -105,8 +105,8 @@ static FV exmm(const char *name, const BF &A, const BF &X, int M, int N, int K, 
             cudaEventRecord(t1);
             ex::gemm_pairs<<<dim3(N / oz::BN, M / oz::BM, Z), oz::THREADS>>>(Wd, Xd, P, 1);
             cudaEventRecord(t2);
-            ex::combine_window<<<dim3((N + 255) / 256, M), 256>>>(P, Wd, Xd, ex::Window{dA, em, idx, cnt, C},
-                ex::Window{dX, em + M, idx + (size_t)M * C, cnt + M, C}, p, Y, M, nbad);
+            ex::combine_window<<<dim3((N + 255) / 256, M), 256>>>(P, Wd, Xd, ex::Window{dA, em, idx, cnt, C, M},
+                ex::Window{dX, em + M, idx + (size_t)M * C, cnt + M, C, N}, p, Y, M, nbad);
             cudaEventRecord(e1); CK(cudaEventSynchronize(e1)); cudaEventElapsedTime(&ms, e0, e1);
             if (getenv("OZ_PROF")) { float a, b; cudaEventElapsedTime(&a, e0, t1); cudaEventElapsedTime(&b, t1, t2); printf("      split %.1f  gemm %.1f  combine %.1f ms\n", a, b, ms - a - b); }
             snprintf(how, sizeof how, "window, sparse <= %d,%d", st[0], st[3]);

@@ -204,14 +204,14 @@ __global__ void combine_mxw(const int32_t *__restrict__ P, const int *__restrict
             else { acc += (__int128)(v >> min(-sh, 62)); lost++; }
         };
         if (bx != EMPTY)
-            for (int a = 0; a < A; a++)
-                for (int d = 0; d < S; d++) {
-                    const int p = P[((size_t)(a * S + d) * M + i) * Np + j];
-                    if (p) add(p, smin[i] + 4 * a - 128 + bx + 7 * d - base);
-                }
+            for (int a = 0; a < A; a++) {   // a band's digits in 64 bits first: |P| < 2^27, shifts <= 7 (S - 1)
+                long long v = 0;
+                for (int d = 0; d < S; d++) v += (long long)P[((size_t)(a * S + d) * M + i) * Np + j] << (7 * d);
+                if (v) add(v, smin[i] + 4 * a - 128 + bx - base);
+            }
         const uint32_t LUT = 0xC8643210u;   // 2 E2M1
         for (int s = 0; s < cnt[j]; s++) {
-            const uint32_t e_ = idx[(size_t)j * C + s]; const int k = e_ & 0xFFFF;
+            const uint32_t e_ = idx[(size_t)s * Np + j]; const int k = e_ & 0xFFFF;
             const uint16_t b = e_ >> 16;
             const int ex = (b >> 7) & 255, m0 = ex ? ((b & 127) | 128) : (b & 127), e = ex ? ex - 134 : -133;
             const uint8_t nb = (pk[(size_t)i * (K / 2) + k / 2] >> (k & 1 ? 4 : 0)) & 15;

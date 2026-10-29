@@ -171,7 +171,8 @@ constexpr int BM = 64, BN = 64, THREADS = 256;
 // handful of elements. split_window puts each row's densest Dc-bit exponent window into the S digit planes (one tier)
 // and lists the other elements (above or below it, at most C per row) by column; combine_window adds those products
 // exactly from the raw BF16 values: sparse(A) x all(X) + window(A) x sparse(X) + window x window (the planes) = A X.
-// idx entries are (BF16 bits << 16) | column, so a combine needs no second read of the sparse value.
+// idx [C][rows] (entry s of row j at s rows + j: a warp of rows reads one line), each (BF16 bits << 16) | column,
+// so a combine needs no second read of the sparse value.| column, so a combine needs no second read of the sparse value.
 // em[row] = the row's largest exponent (value = m 2^e, |m| < 256), so the accumulator's base covers every term.
 __global__ void split_window(const __nv_bfloat16 *X, int8_t *dig, int *Bt, int *em, int *idx, int *cnt, int *stat, int rows, int K, int S, int C) {
     const int j = blockIdx.x, Dc = 7 * S - 8;
@@ -209,7 +210,7 @@ __global__ void split_window(const __nv_bfloat16 *X, int8_t *dig, int *Bt, int *
         if (b & 0x8000) m = -m;
         if (m && ex != 255) {
             if (e <= E && E - e <= Dc) Av = m * (1 << (Dc - (E - e)));
-            else { const int p = atomicAdd(&n, 1); if (p < C) idx[(size_t)j * C + p] = (int)((uint32_t)b << 16 | (uint32_t)k); }   // the value rides with its column (K < 65536)
+            else { const int p = atomicAdd(&n, 1); if (p < C) idx[(size_t)p * rows + j] = (int)((uint32_t)b << 16 | (uint32_t)k); }   // the value rides with its column (K < 65536)
         }
         for (int d = 0; d < S; d++) dig[(size_t)d * rows * K + (size_t)j * K + k] = (int8_t)(d < S - 1 ? (Av >> (7 * d)) & 127 : Av >> (7 * d));
     }
@@ -218,7 +219,7 @@ __global__ void split_window(const __nv_bfloat16 *X, int8_t *dig, int *Bt, int *
     if (bad) atomicAdd(&stat[2], bad);
 }
 
-struct Window { const __nv_bfloat16 *raw; const int *em, *idx, *cnt; int C; };
+struct Window { const __nv_bfloat16 *raw; const int *em, *idx, *cnt; int C, rows; };   // idx [C][rows]
 
 __device__ inline bool bf_parts(uint16_t b, int &m, int &e) {   // value = m 2^e; false for zero
     const int ex = (b >> 7) & 255, man = b & 127;
@@ -241,21 +242,21 @@ __global__ void combine_window(const int32_t *__restrict__ P, Digits W, Digits X
             if (sh >= 0) acc += (__int128)v << sh;
             else { acc += (__int128)(v >> min(-sh, 62)); lost++; }
         };
-        if (bw != EMPTY && bx != EMPTY)
+        if (bw != EMPTY && bx != EMPTY) {   // the planes in 64 bits first: |P| <= K 2^14 < 2^29, shifts <= 28: < 2^58
+            long long v = 0;
             for (int dw = 0; dw < W.S; dw++)
-                for (int dx = 0; dx < X.S; dx++) {
-                    const int v = P[((size_t)(dw * X.S + dx) * M + i) * Np + j];
-                    if (v) add(v, bw + bx + 7 * (dw + dx) - base);
-                }
+                for (int dx = 0; dx < X.S; dx++) v += (long long)P[((size_t)(dw * X.S + dx) * M + i) * Np + j] << (7 * (dw + dx));
+            if (v) add(v, bw + bx - base);
+        }
         const __nv_bfloat16 *ar = wa.raw + (size_t)i * K, *xr = wx.raw + (size_t)j * K;
         int ma, ea, mx, ex;
         for (int s = 0; s < wa.cnt[i]; s++) {   // A's sparse elements times every element of X_j
-            const uint32_t e_ = wa.idx[(size_t)i * wa.C + s]; const int k = e_ & 0xFFFF;
+            const uint32_t e_ = wa.idx[(size_t)s * wa.rows + i]; const int k = e_ & 0xFFFF;
             if (bf_parts(e_ >> 16, ma, ea) && bf_parts(__bfloat16_as_ushort(xr[k]), mx, ex)) add((long long)ma * mx, ea + ex - base);
         }
         const int Ea = bw + Dc;
         for (int s = 0; s < wx.cnt[j]; s++) {   // X_j's sparse elements times A's window elements (the sparse ones are counted above)
-            const uint32_t e_ = wx.idx[(size_t)j * wx.C + s]; const int k = e_ & 0xFFFF;
+            const uint32_t e_ = wx.idx[(size_t)s * wx.rows + j]; const int k = e_ & 0xFFFF;
             if (bf_parts(e_ >> 16, mx, ex) && bf_parts(__bfloat16_as_ushort(ar[k]), ma, ea) && bw != EMPTY && ea <= Ea && Ea - ea <= Dc)
                 add((long long)ma * mx, ea + ex - base);
         }
