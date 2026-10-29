@@ -30,13 +30,21 @@ __device__ __forceinline__ void load_tile(int8_t *s, const int8_t *g, int ld, in
 // the block's 128 x 128 tile of A Bt; epi(row, col, c00, c01, c10, c11) gets (row, col..col+1) and (row + 8, col..col+1)
 template <class Epi>
 __device__ __forceinline__ void gemm_i8_tile(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int K, Epi epi,
-                                             int lda = 0, int ldb = 0) {   // row strides; 0 = K (sub-blocks of a bigger matrix: Strassen)
+                                             int lda = 0, int ldb = 0, int group = 0) {   // row strides; 0 = K (sub-blocks of a bigger matrix: Strassen)
+    // group > 0: blocks walk the grid in bands of `group` tile rows, column by column, so a band's A rows and the B columns
+    // in use stay in L2 (row-major order re-reads all of B per tile row: n = 32768 fell to 86 TOPS from ~130 at 4096)
+    int bx = blockIdx.x, by = blockIdx.y;
+    if (group) {
+        const int pid = by * gridDim.x + bx, span = group * gridDim.x, first = pid / span * group;
+        const int gs = min((int)gridDim.y - first, group);
+        by = first + (pid % span) % gs; bx = (pid % span) / gs;
+    }
     if (!lda) lda = K;
     if (!ldb) ldb = K;
     __shared__ __align__(128) int8_t sA[STAGES][BM * BK], sB[STAGES][BN * BK];   // 3 x 16 KB = the 48 KB static limit
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = (warp >> 2) * 64, wn = (warp & 3) * 32;   // this warp's corner inside the block tile
-    const int8_t *gA = A + (size_t)blockIdx.y * BM * lda, *gB = Bt + (size_t)blockIdx.x * BN * ldb;
+    const int8_t *gA = A + (size_t)by * BM * lda, *gB = Bt + (size_t)bx * BN * ldb;
 
     int32_t acc[4][4][4] = {};   // [m16 tile][n8 tile][fragment]
     const int kt = K / BK;
@@ -93,7 +101,7 @@ __device__ __forceinline__ void gemm_i8_tile(const int8_t *__restrict__ A, const
     for (int mi = 0; mi < 4; mi++)
 #pragma unroll
         for (int nj = 0; nj < 4; nj++) {
-            int row = blockIdx.y * BM + wm + mi * 16 + g, col = blockIdx.x * BN + wn + nj * 8 + q * 2;
+            int row = by * BM + wm + mi * 16 + g, col = bx * BN + wn + nj * 8 + q * 2;
             epi(row, col, acc[mi][nj][0], acc[mi][nj][1], acc[mi][nj][2], acc[mi][nj][3]);
         }
 }

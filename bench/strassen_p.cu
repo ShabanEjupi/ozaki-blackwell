@@ -18,11 +18,13 @@ __device__ __forceinline__ int8_t modp(int x) {
 }
 
 // leaf: C (h x h residues, row stride ldc) = A B mod p; B is given transposed (Bt, K contiguous)
-__global__ void __launch_bounds__(oz::THREADS) leaf(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t *C, int ldc, int h) {
+static int G = 8;   // block rasterization band (argv[2]; 0 = row-major, as every other caller)
+
+__global__ void __launch_bounds__(oz::THREADS) leaf(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t *C, int ldc, int h, int g) {
     oz::gemm_i8_tile(A, Bt, h, [&](int r, int c, int c00, int c01, int c10, int c11) {
         *(char2 *)&C[(size_t)r * ldc + c] = make_char2(modp(c00), modp(c01));
         *(char2 *)&C[(size_t)(r + 8) * ldc + c] = make_char2(modp(c10), modp(c11));
-    }, lda, ldb);
+    }, lda, ldb, g);
 }
 
 // Z = X + s Y mod p (h x h, 16 bytes per thread)
@@ -63,7 +65,7 @@ struct Ws { int8_t *S, *T, *M; };   // one set per recursion depth, (h/2)^2 each
 // C = A B mod p, h x h, L Strassen levels (B transposed: block B_ij of B is block (j, i) of Bt)
 static void strassen(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t *C, int ldc, int h, int L,
                      std::vector<Ws> &ws, int d) {
-    if (L == 0) { leaf<<<dim3(h / oz::BN, h / oz::BM), oz::THREADS>>>(A, lda, Bt, ldb, C, ldc, h); return; }
+    if (L == 0) { leaf<<<dim3(h / oz::BN, h / oz::BM), oz::THREADS>>>(A, lda, Bt, ldb, C, ldc, h, G); return; }
     const int q = h / 2;
     const int8_t *A11 = A, *A12 = A + q, *A21 = A + (size_t)q * lda, *A22 = A21 + q;
     const int8_t *B11 = Bt, *B12 = Bt + (size_t)q * ldb, *B21 = Bt + q, *B22 = B12 + q;
@@ -96,6 +98,8 @@ __global__ void diff(const int8_t *X, const int8_t *Y, size_t n, unsigned long l
 
 int main(int argc, char **argv) {
     const int maxL = argc > 1 ? atoi(argv[1]) : 4;
+    if (argc > 2) G = atoi(argv[2]);
+    printf("block band G=%d\n", G);
     for (int n : {8192, 16384, 32768}) {
         const size_t nn = (size_t)n * n;
         int8_t *A, *Bt, *C0, *C;
@@ -119,7 +123,7 @@ int main(int argc, char **argv) {
             // the same number of leaf GEMMs alone, back to back: how much of the time is tensor-core work
             const int h = n >> L; size_t leaves = 1; for (int l = 0; l < L; l++) leaves *= 7;
             cudaEventRecord(t0);
-            for (size_t j = 0; j < leaves; j++) leaf<<<dim3(h / oz::BN, h / oz::BM), oz::THREADS>>>(A, n, Bt, n, C, n, h);
+            for (size_t j = 0; j < leaves; j++) leaf<<<dim3(h / oz::BN, h / oz::BM), oz::THREADS>>>(A, n, Bt, n, C, n, h, G);
             cudaEventRecord(t1); CK(cudaEventSynchronize(t1));
             float gm; cudaEventElapsedTime(&gm, t0, t1);
             unsigned long long nb = 0;
