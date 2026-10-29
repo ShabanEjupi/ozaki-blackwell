@@ -30,7 +30,7 @@ $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.855~s at $n=8192$, $499
 and double-double have no correct digit, a triple-double LU on the GPU is $32\times$ faster than the same arithmetic on 24 CPU
 threads and $145\times$ faster than MPFR, and is the most accurate of the three. Counting CPU and GPU power, a double-double
 solve uses $\sim$270$\times$ less energy than the quad-precision CPU solve. Leaving 8-bit moduli for primes below $2^{16}$ and $2^{23}$ split into bytes, an \emph{exact} product of integer matrices with entries of 1\,015 to 131\,063 bits costs work linear in the bits, is bit-exact against GMP, and runs $10$--$19\times$ faster than FLINT's multimodular \texttt{fmpz\_mat\_mul} on 24 CPU threads, with $15$--$18\times$ less energy. Turning the problem around---int8 in, residues out---the exact determinant of an int8 matrix comes $224\times$ sooner than FLINT at $n=4096$ and $355\times$ at $n=8192$ (98\,139 bits), with a proved bound on $|\det A|$ tight to one bit, and $n=16\,384$ (204\,480 bits) takes 66~s, $n=32\,768$ (425\,348 bits) 594~s within the 12~GB of the GPU. For entries of 32 to 256 bits, high-order lifting on the same modular GEMMs (the residue squared in RNS, the solution vector carried through INT8 GEMMs) and a proved bound for byte-plane entries give the determinant $236\times$ sooner than FLINT at $n=2048$ with 64-bit entries, $306\times$ with 128-bit entries and $265\times$ at $n=4096$ (276\,398 bits in 3.3~s against 868~s): the ratio grows with the entry size. The laptop is power-bound ($\sim$95~W) under these
-kernels, which shapes what can and cannot be gained. On 15 of the most ill-conditioned real matrices of NIST Matrix Market ($n\le10\,000$, entries up to 154 bits) the certified exact solution takes 0.2--115~s, up to $\sim$900$\times$ sooner than SPEX; FP64 has no correct digit on 8 of them. The same units give correctly rounded MXFP4 and BF16 products: on the real weights of Kimi K3 (2.78 trillion parameters, the largest open-weights model) every output of 48 expert matrices is certified and identical for any batch, where BF16 tensor cores with FP32 accumulation round 51--83\% of them differently; at decode the exact kernel reads 94~GB/s, $18\times$ the laptop's NVMe, so reproducibility costs nothing when such a model streams from disk. On Nemotron~3 Ultra (560 billion parameters) the GPU's own NVFP4 tensor-core instruction leaves 18--49\% of an expert's outputs not correctly rounded, and the correctly rounded product costs $4\times$ at instruction peak in prefill and nothing in decode: the whole model runs from the laptop's disk with every linear map correctly rounded (1.54 billion outputs certified, 19.6~s per token, as fast as FP32 accumulation), while FP32-accumulating engines round 42--49\% of its router logits differently and, on two of three prompts, depart from the exact text within 29 tokens. Batched, the same exactness holds: Jais-3 (375 billion parameters, FP8 experts) run layer by layer over many tokens gives the token-by-token run bit for bit, and answers 73.4\% of CTIBench's 2\,500 multiple-choice security questions and maps 73.8\% of 1\,000 vulnerability descriptions to their CWE, with every product certified.
+kernels, which shapes what can and cannot be gained: Strassen's algorithm over $\mathbb{Z}/m$, exact in any ring and therefore usable for every modulus, gives 187.8 effective TOPS at $n=32\,768$, 91\% of the 206.8~TOPS the GPU sustains at that power (the classical product reaches 72--77\%), once two levels run in one pass. On 15 of the most ill-conditioned real matrices of NIST Matrix Market ($n\le10\,000$, entries up to 154 bits) the certified exact solution takes 0.2--115~s, up to $\sim$900$\times$ sooner than SPEX; FP64 has no correct digit on 8 of them. The same units give correctly rounded MXFP4 and BF16 products: on the real weights of Kimi K3 (2.78 trillion parameters, the largest open-weights model) every output of 48 expert matrices is certified and identical for any batch, where BF16 tensor cores with FP32 accumulation round 51--83\% of them differently; at decode the exact kernel reads 94~GB/s, $18\times$ the laptop's NVMe, so reproducibility costs nothing when such a model streams from disk. On Nemotron~3 Ultra (560 billion parameters) the GPU's own NVFP4 tensor-core instruction leaves 18--49\% of an expert's outputs not correctly rounded, and the correctly rounded product costs $4\times$ at instruction peak in prefill and nothing in decode: the whole model runs from the laptop's disk with every linear map correctly rounded (1.54 billion outputs certified, 19.6~s per token, as fast as FP32 accumulation), while FP32-accumulating engines round 42--49\% of its router logits differently and, on two of three prompts, depart from the exact text within 29 tokens. Batched, the same exactness holds: Jais-3 (375 billion parameters, FP8 experts) run layer by layer over many tokens gives the token-by-token run bit for bit, and answers 73.4\% of CTIBench's 2\,500 multiple-choice security questions and maps 73.8\% of 1\,000 vulnerability descriptions to their CWE, with every product certified.
 \end{abstract}
 
 \noindent\textbf{Përmbledhje (shqip).} Kartelat grafike të laptopëve e ekzekutojnë FP64 me 1/64 e shpejtësisë FP32, ndërsa
@@ -542,9 +542,42 @@ dd LU on the GPU & 0.238 s & 28.2 W & 68.3 W & \textbf{23 J} \\\bottomrule
 That is $\sim$270$\times$ less energy per solve with both CPU and GPU counted ($360\times$ GPU alone against CPU package alone).
 DRAM power is not exposed on this laptop.
 
+\section{Past the classical ceiling: Strassen over $\mathbb{Z}/m$}\label{sec:strassen}
+Every Ozaki-II product is a product of residues modulo $m\le256$. Strassen's algorithm~\cite{strassen} is exact in any
+commutative ring, so it applies to every modulus, composite ones included, and its operand sums, reduced modulo $m$, are again
+residues: unlike over the integers, no level adds a bit, and every level stays on the INT8 tensor cores. The result is
+bit-identical to the classical product, so the stability question that keeps fast algorithms out of floating-point emulation
+does not arise. We count the \emph{effective} rate $2n^3/t$ in classical operations and check every run byte for byte against
+the classical product (64 of whose entries are recomputed on the CPU, and a changed byte must be counted).
+\begin{center}\begin{tabular}{lrr}\toprule
+$n=32\,768$, residues mod 251 & time & effective TOPS \\\midrule
+classical, $128\times128$ tile & 553 ms & 127.1 \\
+classical, $128\times256$ tile, memory clock 9001 MHz & 443--470 ms & 149.7--158.7 \\
+Strassen, 2 levels, level by level & 456 ms & 154.1 \\
+\textbf{Strassen, 2 levels in one pass, $128\times256$, 9001 MHz} & \textbf{375 ms} & \textbf{187.8} \\\bottomrule
+\end{tabular}\end{center}
+\emph{Two levels in one pass.} Two levels of Strassen are one bilinear algorithm with 49 products whose coefficients are the
+Kronecker products $U\otimes U$, $V\otimes V$, $W\otimes W$ of the one-level ones. Each of the 16 sub-blocks is read once and
+each of the 49 operands written once, the 49 products run as one batched launch, and the 16 sub-blocks of $C$ are written once
+and never read: about $8h^2$ bytes per node of size $h$ instead of $\sim$39$h^2$ level by level (at $n=32\,768$ with three
+levels, 125.9 $\to$ 168.5 effective TOPS).
+
+\emph{What the hardware gives.} Under this load the GPU draws 100~W and holds 2195~MHz: 46 SMs $\times$ 2048 INT8
+operations per clock give 206.8~TOPS; the 232~TOPS of the specification need $\sim$2.46~GHz, which the laptop does not
+sustain. The classical product reaches 72--77\% of the 206.8; Strassen modulo $m$ reaches 91\%, in classical operations.
+
+\emph{The power cap is an energy budget.} A pure DRAM copy draws 84~W at 460~GB/s, the GEMM 100--110~W. Running the memory
+passes on separate streams beside the products, which use different units, gained nothing (433.7 against 433.2~ms at four
+levels); lowering the memory clock moved watts to the SMs (classical $+10\%$), and a tile that reads a third fewer
+shared-memory bytes per multiply-add gave $+12$--$19\%$. Under a power cap time is energy divided by power: only fewer joules
+help. At four levels the 2\,401 products alone take 272~ms, 258 effective TOPS, above the specification; the memory passes
+($\sim$180~ms) take it back to 164. Fusing the operand sums into the products' loads is the next step.
+
 \section{Limitations}
-The INT8 GEMMs are power-bound on this laptop, so a faster kernel does not translate into time; gains come from fewer
-operations (fewer moduli) and less data movement. The cost of the higher precisions grows roughly with the square of the
+The INT8 GEMMs are power-bound on this laptop, so hiding latency does not translate into time; gains come from fewer
+operations (fewer moduli, Strassen's seven products for eight) and less data movement, including inside the kernel
+(Section~\ref{sec:strassen}). Strassen pays from $n\approx16\,384$ here, where 16 residue planes and the FP64 operands no
+longer fit 12~GB together; using it inside the FP64 emulation needs the moduli streamed. The cost of the higher precisions grows roughly with the square of the
 number of slices, as MPFR's does at these sizes, so the ratio against MPFR does not grow without bound; it is largest
 against software emulation of each width. The triple-double solver is panel-bound at $n=4096$. Kernel launches cost
 $\sim$7~$\mu$s under WSL2 (0.83~$\mu$s per node in a CUDA graph), which matters for the many small launches of the panel.
@@ -572,6 +605,7 @@ the panel (now the bound of the triple-double solve), CUDA graphs for its launch
 \bibitem{spex} C.~Lourenco, J.~Chen, E.~Moreno-Centeno, T.~A.~Davis. Algorithm 1021: SPEX Left LU, exactly solving sparse linear
 systems via a sparse left-looking integer-preserving LU factorization. \emph{ACM Trans. Math. Softw.} 48(2):1--23, 2022.
 doi:10.1145/3519024.
+\bibitem{strassen} V.~Strassen. Gaussian elimination is not optimal. \emph{Numerische Mathematik} 13:354--356, 1969.
 \bibitem{ozaki2} K.~Ozaki, Y.~Uchino, T.~Imamura. Ozaki Scheme II: A GEMM-oriented emulation of floating-point matrix
 multiplication using an integer modular technique. arXiv:2504.08009, 2025.
 \bibitem{ozaki2sgemm} Y.~Uchino, K.~Ozaki, T.~Imamura. High-performance and power-efficient emulation of matrix
