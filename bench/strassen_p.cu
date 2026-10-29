@@ -22,8 +22,9 @@ __device__ __forceinline__ int8_t modp(int x) {
 // leaf: C (h x h residues, row stride ldc) = A B mod p; B is given transposed (Bt, K contiguous)
 static int G = 8;   // block rasterization band (argv[2]; 0 = row-major, as every other caller)
 
-__global__ void __launch_bounds__(oz::THREADS) leaf(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t *C, int ldc, int h, int g) {
-    oz::gemm_i8_tile(A, Bt, h, [&](int r, int c, int c00, int c01, int c10, int c11) {
+template <int WN, int ST>
+__global__ void __launch_bounds__(oz::THREADS, 1) leaf(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t *C, int ldc, int h, int g) {
+    oz::gemm_i8_tile<WN, ST>(A, Bt, h, [&](int r, int c, int c00, int c01, int c10, int c11) {
         *(char2 *)&C[(size_t)r * ldc + c] = make_char2(modp(c00), modp(c01));
         *(char2 *)&C[(size_t)(r + 8) * ldc + c] = make_char2(modp(c10), modp(c11));
     }, lda, ldb, g);
@@ -156,9 +157,10 @@ __global__ void two_out(const int8_t *M, int s, int8_t *C, int ldc) {
 
 
 // the 49 leaf products in one launch: blockIdx.z picks the product, operands and results packed s x s
-__global__ void __launch_bounds__(oz::THREADS) leafz(const int8_t *A, const int8_t *Bt, int8_t *C, int s, int g) {
+template <int WN, int ST>
+__global__ void __launch_bounds__(oz::THREADS, 1) leafz(const int8_t *A, const int8_t *Bt, int8_t *C, int s, int g) {
     const size_t o = (size_t)blockIdx.z * s * s;
-    oz::gemm_i8_tile(A + o, Bt + o, s, [&](int r, int c, int c00, int c01, int c10, int c11) {
+    oz::gemm_i8_tile<WN, ST>(A + o, Bt + o, s, [&](int r, int c, int c00, int c01, int c10, int c11) {
         *(char2 *)&C[o + (size_t)r * s + c] = make_char2(modp(c00), modp(c01));
         *(char2 *)&C[o + (size_t)(r + 8) * s + c] = make_char2(modp(c10), modp(c11));
     }, s, s, g);
@@ -167,6 +169,23 @@ __global__ void __launch_bounds__(oz::THREADS) leafz(const int8_t *A, const int8
 // C = A B mod p with L (even) levels, two per pass; the 49 products are leaves (L = 2, one batched launch) or two_rec again
 static float prof[3]; static bool profon = false;   // ms in operand sums, products, output sums (depth 0, L = 2)
 static cudaEvent_t pe[4];
+// the leaf tile: OZ_TILE = 32x3 (128 x 128, 3 stages, the default), 64x3 or 64x4 (128 x 256: warps 64 x 64)
+static int TILE = 0;   // 0, 1, 2 = 32x3, 64x3, 64x4
+template <int WN, int ST> static void grant() {
+    CK(cudaFuncSetAttribute(leaf<WN, ST>, cudaFuncAttributeMaxDynamicSharedMemorySize, oz::gemm_smem<WN, ST>()));
+    CK(cudaFuncSetAttribute(leafz<WN, ST>, cudaFuncAttributeMaxDynamicSharedMemorySize, oz::gemm_smem<WN, ST>()));
+}
+template <int WN, int ST> static void leaf_go(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t *C, int ldc, int h, int z, cudaStream_t st) {
+    if (z) leafz<WN, ST><<<dim3(h / (4 * WN), h / oz::BM, z), oz::THREADS, oz::gemm_smem<WN, ST>(), st>>>(A, Bt, C, h, G);
+    else leaf<WN, ST><<<dim3(h / (4 * WN), h / oz::BM), oz::THREADS, oz::gemm_smem<WN, ST>(), st>>>(A, lda, Bt, ldb, C, ldc, h, G);
+}
+// C = A B mod p (h x h); z > 0: z products packed h x h (A, Bt, C contiguous, the ld arguments unused)
+static void leaf_run(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t *C, int ldc, int h, int z, cudaStream_t st) {
+    if (TILE == 1) leaf_go<64, 3>(A, lda, Bt, ldb, C, ldc, h, z, st);
+    else if (TILE == 2) leaf_go<64, 4>(A, lda, Bt, ldb, C, ldc, h, z, st);
+    else leaf_go<32, 3>(A, lda, Bt, ldb, C, ldc, h, z, st);
+}
+
 static void two_rec(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t *C, int ldc, int h, int L, int t) {
     const int s = h / 4; const size_t ss = (size_t)s * s; const unsigned g = (unsigned)((ss / 16 + 255) / 256), go = (unsigned)((ss / 8 + 255) / 256);
     const TwoBuf &b = two.tb[t];
@@ -177,7 +196,7 @@ static void two_rec(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t 
         two_ops<false><<<g, 256>>>(A, lda, s, b.SA, K0, cnt);
         two_ops<true><<<g, 256>>>(Bt, ldb, s, b.SB, K0, cnt);
         if (pr) cudaEventRecord(pe[1]);
-        if (L == 2) leafz<<<dim3(s / oz::BN, s / oz::BM, cnt), oz::THREADS>>>(b.SA, b.SB, b.M + K0 * ss, s, G);
+        if (L == 2) leaf_run(b.SA, 0, b.SB, 0, b.M + K0 * ss, 0, s, cnt, 0);
         else if (L == 4 && two.ov) {   // children are two-level nodes: their passes (DRAM) overlap the products (tensor cores)
             // of their neighbours. Child z uses set z & 1; a set's operands are rewritten once its products are done (ev 1),
             // its products once its output pass is done (ev 2). The legacy stream (parent passes) waits for all three.
@@ -190,7 +209,7 @@ static void two_rec(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t 
                 two_ops<true><<<gc, 256, 0, two.st[0]>>>(b.SB + z * ss, s, sc, SB, 0, 49);
                 cudaEventRecord(two.ev[j][0], two.st[0]);
                 cudaStreamWaitEvent(two.st[1], two.ev[j][0]); cudaStreamWaitEvent(two.st[1], two.ev[j][2]);
-                leafz<<<dim3(sc / oz::BN, sc / oz::BM, 49), oz::THREADS, 0, two.st[1]>>>(SA, SB, M, sc, G);
+                leaf_run(SA, 0, SB, 0, M, 0, sc, 49, two.st[1]);
                 cudaEventRecord(two.ev[j][1], two.st[1]);
                 cudaStreamWaitEvent(two.st[2], two.ev[j][1]);
                 two_out<<<gco, 256, 0, two.st[2]>>>(M, sc, b.M + (K0 + z) * ss, s);
@@ -208,7 +227,7 @@ static void two_rec(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t 
 // C = A B mod p, h x h, L Strassen levels (B transposed: block B_ij of B is block (j, i) of Bt)
 static void strassen(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t *C, int ldc, int h, int L,
                      std::vector<Ws> &ws, int d) {
-    if (L == 0) { leaf<<<dim3(h / oz::BN, h / oz::BM), oz::THREADS, 0, pp.mm>>>(A, lda, Bt, ldb, C, ldc, h, G); return; }
+    if (L == 0) { leaf_run(A, lda, Bt, ldb, C, ldc, h, 0, pp.mm); return; }
     if (two.on && L % 2 == 0) { two_rec(A, lda, Bt, ldb, C, ldc, h, L, 0); return; }   // odd L: this level as below, then pairs
     const int q = h / 2;
     const int8_t *A11 = A, *A12 = A + q, *A21 = A + (size_t)q * lda, *A22 = A21 + q;
@@ -269,10 +288,12 @@ int main(int argc, char **argv) {
     const int modes = argc > 5 ? atoi(argv[5]) : 7;
     std::vector<int> sizes = {8192, 16384, 32768};
     if (argc > 6) sizes = {atoi(argv[6])};
-    printf("block band G=%d, operands in [%d, %d], modes %d\n", G, lo, hi, modes);
+    printf("block band G=%d, operands in [%d, %d], modes %d, tile %s\n", G, lo, hi, modes, getenv("OZ_TILE") ? getenv("OZ_TILE") : "32x3");
     int plo, phi; cudaDeviceGetStreamPriorityRange(&plo, &phi);   // phi = the highest priority: sums and puts get SMs first
     CK(cudaStreamCreateWithPriority(&pp.add, cudaStreamDefault, phi)); CK(cudaStreamCreateWithPriority(&pp.ac, cudaStreamDefault, phi));
     CK(cudaStreamCreate(&pp.mm));   // blocking streams: the legacy stream (timing events, memcpy) waits for all three
+    if (const char *e = getenv("OZ_TILE")) TILE = !strcmp(e, "64x3") ? 1 : !strcmp(e, "64x4") ? 2 : 0;
+    grant<32, 3>(); grant<64, 3>(); grant<64, 4>();
     pp.ev.resize(2 * 3 * (maxL + 1));
     for (auto &ev : pp.ev) CK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
     CK(cudaStreamCreateWithPriority(&two.st[0], cudaStreamDefault, phi)); CK(cudaStreamCreate(&two.st[1]));
