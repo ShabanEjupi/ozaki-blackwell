@@ -4,7 +4,7 @@ Title:      Precision as a software choice: FP64, double-double, triple-double a
 Authors:    Shaban Ejupi
 Primary:    cs.MS (Mathematical Software)
 Cross-list: cs.DC, cs.SC, math.NA
-License:    CC BY 4.0
+License:    arXiv.org perpetual, non-exclusive license (chosen 29-10-2026)
 Comments:   15 pages. Code and every measurement: https://git.spacecode.tech/shaban/ozaki-blackwell
 
 Abstract (plain text, under arXiv's 1920 characters):
