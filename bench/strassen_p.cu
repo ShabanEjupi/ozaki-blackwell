@@ -84,11 +84,11 @@ static void strassen(const int8_t *A, int lda, const int8_t *Bt, int ldb, int8_t
     sum(A12, lda, A22, lda, -1, S); sum(B21, ldb, B22, ldb, 1, T); prod(S, q, T, q); put(C11, 1, false, nullptr, 0, false);  // M7
 }
 
-__global__ void fill(int8_t *X, size_t n, unsigned seed) {
+__global__ void fill(int8_t *X, size_t n, unsigned seed, int lo, int hi) {   // uniform in [lo, hi], a subrange of the residues
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     unsigned x = (unsigned)i * 2654435761u ^ seed; x ^= x >> 15; x *= 2246822519u; x ^= x >> 13; x *= 3266489917u; x ^= x >> 16;
-    X[i] = (int8_t)((int)(x % P) - HP);
+    X[i] = (int8_t)(lo + (int)(x % (unsigned)(hi - lo + 1)));
 }
 
 __global__ void diff(const int8_t *X, const int8_t *Y, size_t n, unsigned long long *bad) {
@@ -99,12 +99,15 @@ __global__ void diff(const int8_t *X, const int8_t *Y, size_t n, unsigned long l
 int main(int argc, char **argv) {
     const int maxL = argc > 1 ? atoi(argv[1]) : 4;
     if (argc > 2) G = atoi(argv[2]);
-    printf("block band G=%d\n", G);
+    // argv[3], argv[4]: operand range (default all residues). The GEMM is power-bound, and fewer toggling bits draw fewer watts
+    const int lo = argc > 4 ? atoi(argv[3]) : -HP, hi = argc > 4 ? atoi(argv[4]) : HP;
+    if (lo < -HP || hi > HP || lo > hi) { printf("range must lie in [%d, %d]\n", -HP, HP); return 1; }
+    printf("block band G=%d, operands in [%d, %d]\n", G, lo, hi);
     for (int n : {8192, 16384, 32768}) {
         const size_t nn = (size_t)n * n;
         int8_t *A, *Bt, *C0, *C;
         CK(cudaMalloc(&A, nn)); CK(cudaMalloc(&Bt, nn)); CK(cudaMalloc(&C0, nn)); CK(cudaMalloc(&C, nn));
-        fill<<<(nn + 255) / 256, 256>>>(A, nn, 12345u); fill<<<(nn + 255) / 256, 256>>>(Bt, nn, 67890u);
+        fill<<<(nn + 255) / 256, 256>>>(A, nn, 12345u, lo, hi); fill<<<(nn + 255) / 256, 256>>>(Bt, nn, 67890u, lo, hi);
         std::vector<Ws> ws;
         for (int h = n / 2, d = 0; d < maxL; d++, h /= 2) {
             Ws w; size_t s = (size_t)h * h;
