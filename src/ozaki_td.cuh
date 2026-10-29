@@ -161,7 +161,7 @@ template <int NM> void tdgemm_t(Plan &p, const double *Ah, const double *Am, con
     scales_dd<<<p.N, 256>>>(Bh, 1, ldb, p.K, p.bits, p.sb);
     residues_td<NM><<<dim3((p.K + 255) / 256, p.M), 256>>>(Ah, Am, Al, p.K, lda, 1, p.sa, p.Ar, p.Kp, (size_t)p.Mp * p.Kp);
     residues_td<NM><<<dim3((p.K + 255) / 256, p.N), 256>>>(Bh, Bm, Bl, p.K, 1, ldb, p.sb, p.Br, p.Kp, (size_t)p.Np * p.Kp);
-    gemm_i8<<<dim3(p.Np / BN, p.Mp / BM, NM), THREADS>>>(p.Ar, p.Br, p.Cl, p.Mp, p.Np, p.Kp);
+    gemm_i8_run(p.Ar, p.Br, p.Cl, p.Mp, p.Np, p.Kp, NM);
     crt_td<NM><<<dim3((p.N + 255) / 256, p.M), 256>>>(p.Cl, (size_t)p.Mp * p.Np, p.M, p.N, p.Np, p.sa, p.sb, Ch, Cm, Cl, ldo, mode);
 }
 

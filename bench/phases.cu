@@ -25,7 +25,7 @@ template <int NM> void run(double *A, double *B, double *C) {
         oz::residues<NM><<<dim3((p.K + 255) / 256, p.N), 256>>>(B, p.N, p.K, 1, p.N, p.sb, p.Br, p.Kp, (size_t)p.Np * p.Kp);
         cudaEventRecord(e[3]);
         for (int l = 0; l < nm; l++)
-            oz::gemm_i8<<<dim3(p.Np / oz::BN, p.Mp / oz::BM), oz::THREADS>>>(p.Ar + (size_t)l * p.Mp * p.Kp, p.Br + (size_t)l * p.Np * p.Kp, p.Cl + (size_t)l * p.Mp * p.Np, p.Mp, p.Np, p.Kp);
+            oz::gemm_i8_run(p.Ar + (size_t)l * p.Mp * p.Kp, p.Br + (size_t)l * p.Np * p.Kp, p.Cl + (size_t)l * p.Mp * p.Np, p.Mp, p.Np, p.Kp);
         cudaEventRecord(e[4]);
         oz::crt<NM><<<dim3((p.N + 255) / 256, p.M), 256>>>(p.Cl, (size_t)p.Mp * p.Np, p.M, p.N, p.Np, p.sa, p.sb, C);
         cudaEventRecord(e[5]); cudaEventSynchronize(e[5]);

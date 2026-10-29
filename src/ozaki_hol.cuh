@@ -612,7 +612,7 @@ inline std::vector<int16_t> hol_solve(DetWork &lu, const int8_t *dA, int L, cons
         for (int e0 = 0; e0 < E; e0 += Ec) {
             const int rows = std::min(Ec, E - e0), rpad = rup(rows, BM), last = e0 + Ec >= E;
             hol_pack<<<2048, 256>>>(co, n, e0, rows, rpad, Apk);
-            gemm_i8<<<dim3((U + 1) * n / BN, rpad / BM, 1), THREADS>>>(Apk, Bt, G, rpad, (U + 1) * n, 2 * n);
+            gemm_i8_run(Apk, Bt, G, rpad, (U + 1) * n, 2 * n);
             combine_k(rows);
             carry_k(co, cn, G, sm + e0, sm + e0 + rows, bmp, b0, sm + e0, last ? hi : sm + e0 + rows, last ? sN : sm + e0 + rows, e0 == 0);
         }

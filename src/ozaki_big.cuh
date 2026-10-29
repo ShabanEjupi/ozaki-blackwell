@@ -228,7 +228,7 @@ inline void big_residues(BigPlan &b, const unsigned *X, int rows, int cols, bool
     size_t rc = std::max<size_t>(BN, b.cg_elems / (size_t)b.Kc / BN * BN);
     for (size_t r0 = 0; r0 < n; r0 += rc) {
         size_t m = std::min(rc, n - r0), mp = (m + BN - 1) / BN * BN;
-        gemm_i8<<<dim3(mp / BN, b.Kc / BM, 1), THREADS>>>(b.Bres, b.Xd + r0 * b.Kr, b.Cg, b.Kc, (int)mp, b.Kr);
+        gemm_i8_run(b.Bres, b.Xd + r0 * b.Kr, b.Cg, b.Kc, (int)mp, b.Kr);
         big_res_out<<<dim3((m + 255) / 256, b.L), 256>>>(b.Cg, mp, r0, m, b.L, b.NB, b.dp, cols, b.Kp, plane, P);
     }
 }
@@ -245,15 +245,15 @@ inline void biggemm(BigPlan &b, const unsigned *A, const unsigned *B, unsigned *
     for (int l0 = 0; l0 < b.L; l0 += b.LC) {
         int lc = std::min(b.LC, b.L - l0);
         for (int q = 0; q < b.NB * b.NB; q++)   // byte a of A times byte c of B, slot a NB + c
-            gemm_i8<<<dim3(b.Np / BN, b.Mp / BM, lc), THREADS>>>(b.Ar + ((size_t)(q / b.NB) * b.L + l0) * pa,
-                                                                 b.Br + ((size_t)(q % b.NB) * b.L + l0) * pb, b.Cg + (size_t)q * b.LC * pc, b.Mp, b.Np, b.Kp);
+            gemm_i8_run(b.Ar + ((size_t)(q / b.NB) * b.L + l0) * pa,
+                        b.Br + ((size_t)(q % b.NB) * b.L + l0) * pb, b.Cg + (size_t)q * b.LC * pc, b.Mp, b.Np, b.Kp, lc);
         big_t<<<dim3((b.N + 63) / 64, b.M), 256>>>(b.Cg, b.LC, lc, pc, l0, b.L, b.NB, b.M, b.N, b.Np, b.dp, b.dinv, b.T, b.Kc);
     }
     if (prof) cudaEventRecord(ev[2]);
     size_t n = (size_t)b.M * b.N, rc = std::max<size_t>(BM, b.cg_elems / b.D / BM * BM);
     for (size_t e0 = 0; e0 < n; e0 += rc) {
         size_t m = std::min(rc, n - e0), mp = (m + BM - 1) / BM * BM;
-        gemm_i8<<<dim3(b.D / BN, mp / BM, 1), THREADS>>>(b.T + e0 * b.Kc, b.Wc, b.Cg, (int)mp, b.D, b.Kc);
+        gemm_i8_run(b.T + e0 * b.Kc, b.Wc, b.Cg, (int)mp, b.D, b.Kc);
         big_out<<<(m + 255) / 256, 256>>>(b.Cg, b.T, e0, m, b.L, b.NB, b.Kc, b.D, b.drp, b.dMb, b.NA, C);
     }
     if (prof) {

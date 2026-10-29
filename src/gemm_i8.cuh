@@ -6,6 +6,7 @@
 // Needs M, N % 128 == 0 and K % 64 == 0 (the caller pads).
 #pragma once
 #include <cstdint>
+#include <cstdlib>
 
 namespace oz {
 
@@ -123,6 +124,30 @@ __global__ void __launch_bounds__(THREADS) gemm_i8(const int8_t *__restrict__ A,
         *(int2 *)&C[(size_t)row * N + col] = make_int2(c00, c01);
         *(int2 *)&C[(size_t)(row + 8) * N + col] = make_int2(c10, c11);
     });
+}
+
+// the same with the 128 x 256 tile (warps 64 x 64): needs N % 256 == 0
+__global__ void __launch_bounds__(THREADS, 1) gemm_i8w(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt,
+                                                        int32_t *__restrict__ C, int M, int N, int K) {
+    A += (size_t)blockIdx.z * M * K; Bt += (size_t)blockIdx.z * N * K; C += (size_t)blockIdx.z * M * N;
+    gemm_i8_tile<64, 3>(A, Bt, K, [&](int row, int col, int c00, int c01, int c10, int c11) {
+        *(int2 *)&C[(size_t)row * N + col] = make_int2(c00, c01);
+        *(int2 *)&C[(size_t)(row + 8) * N + col] = make_int2(c10, c11);
+    });
+}
+
+// C = A Bt^T for Z planes (blockIdx.z), M % 128 == 0, N % 128 == 0, K % 64 == 0. The 128 x 256 tile (a third fewer shared-
+// memory bytes per MAC) wins once the work is long enough to sit at the power cap: fewer bytes = more MHz (n = 8192: 103.9 ->
+// 113.8 TOPS with int32 C). Short work runs at boost clock, where 128 x 128 (16 warps per SM, not 8) hides latency better
+// (n = 4096, one plane: 151.4 vs 137.8). Measured 29-10-2026; FP64 emulation errors identical on both.
+// OZ_NARROW=1 forces 128 x 128 (A/B measurements in one binary).
+inline void gemm_i8_run(const int8_t *A, const int8_t *Bt, int32_t *C, int M, int N, int K, int Z = 1, cudaStream_t st = 0) {
+    static const bool wide = [] {
+        cudaFuncSetAttribute(gemm_i8w, cudaFuncAttributeMaxDynamicSharedMemorySize, gemm_smem<64, 3>());
+        const char *e = getenv("OZ_NARROW"); return !(e && *e == '1');
+    }();
+    if (wide && N % 256 == 0 && (size_t)M * N * Z >= (1ull << 26)) gemm_i8w<<<dim3(N / 256, M / BM, Z), THREADS, gemm_smem<64, 3>(), st>>>(A, Bt, C, M, N, K);
+    else gemm_i8<<<dim3(N / BN, M / BM, Z), THREADS, 0, st>>>(A, Bt, C, M, N, K);
 }
 
 }  // namespace oz

@@ -156,7 +156,7 @@ template <int Q> void mpgemm(MpPlan<Q> &m, MpPtr<Q> A, MpPtr<Q> B, MpPtr<Q> C) {
     for (int i = 0; i < S; i++)
         for (int j = 0; j < S; j++) {
             if (!mp_keep<Q>(i, j)) continue;
-            gemm_i8<<<dim3(p.Np / BN, p.Mp / BM, 49), THREADS>>>(p.Ar + i * 49 * pa, p.Br + j * 49 * pb, p.Cl, p.Mp, p.Np, p.Kp);
+            gemm_i8_run(p.Ar + i * 49 * pa, p.Br + j * 49 * pb, p.Cl, p.Mp, p.Np, p.Kp, 49);
             crt_mp_acc<49, NA><<<dim3((p.N + 255) / 256, p.M), 256>>>(p.Cl, (size_t)p.Mp * p.Np, p.M, p.N, p.Np, m.acc, 5 * (i + j));
         }
     mp_out<Q, NA><<<dim3((p.N + 255) / 256, p.M), 256>>>(m.acc, p.M, p.N, p.sa, p.sb, C, p.N);

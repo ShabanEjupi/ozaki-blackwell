@@ -15,7 +15,7 @@ static bool check(int M, int N, int K) {
     CK(cudaMalloc(&dA, A.size())); CK(cudaMalloc(&dB, Bt.size())); CK(cudaMalloc(&dC, (size_t)M * N * 4));
     CK(cudaMemcpy(dA, A.data(), A.size(), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dB, Bt.data(), Bt.size(), cudaMemcpyHostToDevice));
-    oz::gemm_i8<<<dim3(N / oz::BN, M / oz::BM), oz::THREADS>>>(dA, dB, dC, M, N, K);
+    oz::gemm_i8_run(dA, dB, dC, M, N, K);
     CK(cudaGetLastError());
     std::vector<int32_t> C((size_t)M * N);
     CK(cudaMemcpy(C.data(), dC, C.size() * 4, cudaMemcpyDeviceToHost));
@@ -32,18 +32,18 @@ static bool check(int M, int N, int K) {
 }
 
 int main() {
-    bool ok = check(128, 128, 64) & check(256, 384, 512) & check(512, 256, 1024);
+    // the last one is large enough (M N >= 2^26) for gemm_i8_run to take the 128 x 256 tile
+    bool ok = check(128, 128, 64) & check(256, 384, 512) & check(512, 256, 1024) & check(8192, 8192, 128);
     if (!ok) return 1;
     for (int n : {2048, 4096, 8192}) {
         int8_t *dA, *dB; int32_t *dC;
         CK(cudaMalloc(&dA, (size_t)n * n)); CK(cudaMalloc(&dB, (size_t)n * n)); CK(cudaMalloc(&dC, (size_t)n * n * 4));
         CK(cudaMemset(dA, 1, (size_t)n * n)); CK(cudaMemset(dB, 1, (size_t)n * n));
-        dim3 grid(n / oz::BN, n / oz::BM);
-        oz::gemm_i8<<<grid, oz::THREADS>>>(dA, dB, dC, n, n, n);
+        oz::gemm_i8_run(dA, dB, dC, n, n, n);
         cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
         int reps = n >= 8192 ? 3 : 10;
         cudaEventRecord(t0);
-        for (int r = 0; r < reps; r++) oz::gemm_i8<<<grid, oz::THREADS>>>(dA, dB, dC, n, n, n);
+        for (int r = 0; r < reps; r++) oz::gemm_i8_run(dA, dB, dC, n, n, n);
         cudaEventRecord(t1); CK(cudaEventSynchronize(t1));
         float ms; cudaEventElapsedTime(&ms, t0, t1); ms /= reps;
         printf("n=%5d  %7.2f ms  %6.1f TOPS\n", n, ms, 2.0 * n * n * n / (ms * 1e-3) / 1e12);
