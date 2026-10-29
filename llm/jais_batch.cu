@@ -88,6 +88,7 @@ static int NL; static std::vector<bool> MOE; static std::vector<std::vector<floa
 static DevW LM; static bool VALIDATE; static std::vector<int> SCORE;
 // jais_lora.cu: HSAVE collects the residual stream entering every layer and leaving the last; HEMB may change the embeddings
 static std::vector<std::vector<float>> *HSAVE; static void (*HEMB)(std::vector<float> &);
+static std::vector<float> (*PROJ)(int L, int which, const DevW &W, const std::vector<float> &x);   // q (0) and v (1) maps, when set
 
 // the rows' function f(row vector) -> row vector, in parallel over rows: the per-token host code on each row as it is
 template <class F> static void rows_map(std::vector<float> &A, int K, F f) {
@@ -208,11 +209,11 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
         std::string P = "model.layers." + std::to_string(L) + ".";
         std::vector<float> x = norm_rows(h, N1[L]);
         if (!MOE[L] && L + 1 < NL) part0(L + 1);
-        DevW W = load_w(P + "self_attn.q_proj.weight", F_BF16, QD, D_H); auto q = bmm(W, x);
+        DevW W = load_w(P + "self_attn.q_proj.weight", F_BF16, QD, D_H); auto q = PROJ ? PROJ(L, 0, W, x) : bmm(W, x);
         rows_map(q, QD, [&](size_t r, std::vector<float> &v) { rope_part(v, D_Q, rows[r].second); });
         W = load_w(P + "self_attn.k_proj.weight", F_BF16, KVD, D_H); auto k = bmm(W, x);
         rows_map(k, KVD, [&](size_t r, std::vector<float> &v) { rope_part(v, D_KV, rows[r].second); });
-        W = load_w(P + "self_attn.v_proj.weight", F_BF16, KVD, D_H); auto v = bmm(W, x);
+        W = load_w(P + "self_attn.v_proj.weight", F_BF16, KVD, D_H); auto v = PROJ ? PROJ(L, 1, W, x) : bmm(W, x);
         for (size_t r = 0; r < R; r++) {   // the cache of position t is row t
             auto &s = S[rows[r].first]; size_t t = rows[r].second;
             if (s.kc[L].size() != t * KVD) { fprintf(stderr, "cache of prompt %d layer %d holds %zu rows at position %zu\n", s.prompt, L, s.kc[L].size() / KVD, t); exit(1); }

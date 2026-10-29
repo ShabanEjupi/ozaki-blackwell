@@ -90,10 +90,10 @@ static void dgrad(const std::vector<DevW> &Ws, const std::vector<const std::vect
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < Y.size(); i++) dX[i] += Y[i];
 }
-static DevW up(const std::vector<float> &m, int M, int K) {   // a host matrix of BF16 values as a BF16 map
-    if ((size_t)M * K * 2 > SM_MAX) { fprintf(stderr, "%d x %d exceeds the small buffer\n", M, K); exit(1); }
-    std::vector<uint16_t> b(m.size()); for (size_t i = 0; i < m.size(); i++) { uint32_t u; memcpy(&u, &m[i], 4); b[i] = u >> 16; }
-    CK(cudaMemcpy(dSm, b.data(), b.size() * 2, cudaMemcpyHostToDevice)); return devw(dSm, M, K);
+static DevW up(const std::vector<float> &m, int M, int K, void *buf = nullptr) {   // a host matrix, rounded to BF16, as a BF16 map
+    if (!buf && (size_t)M * K * 2 > SM_MAX) { fprintf(stderr, "%d x %d exceeds the small buffer\n", M, K); exit(1); }
+    std::vector<uint16_t> b(m.size()); for (size_t i = 0; i < m.size(); i++) { float f = bf(m[i]); uint32_t u; memcpy(&u, &f, 4); b[i] = u >> 16; }
+    CK(cudaMemcpy(buf ? buf : dSm, b.data(), b.size() * 2, cudaMemcpyHostToDevice)); return devw(buf ? buf : dSm, M, K);
 }
 
 // ---- the host parts of the backward, FP64 ---------------------------------------------------------------------------------
@@ -158,7 +158,9 @@ static void attend_back(const std::vector<float> &q, const std::vector<float> &k
 
 // ---- LoRA -----------------------------------------------------------------------------------------------------------------
 static int RK = 16; static double SC = 2.0;   // rank, alpha / rank (a power of two: the scaling is exact)
-struct Lora { std::vector<float> Aq, Av, dBq, dBv; };
+// A and B in FP32 (the master copy), used as BF16 in every product; m, v: Adam's moments of Bq, Bv, Aq, Av
+struct Lora { std::vector<float> Aq, Av, dBq, dBv, Bq, Bv, dAq, dAv; std::vector<double> m[4], v[4]; };
+static std::vector<Lora> LO; static void *dLA[2];
 static std::vector<float> lora_h(const std::vector<float> &A, const std::vector<float> &x) { return bmm(up(A, RK, D_H), x, 8); }
 // dB = s G^T H: the tokens are the product's K (zeros up to a multiple of 128)
 static std::vector<float> lora_db(const std::vector<double> &G, int M, const std::vector<float> &H, size_t N) {
@@ -169,6 +171,54 @@ static std::vector<float> lora_db(const std::vector<double> &G, int M, const std
     bmm(up(Ht, RK, NP), Gt.data(), M, 24, Y.data());
     for (auto &y : Y) y = (float)(y * SC);
     return Y;
+}
+// the adapted map Y = BF16(x W^T + s H B^T) as ONE product, [x | s H | 0] [W | B | 0]^T (s H is exact: s a power of two);
+// B = 0: the base map alone, bit for bit the model
+static std::vector<float> lora_proj(int L, int which, const DevW &W, const std::vector<float> &x) {
+    const auto &B = which ? LO[L].Bv : LO[L].Bq;
+    if (B.empty()) return bmm(W, x);
+    size_t N = x.size() / D_H; const int M = W.M, KP = D_H + 128;
+    auto H = lora_h(which ? LO[L].Av : LO[L].Aq, x);
+    CK(cudaMemset(dWt, 0, (size_t)M * KP * 2));
+    CK(cudaMemcpy2D(dWt, KP * 2, W.w, D_H * 2, D_H * 2, M, cudaMemcpyDeviceToDevice));
+    std::vector<uint16_t> b((size_t)M * 128, 0);
+    for (int m = 0; m < M; m++) for (int j = 0; j < RK; j++) { float f = bf(B[m * RK + j]); uint32_t u; memcpy(&u, &f, 4); b[m * 128 + j] = u >> 16; }
+    CK(cudaMemcpy2D((uint16_t *)dWt + D_H, KP * 2, b.data(), 256, 256, M, cudaMemcpyHostToDevice));
+    std::vector<float> X(N * KP, 0.f), Y(N * M);
+    #pragma omp parallel for schedule(static)
+    for (size_t n = 0; n < N; n++) { std::copy(x.begin() + n * D_H, x.begin() + (n + 1) * D_H, X.begin() + n * KP);
+        for (int j = 0; j < RK; j++) X[n * KP + D_H + j] = (float)(SC * H[n * RK + j]); }
+    bmm(devw(dWt, M, KP), X.data(), N, 8, Y.data());
+    return Y;
+}
+// U = s G B [N][r] (FP32 outputs of one product, times s), the adapter's gradient path
+static std::vector<double> lora_u(const std::vector<double> &G, int M, const std::vector<float> &B, size_t N) {
+    std::vector<float> Bt((size_t)RK * M), Gb(G.size()), Y(N * RK);
+    for (int m = 0; m < M; m++) for (int j = 0; j < RK; j++) Bt[j * M + m] = B[m * RK + j];
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < G.size(); i++) Gb[i] = bf(G[i]);
+    bmm(up(Bt, RK, M), Gb.data(), N, 24, Y.data());
+    std::vector<double> U(Y.size()); for (size_t i = 0; i < Y.size(); i++) U[i] = SC * Y[i];
+    return U;
+}
+// dA = U^T x [r][H], U already scaled: one product over the tokens, U in BF16 as every gradient that enters a product
+static std::vector<float> lora_da(const std::vector<double> &U, const std::vector<float> &x, size_t N) {
+    size_t NP = (N + 127) / 128 * 128; std::vector<float> Ut((size_t)RK * NP, 0.f), Xt((size_t)D_H * NP, 0.f), Y((size_t)D_H * RK), dA((size_t)RK * D_H);
+    for (size_t n = 0; n < N; n++) for (int j = 0; j < RK; j++) Ut[j * NP + n] = bf(U[n * RK + j]);
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < D_H; k++) for (size_t n = 0; n < N; n++) Xt[k * NP + n] = x[n * D_H + k];
+    bmm(up(Ut, RK, NP), Xt.data(), D_H, 24, Y.data());
+    for (int k = 0; k < D_H; k++) for (int j = 0; j < RK; j++) dA[j * D_H + k] = Y[k * RK + j];
+    return dA;
+}
+// AdamW (b1 0.9, b2 0.999, eps 1e-8, no decay) on p from its gradient; returns sum g dp, the update's first-order change
+static double adamw(std::vector<float> &p, const std::vector<float> &g, std::vector<double> &m, std::vector<double> &v, int t, double lr) {
+    if (p.empty()) p.assign(g.size(), 0.f);
+    m.resize(g.size(), 0.0); v.resize(g.size(), 0.0);
+    const double b1 = 0.9, b2 = 0.999, c1 = 1 - pow(b1, t), c2 = 1 - pow(b2, t); double ch = 0;
+    for (size_t i = 0; i < g.size(); i++) { m[i] = b1 * m[i] + (1 - b1) * g[i]; v[i] = b2 * v[i] + (1 - b2) * (double)g[i] * g[i];
+        float np = (float)(p[i] - lr * (m[i] / c1) / (sqrt(v[i] / c2) + 1e-8)); ch += (double)g[i] * ((double)bf(np) - bf(p[i])); p[i] = np; }
+    return ch;
 }
 
 // ---- the backward of one layer --------------------------------------------------------------------------------------------
@@ -223,9 +273,9 @@ static void back_layer(int L, const std::vector<float> &h, size_t N, std::vector
     auto x1 = norm_rows(h, N1[L]);
     DevW Wq = load_w(P + "self_attn.q_proj.weight", F_BF16, QD, D_H, dAt[0]), Wk = load_w(P + "self_attn.k_proj.weight", F_BF16, KVD, D_H, dAt[1]);
     DevW Wv = load_w(P + "self_attn.v_proj.weight", F_BF16, KVD, D_H, dAt[2]), Wo = load_w(P + "self_attn.o_proj.weight", F_BF16, D_H, QD, dAt[3]);
-    auto q = bmm(Wq, x1); rows_map(q, QD, [&](size_t r, std::vector<float> &v) { rope_part(v, D_Q, r); });
+    auto q = lora_proj(L, 0, Wq, x1); rows_map(q, QD, [&](size_t r, std::vector<float> &v) { rope_part(v, D_Q, r); });
     auto k = bmm(Wk, x1); rows_map(k, KVD, [&](size_t r, std::vector<float> &v) { rope_part(v, D_KV, r); });
-    auto v = bmm(Wv, x1);
+    auto v = lora_proj(L, 1, Wv, x1);
     std::vector<float> o(N * QD);
     #pragma omp parallel for schedule(dynamic)
     for (size_t r = 0; r < N; r++) attend_p(q.data() + r * QD, k.data(), v.data(), r + 1, D_Q, D_KV, D_HD, o.data() + r * QD, false);
@@ -249,8 +299,15 @@ static void back_layer(int L, const std::vector<float> &h, size_t N, std::vector
     attend_back(q, k, v, dO, N, dq, dk, dv);
     #pragma omp parallel for schedule(static)
     for (size_t r = 0; r < N; r++) { rope_back(dq.data() + r * QD, D_Q, r); rope_back(dk.data() + r * KVD, D_KV, r); }
-    lo.dBq = lora_db(dq, QD, lora_h(lo.Aq, x1), N); lo.dBv = lora_db(dv, KVD, lora_h(lo.Av, x1), N);   // G B = 0: no dA, no adapter term in dx1
-    std::vector<double> dx1(N * D_H, 0.0); dgrad({Wq, Wk, Wv}, {&dq, &dk, &dv}, N, dx1);
+    lo.dBq = lora_db(dq, QD, lora_h(lo.Aq, x1), N); lo.dBv = lora_db(dv, KVD, lora_h(lo.Av, x1), N);
+    std::vector<double> dx1(N * D_H, 0.0);
+    if (lo.Bq.empty()) dgrad({Wq, Wk, Wv}, {&dq, &dk, &dv}, N, dx1);   // B = 0: G B = 0, no dA and no adapter term in dx1
+    else {   // U = s G B; dA = U^T x; the adapters' share of dx1, U A, in the same product as q, k and v
+        auto Uq = lora_u(dq, QD, lo.Bq, N), Uv = lora_u(dv, KVD, lo.Bv, N);
+        lo.dAq = lora_da(Uq, x1, N); lo.dAv = lora_da(Uv, x1, N);
+        DevW Aq = up(lo.Aq, RK, D_H, dLA[0]), Av = up(lo.Av, RK, D_H, dLA[1]);
+        dgrad({Wq, Wk, Wv, Aq, Av}, {&dq, &dk, &dv, &Uq, &Uv}, N, dx1);
+    }
     norm_back(h, N1[L], dx1, gh);
     g.swap(gh);
     t_back_att += secs(t0) - tmlp;
@@ -373,7 +430,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 3; i++) { CK(cudaMalloc(&dMl[i], (size_t)D_FF * D_H * 2)); CK(cudaMalloc(&dEw[i], (size_t)J_MFF * D_H)); CK(cudaMalloc(&dEs[i], (size_t)1 << 20));
         CK(cudaMalloc(&dSh[i], (size_t)J_MFF * D_H * 2)); }
     CK(cudaMalloc(&dRt, (size_t)J_E * D_H * 2));
-    std::vector<Lora> lo(NL);
+    LO.assign(NL, Lora()); auto &lo = LO;
+    for (int i = 0; i < 2; i++) CK(cudaMalloc(&dLA[i], (size_t)RK * D_H * 2));
     const double bound = 1.0 / sqrt((double)D_H);
     for (int L = 0; L < NL; L++) for (int w = 0; w < 2; w++) {
         auto &A = w ? lo[L].Av : lo[L].Aq; A.resize((size_t)RK * D_H);
@@ -381,39 +439,56 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "jais_lora: %d layers (%d MoE), %zu tokens, rank %d, alpha %g%s\n", NL, (int)std::count(MOE.begin(), MOE.end(), true), N, RK, alpha,
             EPS ? (", forward only, embeddings moved by " + std::to_string(EPS)).c_str() : "");
-    auto t0 = std::chrono::steady_clock::now();
-    BSeq s; s.prompt = 0; s.toks = toks; s.plen = N; s.end = N; s.kc.resize(NL); s.vc.resize(NL);
-    std::vector<BSeq> S{s}; std::vector<std::pair<int, size_t>> rows; for (size_t t = 0; t < N; t++) rows.push_back({0, t});
-    std::vector<std::vector<float>> HS; HSAVE = &HS; if (EPS) HEMB = perturb;
-    pass(S, rows, std::vector<bool>(N, false)); HSAVE = nullptr; S.clear();
-    std::vector<double> g(N * D_H, 0.0);
-    double loss = loss_back(HS[NL], toks, N, EPS ? nullptr : &g);
-    double tf = secs(t0);
-    printf("loss %.17g (perplexity %.6g) over %zu predictions; forward %.1f s\n", loss, exp(loss), N - 1, tf);
-    if (EPS) return 0;
-    printf("layer %d |g| %.6e\n", NL, norm2(g));
-    double d0 = t_disk, b0 = bytes_disk;
-    for (int L = NL - 1; L >= 0; L--) {
-        auto tl = std::chrono::steady_clock::now();
-        back_layer(L, HS[L], N, g, lo[L]);
-        printf("layer %d |g| %.6e |dBq| %.6e |dBv| %.6e  %.1f s\n", L, norm2(g), norm2f(lo[L].dBq), norm2f(lo[L].dBv), secs(tl)); fflush(stdout);
+    // OZ_STEPS steps of AdamW (OZ_LR) on the one sequence: step 1 at B = 0, then the adapters in the forward too
+    const int STEPS = getenv("OZ_STEPS") ? atoi(getenv("OZ_STEPS")) : 1; const double LR = getenv("OZ_LR") ? atof(getenv("OZ_LR")) : 1e-4;
+    PROJ = lora_proj; double prev = 0, predicted = 0;
+    for (int st = 1; st <= STEPS; st++) {
+        auto t0 = std::chrono::steady_clock::now(); t_back_mlp = t_back_att = 0;
+        BSeq s; s.prompt = 0; s.toks = toks; s.plen = N; s.end = N; s.kc.resize(NL); s.vc.resize(NL);
+        std::vector<BSeq> S{s}; std::vector<std::pair<int, size_t>> rows; for (size_t t = 0; t < N; t++) rows.push_back({0, t});
+        std::vector<std::vector<float>> HS; HSAVE = &HS; if (EPS) HEMB = perturb;
+        pass(S, rows, std::vector<bool>(N, false)); HSAVE = nullptr; S.clear();
+        std::vector<double> g(N * D_H, 0.0);
+        double loss = loss_back(HS[NL], toks, N, EPS ? nullptr : &g);
+        double tf = secs(t0);
+        printf("step %d loss %.17g (perplexity %.6g) over %zu predictions; forward %.1f s\n", st, loss, exp(loss), N - 1, tf);
+        if (st > 1) printf("step %d: the update changed the loss by %.9e, its first-order prediction %.9e\n", st, loss - prev, predicted);
+        if (EPS) return 0;
+        printf("layer %d |g| %.6e\n", NL, norm2(g));
+        double d0 = t_disk, b0 = bytes_disk;
+        for (int L = NL - 1; L >= 0; L--) {
+            auto tl = std::chrono::steady_clock::now();
+            back_layer(L, HS[L], N, g, lo[L]);
+            printf("layer %d |g| %.6e |dBq| %.6e |dBv| %.6e |dAq| %.6e |dAv| %.6e  %.1f s\n", L, norm2(g), norm2f(lo[L].dBq), norm2f(lo[L].dBv),
+                   norm2f(lo[L].dAq), norm2f(lo[L].dAv), secs(tl)); fflush(stdout);
+        }
+        int tb; CK(cudaMemcpy(&tb, dtbad, 4, cudaMemcpyDeviceToHost));
+        uint64_t dig = 1469598103934665603ULL, dia = dig;
+        for (int L = 0; L < NL; L++) { dig = fnv(dig, lo[L].dBq); dig = fnv(dig, lo[L].dBv); dia = fnv(dia, lo[L].dAq); dia = fnv(dia, lo[L].dAv); }
+        printf("step %d dB digest %016llx, dA digest %016llx, g_0 digest %016llx; hi/lo splits not exact %d; uncertified %lld\n", st,
+               (unsigned long long)dig, (unsigned long long)dia, (unsigned long long)fnvd(1469598103934665603ULL, g), tb, st_bad);
+        if (st == 1) {
+            std::vector<uint64_t> SEEDS{DSEED};
+            if (const char *f = getenv("OZ_DSEEDS")) { SEEDS.clear(); std::stringstream ss(f); std::string t; while (std::getline(ss, t, ',')) SEEDS.push_back(strtoull(t.c_str(), 0, 0)); }
+            for (uint64_t sd : SEEDS) for (double e : FDEPS) {   // the predicted L(+e) - L(-e) for the moves the OZ_EPS runs make
+                double pr = 0; const auto &h0 = HS[0];
+                for (size_t i = 0; i < h0.size(); i++) { double d = (sm64(i ^ sd) & 1) ? 1.0 : -1.0;
+                    pr += g[i] * ((double)bf((double)h0[i] + e * d) - (double)bf((double)h0[i] - e * d)); }
+                printf("predicted seed %llu L(+%g) - L(-%g) = %.9e\n", (unsigned long long)sd, e, e, pr);
+            }
+            if (!out.empty()) for (int L = 0; L < NL; L++) for (int w = 0; w < 2; w++) {
+                std::string fn = out + "/dB" + (w ? "v_" : "q_") + std::to_string(L) + ".f32"; FILE *f = fopen(fn.c_str(), "wb");
+                auto &d = w ? lo[L].dBv : lo[L].dBq; if (f) { fwrite(d.data(), 4, d.size(), f); fclose(f); } }
+        }
+        printf("step %d time %.1f s: forward %.1f, backward %.1f (MLP/MoE %.1f, attention and LoRA %.1f), backward disk %.1f s for %.1f GB\n", st, secs(t0), tf,
+               secs(t0) - tf, t_back_mlp, t_back_att, t_disk - d0, (bytes_disk - b0) / 1e9);
+        fflush(stdout);
+        if (st == STEPS) break;
+        predicted = 0;
+        for (int L = 0; L < NL; L++) { auto &l = lo[L];
+            predicted += adamw(l.Bq, l.dBq, l.m[0], l.v[0], st, LR) + adamw(l.Bv, l.dBv, l.m[1], l.v[1], st, LR);
+            if (!l.dAq.empty()) predicted += adamw(l.Aq, l.dAq, l.m[2], l.v[2], st - 1, LR) + adamw(l.Av, l.dAv, l.m[3], l.v[3], st - 1, LR); }   // A moves from step 2 on
+        prev = loss;
     }
-    int tb; CK(cudaMemcpy(&tb, dtbad, 4, cudaMemcpyDeviceToHost));
-    uint64_t dig = 1469598103934665603ULL; for (int L = 0; L < NL; L++) { dig = fnv(dig, lo[L].dBq); dig = fnv(dig, lo[L].dBv); }
-    printf("dB digest %016llx, g_0 digest %016llx; hi/lo splits not exact %d; uncertified %lld\n", (unsigned long long)dig,
-           (unsigned long long)fnvd(1469598103934665603ULL, g), tb, st_bad);
-    std::vector<uint64_t> SEEDS{DSEED};
-    if (const char *f = getenv("OZ_DSEEDS")) { SEEDS.clear(); std::stringstream ss(f); std::string t; while (std::getline(ss, t, ',')) SEEDS.push_back(strtoull(t.c_str(), 0, 0)); }
-    for (uint64_t sd : SEEDS) for (double e : FDEPS) {   // the predicted L(+e) - L(-e) for the moves the OZ_EPS runs make
-        double pr = 0; const auto &h0 = HS[0];
-        for (size_t i = 0; i < h0.size(); i++) { double d = (sm64(i ^ sd) & 1) ? 1.0 : -1.0;
-            pr += g[i] * ((double)bf((double)h0[i] + e * d) - (double)bf((double)h0[i] - e * d)); }
-        printf("predicted seed %llu L(+%g) - L(-%g) = %.9e\n", (unsigned long long)sd, e, e, pr);
-    }
-    printf("step %.1f s: forward %.1f, backward %.1f (MLP/MoE %.1f, attention and LoRA %.1f), backward disk %.1f s for %.1f GB\n", secs(t0), tf,
-           secs(t0) - tf, t_back_mlp, t_back_att, t_disk - d0, (bytes_disk - b0) / 1e9);
-    if (!out.empty()) for (int L = 0; L < NL; L++) for (int w = 0; w < 2; w++) {
-        std::string fn = out + "/dB" + (w ? "v_" : "q_") + std::to_string(L) + ".f32"; FILE *f = fopen(fn.c_str(), "wb");
-        auto &d = w ? lo[L].dBv : lo[L].dBq; if (f) { fwrite(d.data(), 4, d.size(), f); fclose(f); } }
     return 0;
 }
