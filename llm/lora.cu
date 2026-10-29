@@ -92,16 +92,17 @@ static FV exmm(const char *name, const BF &A, const BF &X, int M, int N, int K, 
     if (window) {   // each row's densest window in S digits + at most C sparse elements: S^2 planes instead of (T S)^2
         const int C = getenv("OZ_C") ? atoi(getenv("OZ_C")) : 64; int *em, *idx, *cnt;
         const int SX = getenv("OZ_SX") ? atoi(getenv("OZ_SX")) : S;   // the digits of X (the tokens): 2 = a 6-bit window, more sparse
+        const int SA = getenv("OZ_SA") && (!strcmp(name, "Y") || !strcmp(name, "dX")) ? atoi(getenv("OZ_SA")) : S;   // the digits of the first operand (W): 1 or 2 carry a quantized base
         CK(cudaMalloc(&em, (size_t)(M + N) * 4)); CK(cudaMalloc(&idx, (size_t)(M + N) * C * 4)); CK(cudaMalloc(&cnt, (size_t)(M + N) * 4));
         int32_t *P; CK(cudaMalloc(&P, (size_t)S * S * M * N * 4));   // allocated outside the timed part
         cudaEvent_t t1, t2; cudaEventCreate(&t1); cudaEventCreate(&t2); cudaEventRecord(e0);
-        ex::split_window<<<M, 256>>>(dA, digA, BA, em, idx, cnt, stat, M, K, S, C);
+        ex::split_window<<<M, 256>>>(dA, digA, BA, em, idx, cnt, stat, M, K, SA, C);
         ex::split_window<<<N, 256>>>(dX, digX, BX, em + M, idx + (size_t)M * C, cnt + M, stat + 3, N, K, SX, C);
         CK(cudaMemcpy(st, stat, 24, cudaMemcpyDeviceToHost));
         if (st[2] || st[5]) { fprintf(stderr, "%s: inf/nan %d %d\n", name, st[2], st[5]); exit(1); }
         if (!st[1] && !st[4]) {
-            ex::Digits Wd{digA, BA, 1, S, M, K}, Xd{digX, BX, 1, SX, N, K};
-            Z = S * SX;
+            ex::Digits Wd{digA, BA, 1, SA, M, K}, Xd{digX, BX, 1, SX, N, K};
+            Z = SA * SX;
             cudaEventRecord(t1);
             ex::gemm_pairs<<<dim3(N / oz::BN, M / oz::BM, Z), oz::THREADS>>>(Wd, Xd, P, 1);
             cudaEventRecord(t2);
@@ -201,6 +202,17 @@ int main(int argc, char **argv) {
     for (auto &g : G) g = f2b((float)(1e-4 * td(rng)));                           // upstream gradient
     for (int q = 0; q < r; q++) for (int k = 0; k < D; k++) Ap[(size_t)q * D + k] = f2b((float)(nd(rng) / sqrt((double)D)));
     for (int i = 0; i < D; i++) for (int q = 0; q < r; q++) Bp[(size_t)i * RP + q] = f2b((float)(1e-3 * nd(rng)));
+    if (getenv("OZ_WQ"))   // the frozen base quantized to MXFP4 (QLoRA-style), held exactly in BF16: E2M1 x 2^scale per 32
+        for (int i = 0; i < D; i++) for (int g = 0; g < D; g += 32) {
+            float mx = 0; for (int k = g; k < g + 32; k++) mx = std::max(mx, fabsf(b2f(W[(size_t)i * D + k])));
+            if (mx == 0) continue;
+            const float sc = ldexpf(1.f, (int)floorf(log2f(mx)) - 2), grid[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
+            for (int k = g; k < g + 32; k++) {
+                const float v = b2f(W[(size_t)i * D + k]) / sc; int bq = 0;
+                for (int q = 1; q < 8; q++) if (fabsf(fabsf(v) - grid[q]) < fabsf(fabsf(v) - grid[bq])) bq = q;
+                W[(size_t)i * D + k] = f2b(copysignf(grid[bq] * sc, v));
+            }
+        }
     const BF Wt = transpose(W, D, D);
 
     printf("[1] the step, %d tokens\n", N);
