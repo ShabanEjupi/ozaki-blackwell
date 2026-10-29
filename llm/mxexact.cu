@@ -32,6 +32,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "../src/gemm_i8.cuh"
+#include "exact.cuh"
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); exit(1); } } while (0)
 
@@ -174,6 +175,49 @@ __global__ void combine(const int32_t *__restrict__ P, const int *__restrict__ s
                     else { acc += (__int128)(p >> min(-sh, 31)); lost++; }
                 }
             }
+        f = round_i128(acc, base);
+        ok = !lost || round_i128(acc + lost, base) == f;
+    }
+    Y[(size_t)j * M + i] = f;
+    flag[(size_t)j * M + i] = !ok;
+    if (!ok) atomicAdd(nbad, 1);
+}
+
+// ---- MXFP4 weights x (one window + sparse rest) activations ----------------------------------------------------------
+// X's tiers cost L times the planes; ex::split_window keeps each token's densest window in S digits (A * S planes) and
+// lists the rest (<= C per token). Those elements are multiplied here by the weight decoded from its nibble and scale:
+// q 2^(s - 128) m 2^e, an integer times a power of two, added to the same 128-bit sum. Bit-identical to combine().
+__global__ void combine_mxw(const int32_t *__restrict__ P, const int *__restrict__ smin, const int *__restrict__ Bx,
+                            const int *__restrict__ emx, const int *__restrict__ idx, const int *__restrict__ cnt, int C,
+                            const uint8_t *__restrict__ pk, const uint8_t *__restrict__ sc, const __nv_bfloat16 *__restrict__ X,
+                            float *Y, uint8_t *flag, int *nbad, int M, int Np, int K, int A, int S) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x, i = blockIdx.y;   // threads along tokens: P rows are read coalesced
+    if (j >= Np) return;
+    float f = 0.f;
+    bool ok = true;
+    if (emx[j] != EMPTY) {
+        const int base = smin[i] + 4 * (A - 1) - 128 + emx[j] - 94, bx = Bx[j];   // every term < 2^(base + 124)
+        __int128 acc = 0;
+        int lost = 0;
+        auto add = [&](long long v, int sh) {
+            if (sh >= 0) acc += (__int128)v << sh;
+            else { acc += (__int128)(v >> min(-sh, 62)); lost++; }
+        };
+        if (bx != EMPTY)
+            for (int a = 0; a < A; a++)
+                for (int d = 0; d < S; d++) {
+                    const int p = P[((size_t)(a * S + d) * M + i) * Np + j];
+                    if (p) add(p, smin[i] + 4 * a - 128 + bx + 7 * d - base);
+                }
+        const uint32_t LUT = 0xC8643210u;   // 2 E2M1
+        for (int s = 0; s < cnt[j]; s++) {
+            const uint32_t e_ = idx[(size_t)j * C + s]; const int k = e_ & 0xFFFF;
+            const uint16_t b = e_ >> 16;
+            const int ex = (b >> 7) & 255, m0 = ex ? ((b & 127) | 128) : (b & 127), e = ex ? ex - 134 : -133;
+            const uint8_t nb = (pk[(size_t)i * (K / 2) + k / 2] >> (k & 1 ? 4 : 0)) & 15;
+            const int q = (int)((LUT >> (4 * (nb & 7))) & 15) * (nb & 8 ? -1 : 1), m = b & 0x8000 ? -m0 : m0;
+            if (q && m) add((long long)q * m, sc[(size_t)i * (K / 32) + k / 32] - 128 + e - base);
+        }
         f = round_i128(acc, base);
         ok = !lost || round_i128(acc + lost, base) == f;
     }
@@ -454,6 +498,40 @@ int main(int argc, char **argv) {
         size_t diff = 0;
         for (size_t t = 0; t < Z.size(); t++) diff += memcmp(&Z[t], &Y[t], 4) != 0;
         printf("  exact, batch %4d: %zu of %zu outputs differ from batch %d\n", n, diff, Z.size(), N);
+    }
+    // the window path: one window per token + a sparse rest, A * S planes instead of A * L * S; must equal Y to the bit
+    {
+        const int C = 64; int *Bx, *emx, *idx, *cnt;
+        CK(cudaMalloc(&Bx, Np * 4)); CK(cudaMalloc(&emx, Np * 4)); CK(cudaMalloc(&idx, (size_t)Np * C * 4)); CK(cudaMalloc(&cnt, Np * 4));
+        cudaEvent_t e0, e1, e2, e3; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2); cudaEventCreate(&e3);
+        float best_w = 1e30f, best_t = 1e30f, ph[3] = {0, 0, 0}; int stw[6] = {0}, nbw = 0, st3[3], nb3;
+        for (int it = 0; it < 6; it++) {
+            CK(cudaMemset(d.stat, 0, 12)); CK(cudaMemset(d.nbad, 0, 4)); CK(cudaMemset(d.Y, 0x5a, (size_t)Np * M * 4));
+            cudaEventRecord(e0);
+            ex::split_window<<<Np, 256>>>(d.X, d.xs, Bx, emx, idx, cnt, d.stat, Np, K, S, C);
+            cudaEventRecord(e1);
+            gemm_parts<<<dim3(Np / oz::BN, M / oz::BM, A * S), oz::THREADS>>>(d.Wt, d.xs, d.P, M, Np, K, 1, S);
+            cudaEventRecord(e2);
+            combine_mxw<<<dim3((Np + 255) / 256, M), 256>>>(d.P, d.smin, Bx, emx, idx, cnt, C, pkd, d.sc, d.X, d.Y, d.flag, d.nbad, M, Np, K, A, S);
+            cudaEventRecord(e3); CK(cudaEventSynchronize(e3));
+            const float t = ms_since(e0, e3);
+            if (it && t < best_w) { best_w = t; ph[0] = ms_since(e0, e1); ph[1] = ms_since(e1, e2); ph[2] = ms_since(e2, e3); }
+            if (!it) { CK(cudaMemcpy(stw, d.stat, 12, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(&nbw, d.nbad, 4, cudaMemcpyDeviceToHost)); }
+        }
+        std::vector<float> W2((size_t)N * M);
+        CK(cudaMemcpy(W2.data(), d.Y, W2.size() * 4, cudaMemcpyDeviceToHost));
+        size_t diff = 0;
+        for (size_t t = 0; t < W2.size(); t++) diff += memcmp(&W2[t], &Y[t], 4) != 0;
+        for (int it = 0; it < 6; it++) {   // the tiers, timed the same way (split included)
+            cudaEventRecord(e0); run_exact(d, N, st3, &nb3); cudaEventRecord(e3); CK(cudaEventSynchronize(e3));
+            if (it) best_t = std::min(best_t, ms_since(e0, e3));
+        }
+        CK(cudaMemcpy(d.Y, Y.data(), Y.size() * 4, cudaMemcpyHostToDevice));
+        printf("window: %d plane(s) (tiers: %d), sparse <= %d per token%s, %d not certified, %zu of %zu outputs differ from the tiers\n",
+               A * S, A * L * S, stw[0], stw[1] ? " (OVER the cap: invalid)" : "", nbw, diff, W2.size());
+        printf("  time: window %.3f ms (split %.3f, GEMMs %.3f, combine %.3f)  tiers %.3f ms  -> %.2fx\n",
+               best_w, ph[0], ph[1], ph[2], best_t, best_t / best_w);
+        for (void *q : {(void *)Bx, (void *)emx, (void *)idx, (void *)cnt}) CK(cudaFree(q));
     }
     // baseline: split-K 1, 2, 4, 8 (engines pick it from the shape) -- how many bits move, and against the exact
     std::vector<std::vector<float>> base;
