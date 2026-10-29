@@ -29,11 +29,14 @@ __device__ __forceinline__ void load_tile(int8_t *s, const int8_t *g, int ld, in
 
 // the block's 128 x 128 tile of A Bt; epi(row, col, c00, c01, c10, c11) gets (row, col..col+1) and (row + 8, col..col+1)
 template <class Epi>
-__device__ __forceinline__ void gemm_i8_tile(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int K, Epi epi) {
+__device__ __forceinline__ void gemm_i8_tile(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int K, Epi epi,
+                                             int lda = 0, int ldb = 0) {   // row strides; 0 = K (sub-blocks of a bigger matrix: Strassen)
+    if (!lda) lda = K;
+    if (!ldb) ldb = K;
     __shared__ __align__(128) int8_t sA[STAGES][BM * BK], sB[STAGES][BN * BK];   // 3 x 16 KB = the 48 KB static limit
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = (warp >> 2) * 64, wn = (warp & 3) * 32;   // this warp's corner inside the block tile
-    const int8_t *gA = A + (size_t)blockIdx.y * BM * K, *gB = Bt + (size_t)blockIdx.x * BN * K;
+    const int8_t *gA = A + (size_t)blockIdx.y * BM * lda, *gB = Bt + (size_t)blockIdx.x * BN * ldb;
 
     int32_t acc[4][4][4] = {};   // [m16 tile][n8 tile][fragment]
     const int kt = K / BK;
@@ -41,7 +44,7 @@ __device__ __forceinline__ void gemm_i8_tile(const int8_t *__restrict__ A, const
     // One group is committed per tile, empty ones too, so "wait_group 1" always means "tile t has landed".
 #pragma unroll
     for (int s = 0; s < STAGES - 1; s++) {
-        if (s < kt) { load_tile(sA[s], gA + s * BK, K, tid); load_tile(sB[s], gB + s * BK, K, tid); }
+        if (s < kt) { load_tile(sA[s], gA + s * BK, lda, tid); load_tile(sB[s], gB + s * BK, ldb, tid); }
         asm volatile("cp.async.commit_group;");
     }
 
@@ -51,7 +54,7 @@ __device__ __forceinline__ void gemm_i8_tile(const int8_t *__restrict__ A, const
         __syncthreads();   // tile t visible to all, and everybody is done with tile t-1, whose buffer is refilled now
         if (t + STAGES - 1 < kt) {
             const int nxt = (t + STAGES - 1) % STAGES;
-            load_tile(sA[nxt], gA + (t + STAGES - 1) * BK, K, tid); load_tile(sB[nxt], gB + (t + STAGES - 1) * BK, K, tid);
+            load_tile(sA[nxt], gA + (t + STAGES - 1) * BK, lda, tid); load_tile(sB[nxt], gB + (t + STAGES - 1) * BK, ldb, tid);
         }
         asm volatile("cp.async.commit_group;");
 
