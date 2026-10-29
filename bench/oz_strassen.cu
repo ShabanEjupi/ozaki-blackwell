@@ -7,8 +7,9 @@
 // checked on all planes and on C, with a mutant. Accuracy: 1024 sampled entries against a double-double reference,
 // componentwise against |A||Bt^T| (the bound a classic FP64 GEMM is judged by), for this and for the GPU's own FP64.
 // Energy: NVML (in process, dlopen) over a window of repeated DGEMMs: joules per DGEMM, FP64-equivalent GFLOPS per watt.
-// Memory at n = 16384: A, Bt, C 2 GB each + nm int8 planes of C; the residue planes of the current group and the Strassen
-// buffers live inside C's FP64 buffer until the CRT overwrites it (g = 2 and chunks of 7 operands: 3.94 n^2 of its 8 n^2).
+// Memory at n = 16384: A, Bt, C 2 GB each + nm int8 planes of C, which first hold A's residues for all moduli (one read of
+// A; the result of modulus l overwrites plane l); Bt's planes, two moduli per read, and the Strassen buffers live inside C's
+// FP64 buffer until the CRT overwrites it (operand chunks of 23 of 49).
 //   oz_strassen [n [nm_list [spread]]]   e.g. oz_strassen 16384 12,13,14 0
 #include <algorithm>
 #include <atomic>
@@ -109,8 +110,35 @@ static void residues(int l0, int g, const double *X, int n, const int *s, int8_t
     else residues_at<1>(l0, X, n, s, R, std::make_integer_sequence<int, 16>{});
 }
 
+template <int... I> static void resA_at(int nm, const double *X, int n, const int *s, int8_t *R, std::integer_sequence<int, I...>) {
+    ((nm == I ? (void)residues_g<0, I><<<dim3((n + 255) / 256, n), 256>>>(X, n, s, R, (size_t)n * n) : (void)0), ...);
+}
+static void resA(int nm, const double *X, int n, const int *s, int8_t *R) { resA_at(nm, X, n, s, R, std::integer_sequence<int, 8, 9, 10, 11, 12, 13, 14, 15, 16>{}); }
+
+// Garner as in ozaki2.cuh, then Horner in 128-bit integers: the integer C'_ij exactly, rounded to FP64 once. The FP64 Horner
+// rounds nm - 1 times and runs at 1/64 of the FP32 rate (OZ_CRT=fp64: that one)
+template <int NM>
+__global__ void crt_int(const int8_t *Cl, size_t plane, int n, const int *sa, const int *sb, double *C) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x, i = blockIdx.y;
+    if (j >= n) return;
+    int x[NM];
+    oz::each<0, NM>([&](auto L) {
+        constexpr int l = decltype(L)::value, m = oz::modulus(l);
+        int v = Cl[l * plane + (size_t)i * n + j];   // already balanced
+        oz::each<0, l>([&](auto t) { v = oz::balc<m>((v - x[decltype(t)::value]) * oz::c_inv[decltype(t)::value][l]); });
+        x[l] = v;
+    });
+    __int128 y = x[NM - 1];
+#pragma unroll
+    for (int l = NM - 2; l >= 0; l--) y = y * oz::modulus(l) + x[l];
+    const long long hi = (long long)(y >> 64); const unsigned long long lo = (unsigned long long)y;   // |y| < 2^126: hi exact in FP64
+    C[(size_t)i * n + j] = ldexp(fma((double)hi, 0x1p64, (double)lo), -(sa[i] + sb[j]));
+}
+
 template <int NM> static void crt_run(const int8_t *Cpl, int n, const int *sa, const int *sb, double *C) {
-    oz::crt<NM><<<dim3((n + 255) / 256, n), 256>>>(Cpl, (size_t)n * n, n, n, n, sa, sb, C);
+    static const bool fp64 = getenv("OZ_CRT") && !strcmp(getenv("OZ_CRT"), "fp64");
+    if (fp64) oz::crt<NM><<<dim3((n + 255) / 256, n), 256>>>(Cpl, (size_t)n * n, n, n, n, sa, sb, C);
+    else crt_int<NM><<<dim3((n + 255) / 256, n), 256>>>(Cpl, (size_t)n * n, n, sa, sb, C);
 }
 static void crt(int nm, const int8_t *Cpl, int n, const int *sa, const int *sb, double *C) {
     switch (nm) {
@@ -157,7 +185,7 @@ int main(int argc, char **argv) {
     std::vector<int> nms = {12, 13, 14};
     if (argc > 2) { nms.clear(); for (char *p = argv[2]; *p;) { nms.push_back((int)strtol(p, &p, 10)); if (*p == ',') p++; } }
     const double spread = argc > 3 ? atof(argv[3]) : 0;
-    const int g = 2, cap = 7;
+    const int g = 2;   // residue planes of Bt per pass over Bt; those of A come from one pass, into C's planes
     std::vector<int> Ls = {0, 2};   // OZ_L=2: only the Strassen run (sweeps); OZ_NATIVE=0 skips the 17 s native FP64 run
     if (const char *e = getenv("OZ_L")) Ls = {atoi(e)};
     const bool native = !getenv("OZ_NATIVE") || atoi(getenv("OZ_NATIVE"));
@@ -165,7 +193,10 @@ int main(int argc, char **argv) {
     const double window = getenv("OZ_WINDOW") ? atof(getenv("OZ_WINDOW")) : 8;     // seconds of repeated DGEMMs per energy reading
     if (n % 1024) { printf("n must be a multiple of 1024 (two levels of 128 x 256 tiles)\n"); return 1; }
     const size_t nn = (size_t)n * n;
-    if (2 * g * nn + oz::StrassenMod::bytes(n, 2, cap) > 8 * nn) { printf("arena too small\n"); return 1; }
+    // the Strassen buffers and the Bt planes live in C's FP64 buffer (8 n^2 bytes) until the CRT overwrites it: operand chunks of
+    // cap, the largest that fits (n = 16384: 23 of 49, three chunks)
+    int cap = 49;
+    while (cap > 1 && g * nn + oz::StrassenMod::bytes(n, 2, cap) > 8 * nn) cap--;
     oz::init_moduli(); oz::StrassenMod::grant();
     oz::StrassenMod sm; sm.tile = 1; sm.G = 8;   // 128 x 256 leaves, 3 stages; block bands of 8
     double *A, *Bt, *C; int8_t *Cpl; int *sa, *sb;
@@ -173,12 +204,12 @@ int main(int argc, char **argv) {
     CK(cudaMalloc(&A, nn * 8)); CK(cudaMalloc(&Bt, nn * 8)); CK(cudaMalloc(&C, nn * 8)); CK(cudaMalloc(&Cpl, (size_t)maxnm * nn));
     CK(cudaMalloc(&sa, n * 4)); CK(cudaMalloc(&sb, n * 4));
     fill<<<(nn + 255) / 256, 256>>>(A, nn, 1, spread); fill<<<(nn + 255) / 256, 256>>>(Bt, nn, 1ull << 40, spread); CK(cudaDeviceSynchronize());
-    int8_t *arena = (int8_t *)C, *Apl = arena, *Bpl = arena + g * nn;   // the group's planes, then the Strassen buffers
-    sm.plan(n, 2, cap, arena + 2 * g * nn);
+    int8_t *arena = (int8_t *)C, *Bpl = arena, *tmp = arena + g * nn;   // Bt's planes, then the Strassen buffers (L = 2) or tmp (L = 0)
+    sm.plan(n, 2, cap, tmp);
     Power pw;
     size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
-    printf("n=%d spread 2^+-%g, NVML %s, %.2f GB free of %.2f\n", n, spread, !pw.ok ? "absent" : pw.counter ? "power samples (energy counter as a cross-check)" : "power samples",
-           fr / 1e9, tot / 1e9);
+    printf("n=%d spread 2^+-%g, NVML %s, %.2f GB free of %.2f, operand chunks of %d\n", n, spread, !pw.ok ? "absent" : pw.counter ? "power samples (energy counter as a cross-check)" : "power samples",
+           fr / 1e9, tot / 1e9, cap);
 
     // the sampled reference: 1024 entries in double-double, and |A||Bt^T| for the componentwise bound
     std::vector<double> hA(nn), hB(nn), hC(nn), hC0(nn);
@@ -215,22 +246,41 @@ int main(int argc, char **argv) {
         if (norm) { double l2 = 0; for (int l = 0; l < nm; l++) l2 += log2((double)oz::MODULI[l]); bits = (int)floor((l2 - 1.001) / 2); if (bits > 62) bits = 62; }
         std::vector<int8_t> pl0, pl1;
         for (int L : Ls) {
-            auto dgemm = [&] {
-                if (norm) { scales_norm<<<n, 256>>>(A, n, bits, sa); scales_norm<<<n, 256>>>(Bt, n, bits, sb); }
-                else { oz::scales<<<n, 256>>>(A, n, n, n, 1, bits, sa); oz::scales<<<n, 256>>>(Bt, n, n, n, 1, bits, sb); }
+            // one DGEMM; ph (OZ_PROF): ms per phase, every phase synchronised (so their sum is a little above a timed run)
+            auto dgemm = [&](float *ph) {
+                cudaEvent_t e0 = nullptr, e1 = nullptr; float pr[3] = {};
+                if (ph) { cudaEventCreate(&e0); cudaEventCreate(&e1); }
+                auto lap = [&](int k, auto f) {
+                    if (!ph) { f(); return; }
+                    cudaEventRecord(e0); f(); cudaEventRecord(e1); cudaEventSynchronize(e1); float t; cudaEventElapsedTime(&t, e0, e1); ph[k] += t;
+                };
+                lap(0, [&] { if (norm) { scales_norm<<<n, 256>>>(A, n, bits, sa); scales_norm<<<n, 256>>>(Bt, n, bits, sb); }
+                             else { oz::scales<<<n, 256>>>(A, n, n, n, 1, bits, sa); oz::scales<<<n, 256>>>(Bt, n, n, n, 1, bits, sb); } });
+                // all nm residue planes of A from one read of A, into C's planes: plane l of A is read by the product of modulus l
+                // only, and its result overwrites it (L = 2 writes C after its last operand pass; L = 0 goes through tmp)
+                lap(1, [&] { resA(nm, A, n, sa, Cpl); });
                 for (int l0 = 0; l0 < nm; l0 += g) {
                     const int gg = nm - l0 < g ? nm - l0 : g;
-                    residues(l0, gg, A, n, sa, Apl); residues(l0, gg, Bt, n, sb, Bpl);
-                    for (int l = l0; l < l0 + gg; l++)
-                        sm.mul(Apl + (l - l0) * nn, n, Bpl + (l - l0) * nn, n, Cpl + (size_t)l * nn, n, n, L, oz::mod_of(oz::MODULI[l]));
+                    lap(1, [&] { residues(l0, gg, Bt, n, sb, Bpl); });
+                    for (int l = l0; l < l0 + gg; l++) lap(3, [&] {
+                        int8_t *Al = Cpl + (size_t)l * nn;
+                        sm.mul(Al, n, Bpl + (l - l0) * nn, n, L ? Al : tmp, n, n, L, oz::mod_of(oz::MODULI[l]), ph && L ? pr : nullptr);
+                        if (!L) CK(cudaMemcpyAsync(Al, tmp, nn, cudaMemcpyDeviceToDevice));
+                    });
                 }
-                crt(nm, Cpl, n, sa, sb, C);
+                lap(5, [&] { crt(nm, Cpl, n, sa, sb, C); });
+                if (ph && L) { ph[2] += pr[0]; ph[3] -= pr[0] + pr[2]; ph[4] += pr[2]; }   // the products' phase without their sums
+                if (ph) { cudaEventDestroy(e0); cudaEventDestroy(e1); }
             };
-            dgemm(); CK(cudaDeviceSynchronize());   // warm-up
+            dgemm(nullptr); CK(cudaDeviceSynchronize());   // warm-up
+            if (getenv("OZ_PROF")) {   // where the time goes
+                float ph[6] = {}; dgemm(ph);
+                printf("   phases ms: scales %.1f, residues %.1f, operand sums %.1f, products %.1f, output sums %.1f, CRT %.1f\n", ph[0], ph[1], ph[2], ph[3], ph[4], ph[5]);
+            }
             // a window of at least 8 s: the GPU settles at its power cap within ~1 s
             int reps = 0; pw.start(); cudaEventRecord(t0);
             auto w0 = std::chrono::steady_clock::now();
-            do { dgemm(); CK(cudaDeviceSynchronize()); reps++; } while (std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count() < window);
+            do { dgemm(nullptr); CK(cudaDeviceSynchronize()); reps++; } while (std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count() < window);
             cudaEventRecord(t1); CK(cudaEventSynchronize(t1)); pw.stop();
             float ms; cudaEventElapsedTime(&ms, t0, t1); ms /= reps;
             CK(cudaGetLastError());

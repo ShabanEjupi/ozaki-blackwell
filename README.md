@@ -112,14 +112,21 @@ double-double reference; energy = NVML power samples every 2 ms, integrated over
 |---|---|---|---|---|---|---|---|
 | the GPU's own FP64 | default | 17 324 | 0.508 | 82.5 | 1 441.5 | 6.10 | 2.82 |
 | the GPU's own FP64 at its best point | 1500 / 9001 | 32 173 | 0.273 | 31.9 | 1 025.7 | 8.58 | 2.82 |
-| Ozaki-II, 15 moduli (max scale), classical | default | 1 021 | 8.62 | 117.8 | 120.3 | 73.1 | 0.98 |
-| + scale from the row 2-norm: 14 moduli | default | 961 | 9.15 | 119.7 | 113.7 | 77.4 | 2.03 |
-| + Strassen, two levels in one pass | default | 897 | 9.81 | 119.5 | 108.3 | 81.2 | 2.03 |
-| **+ the operating point** | **1350 / 9001** | 1 461 | 6.02 | 52.7 | **76.5** | **114.9** | **2.03** |
+| Ozaki-II, 15 moduli (max scale), classical | default | 1 009 | 8.72 | 119.4 | 119.4 | 73.7 | 0.98 |
+| + scale from the row 2-norm: 14 moduli | default | 942 | 9.34 | 119.8 | 114.4 | 76.9 | 2.03 |
+| + Strassen, two levels in one pass | default | 854 | 10.30 | 120.2 | 103.3 | 85.2 | 2.03 |
+| **+ the operating point** | **1350 / 9001** | 1 376 | 6.39 | 53.4 | **73.6** | **119.4** | **2.03** |
 
-- **18.8× fewer joules than the GPU's own FP64 at default clocks, 13.4× fewer than it at its own best point, 19.3× faster at
+- **19.6× fewer joules than the GPU's own FP64 at default clocks, 13.9× fewer than it at its own best point, 20.3× faster at
   default clocks, and more accurate** (2.03 against 2.82; with magnitudes spread over 2^±8: 6.89 against 17.14). 15 moduli
-  at 1350/9001: 82.9 J, error 0.98.
+  at 1350/9001: 81.6 J, error 0.98. Two runs of the best point: 73.36 and 73.64 J.
+- **Static and dynamic joules**: the GPU idles at ~17 W at every clock point. At 1350/9001 the DGEMM is 23.5 J static + 50.1 J
+  dynamic; the GPU's own FP64 at 1500/9001 is 557 J static + 469 J dynamic. Dynamic alone: 9.4× fewer joules; static: 23.7×,
+  because it is done 23× sooner.
+- **Where the time goes** (`OZ_PROF=1`, 1350/9001): products 1051 ms, operand sums 120, residues 91, CRT 60, output sums 45,
+  scales 28. A's residues for all 14 moduli come from one read of A into C's planes (the result of modulus l overwrites plane
+  l), Bt's two moduli per read (residues 142 → 91 ms); the CRT ends in 128-bit integer Horner, one rounding instead of 13 in
+  FP64 at 1/64 rate (75 → 60 ms).
 - **Bit-identical**: the residue planes of C with Strassen equal the classical ones byte for byte (0 of 3 758 096 384 differ),
   so every FP64 entry is identical; a flipped byte (mutant) is seen. Over Z/m there is no stability question.
 - **Scale from the 2-norm** (`scales_norm`): |C′ᵢⱼ| ≤ ‖a′ᵢ‖·‖b′ⱼ‖ (Cauchy–Schwarz) < P/2 when every row norm, rounding
@@ -128,23 +135,24 @@ double-double reference; energy = NVML power samples every 2 ms, integrated over
 - **The operating point**: under the power cap the clock is where the watts go; below it the energy per operation falls with
   the voltage (1500 MHz: 61 W, 1800: 78 W, default ~120 W). Below ~1350 MHz the fixed power of the board and memory
   (~30 W) takes over and the joules rise again (900 MHz: 94.9 J). Memory at 9001 instead of 14001 MHz saves 8–11 %.
-- **Why Strassen gives 5–13 % here, not the 20 % of the bare product**: at n = 16384 the 12 GB card holds A, Bᵀ, C (6.4 GB) and
+- **Why Strassen gives 9 % of the time here, not the 20 % of the bare product**: at n = 16384 the 12 GB card holds A, Bᵀ, C (6.4 GB) and
   14 int8 planes of C (3.8 GB); the residues of the current pair of moduli and the Strassen buffers live inside C's FP64
-  buffer until the CRT overwrites it, which forces operand chunks of 7 (the bare product: 47.9 ms unchunked, ~55 chunked).
-  Strassen cuts the joules more than the time (10.5–12.8 % at 1350–1800 MHz): fewer MACs, and the extra passes are cheap at
-  the low memory clock.
+  buffer until the CRT overwrites it, which forces operand chunks of 23 of 49 (the bare product runs unchunked). Strassen
+  cuts the joules more than the time (14.2 % at 1350/9001: 85.8 → 73.6 J): fewer MACs, and the extra passes are cheap at the
+  low memory clock.
 - **For scale** (datasheet, rated peak over rated power, not measured): H100 SXM 67 TFLOPS FP64 Tensor Core at up to 700 W
   (96 GFLOPS/W), H100 NVL 60 TFLOPS at 350–400 W (150–171). A laptop GPU whose own FP64 gives 8.6 GFLOPS/W at best delivers
-  FP64-accurate GEMM at 114.9 GFLOPS/W, inside the range of a datacenter FP64 tensor core.
+  FP64-accurate GEMM at 119.4 GFLOPS/W, inside the range of a datacenter FP64 tensor core.
 - NVML's energy counter on this laptop advances in steps of ~1 s of energy: over 1–8 s windows it read 20–150 % high against
   the integrated samples (296.8 W "average" at 112.3 W sampled). The samples are the measurement; the counter is printed
   only as a cross-check.
 
 **SQ** — Çdo produkt modular i Ozaki-II kalon tani nga dy nivele Strassen në një kalim, për çdo modul ≤ 256. Te n = 16384:
-**76,5 J për një DGEMM FP64 (114,9 GFLOPS/W) — 18,8× më pak energji se FP64 i vetë GPU-së, 13,4× më pak se ai te pika e vet më e
-mirë, 19,3× më shpejt dhe më i saktë** (2,03 kundër 2,82). Shtresat: INT8 në vend të FP64 → shkallëzimi me normën-2 (14 module në
+**73,6 J për një DGEMM FP64 (119,4 GFLOPS/W) — 19,6× më pak energji se FP64 i vetë GPU-së, 13,9× më pak se ai te pika e vet më e
+mirë, 20,3× më shpejt dhe më i saktë** (2,03 kundër 2,82). Shtresat: INT8 në vend të FP64 → shkallëzimi me normën-2 (14 module në
 vend të 15, kufi i garantuar me Cauchy–Schwarz) → Strassen mbi Z/m (bit për bit si klasiku: 0 bajtë të ndryshëm nga 3,76
-miliardë) → pika e punës 1350 MHz / memorja 9001 MHz. Brenda brezit të një H100 (96–171 GFLOPS/W sipas datasheet-it), në laptop.
+miliardë) → mbetjet e A-së nga një lexim, CRT me Horner 128-bit → pika e punës 1350 MHz / memorja 9001 MHz. Pjesa dinamike e
+xhauleve: 9,4× më pak; ajo statike (~17 W bordi): 23,7× më pak, sepse mbaron 23× më shpejt. Brenda brezit të një H100 (96–171 GFLOPS/W sipas datasheet-it), në laptop.
 
 ## Next / Më tej (27-10-2026)
 - Kimi K3 end to end on this laptop needs 1.56 TB of storage (669 GB free; the office link gave 2.9 MB/s): an external NVMe
