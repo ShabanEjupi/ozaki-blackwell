@@ -37,6 +37,8 @@ li{margin:4px 0}
 <tr><th>D</th><th><span lang="sq">mënyra</span><span lang="en">method</span></th><th><span lang="sq">plane INT8</span><span lang="en">INT8 planes</span></th><th>ms</th><th><span lang="sq">kundër cuBLAS BF16</span><span lang="en">vs cuBLAS BF16</span></th></tr>
 <tr><td>8192</td><td><span lang="sq">shtresa (mëngjes)</span><span lang="en">tiers (morning)</span></td><td>54</td><td>52,3</td><td class="bad">30×</td></tr>
 <tr><td>8192</td><td><span lang="sq">dritare + mbetje e rrallë</span><span lang="en">window + sparse rest</span></td><td>9</td><td>12,2</td><td>7,6×</td></tr>
+<tr><td>8192</td><td><span lang="sq">dritare, shifra sipas gjerësisë</span><span lang="en">window, width-aware digits</span></td><td>9</td><td>11,0</td><td>6,9×</td></tr>
+<tr><td>8192</td><td><span lang="sq">baza QLoRA (MXFP4), 1 shifër</span><span lang="en">QLoRA base (MXFP4), 1 digit</span></td><td>3</td><td>6,6</td><td>4,1×</td></tr>
 <tr><td>8192</td><td>cuBLAS BF16, FP32 <span lang="sq">shuma (jo i saktë)</span><span lang="en">sums (not exact)</span></td><td>—</td><td>1,6</td><td>1×</td></tr>
 <tr><td>16384</td><td><span lang="sq">shtresa</span><span lang="en">tiers</span></td><td>54</td><td>223</td><td class="bad">37×</td></tr>
 <tr><td>16384</td><td><span lang="sq">dritare + mbetje e rrallë</span><span lang="en">window + sparse rest</span></td><td>9</td><td>42,3</td><td>7,2×</td></tr>
@@ -45,9 +47,13 @@ li{margin:4px 0}
 <p lang="sq">Fazat te D=8192: ndarja 1,9 ms · GEMM-i 7,1 ms (≈177 TOPS INT8, afër tavanit) · bashkimi 3,1 ms. Koha e dritares përfshin edhe ndarjen; ajo e shtresave jo.</p>
 <p lang="en">Phases at D=8192: split 1.9 ms · GEMM 7.1 ms (≈177 INT8 TOPS, near the ceiling) · combine 3.1 ms. The window time includes its split; the tiers' does not.</p>
 
+<h2><span lang="sq">Peshat reale të Kimi K3 (MXFP4)</span><span lang="en">Real Kimi K3 weights (MXFP4)</span></h2>
+<p lang="sq">Eksperti 0 i shtresës 5, 4096 tokena: 3 plane në vend të 9, 3,57 ms në vend të 8,06 ms (2,26×). Të 27,3 milionë daljet (w1 + w2) janë bit për bit të njëjta me rrugën e vjetër, 0 të pacertifikuara.</p>
+<p lang="en">Layer 5, expert 0, 4096 tokens: 3 planes instead of 9, 3.57 ms instead of 8.06 ms (2.26×). All 27.3 million outputs (w1 + w2) are bit-identical to the old path, 0 uncertified.</p>
+
 <h2><span lang="sq">Ideja</span><span lang="en">The idea</span></h2>
-<p lang="sq">Te çdo rresht, dritarja 13-bitëshe e eksponentëve me më shumë elemente shkon te 3 plane shifrash INT8. Elementet jashtë saj (6–31 për rresht, sipër ose poshtë) shtohen saktë nga vlera BF16 e papërpunuar, brenda të njëjtit akumulator 128-bitësh. Kështu duhen 9 plane në vend të 54–81, dhe rezultati mbetet bit për bit i njëjtë.</p>
-<p lang="en">Each row's densest 13-bit exponent window goes into 3 INT8 digit planes. The elements outside it (6–31 per row, above or below) are added exactly from the raw BF16 value, into the same 128-bit accumulator. That is 9 planes instead of 54–81, with the result unchanged to the bit.</p>
+<p lang="sq">Te çdo rresht, dritarja e eksponentëve (14 bit për BF16, më e gjerë kur vlera ka më pak bit të rëndësishëm) e eksponentëve me më shumë elemente shkon te 3 plane shifrash INT8. Elementet jashtë saj (6–31 për rresht, sipër ose poshtë) shtohen saktë nga vlera BF16 e papërpunuar, brenda të njëjtit akumulator 128-bitësh. Kështu duhen 9 plane në vend të 54–81, dhe rezultati mbetet bit për bit i njëjtë.</p>
+<p lang="en">Each row's densest exponent window (14 bits for BF16, wider when a value has fewer significant bits) goes into 3 INT8 digit planes. The elements outside it (6–31 per row, above or below) are added exactly from the raw BF16 value, into the same 128-bit accumulator. That is 9 planes instead of 54–81, with the result unchanged to the bit.</p>
 
 <h2><span lang="sq">Prova kundërshtare</span><span lang="en">Adversarial checks</span></h2>
 <ul>
