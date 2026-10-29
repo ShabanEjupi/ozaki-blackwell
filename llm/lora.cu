@@ -199,6 +199,11 @@ int main(int argc, char **argv) {
     for (int j = 0; j < N; j++) { const double sc = exp2(rng() % 8 - 4.0); for (int k = 0; k < D; k++) X[(size_t)j * D + k] = f2b((float)(sc * nd(rng))); }
     if (const char *o = getenv("OZ_OUTLIERS"))   // LLM-style outlier channels: the same few features 2^7 larger in every token
         for (int c = 0, n = atoi(o); c < n; c++) { const int k = rng() % D; for (int j = 0; j < N; j++) X[(size_t)j * D + k] = f2b(128.f * b2f(X[(size_t)j * D + k])); }
+    if (const char *wf = getenv("OZ_W")) {   // real weights and inputs (llm/jais_lora_prep.py): W [D][D] and the first N rows of X, BF16
+        auto rd = [](const char *p, std::vector<uint16_t> &v) { FILE *f = fopen(p, "rb"); if (!f || fread(v.data(), 2, v.size(), f) != v.size()) { fprintf(stderr, "cannot read %zu values from %s\n", v.size(), p); exit(1); } fclose(f); };
+        rd(wf, W); if (const char *xf = getenv("OZ_X")) rd(xf, X);
+        printf("real W from %s%s\n", wf, getenv("OZ_X") ? ", real X" : "");
+    }
     for (auto &g : G) g = f2b((float)(1e-4 * td(rng)));                           // upstream gradient
     for (int q = 0; q < r; q++) for (int k = 0; k < D; k++) Ap[(size_t)q * D + k] = f2b((float)(nd(rng) / sqrt((double)D)));
     for (int i = 0; i < D; i++) for (int q = 0; q < r; q++) Bp[(size_t)i * RP + q] = f2b((float)(1e-3 * nd(rng)));
