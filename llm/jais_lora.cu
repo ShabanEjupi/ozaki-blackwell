@@ -81,9 +81,68 @@ static DevW transposed(const std::vector<DevW> &Ws, int &kpad) {
     if (std::all_of(Ws.begin(), Ws.end(), [](const DevW &W) { return W.fmt == F_E4M3B; })) Wt.wd = 4;   // hi | lo of FP8 x scale: exact in 4 digits
     return Wt;
 }
+// dX += [dY_1 | dY_2] [W_1 ; W_2] for FP8 maps (tgemm.cu): the weights' own E4M3 digits, transposed, and dY once in K (hi|lo
+// needed it twice); the same correctly rounded outputs. OZ_HILO=1: the hi|lo product below for every map.
+static void *dTs; static bool HILO = getenv("OZ_HILO");
+static void dgrad_f8(const std::vector<DevW> &Ws, const std::vector<const std::vector<double> *> &dY, size_t N, std::vector<double> &dX) {
+    auto t0 = std::chrono::steady_clock::now(), tp = t0;
+    int Ko = Ws[0].K, Kt = 0; for (auto &W : Ws) Kt += W.M;
+    int KB = Kt / 128; size_t PW = (size_t)Ko * Kt;
+    if (Ws.size() > 2 || Kt % 128 || Ko % 128 || KB > tg::KBMAX) { fprintf(stderr, "dgrad_f8: %zu maps, %d x %d\n", Ws.size(), Ko, Kt); exit(1); }
+    static bool init = false;
+    if (!init) { CK(cudaMalloc(&dTs, (size_t)128 * tg::KBMAX * 2)); init = true; }
+    if (Ko / 128 > 128) { fprintf(stderr, "dgrad_f8: %d rows exceed the scale buffer\n", Ko); exit(1); }
+    F8Cat C{}; C.n = (int)Ws.size(); C.Ko = Ko;
+    for (int i = 0, off = 0; i < C.n; off += Ws[i].M, i++) {
+        C.w[i] = (const uint8_t *)Ws[i].w; C.sc[i] = (const uint16_t *)Ws[i].sw; C.Mo[i] = Ws[i].M;
+        tr_f8_digits<<<dim3((Ko + 31) / 32, (C.Mo[i] + 31) / 32), dim3(32, 8)>>>(C.w[i], g_wd, PW, C.Mo[i], Ko, Kt, off);
+        tr_f8_scales<<<64, 256>>>(C.sc[i], (uint16_t *)dTs, C.Mo[i], Ko, KB, off);
+    }
+    CK(cudaGetLastError()); pmark(tp, "dg8 w-digits");
+    std::vector<float> Y(N * (size_t)Ko); std::vector<uint16_t> xb;
+    std::vector<uint8_t> hw[2]; std::vector<uint16_t> hs[2];   // the weights on the host, only when an output is left to it
+    for (size_t n0 = 0; n0 < N; n0 += G_NB) {
+        size_t n = std::min(G_NB, N - n0), np = (n + 7) / 8 * 8;
+        xb.assign(np * Kt, 0);
+        #pragma omp parallel for schedule(static)
+        for (size_t r = 0; r < n; r++) { uint16_t *x = xb.data() + r * Kt;
+            for (int i = 0, off = 0; i < C.n; off += C.Mo[i], i++) { const double *gr = dY[i]->data() + (n0 + r) * C.Mo[i];
+                for (int m = 0; m < C.Mo[i]; m++) { float f = bf(gr[m]); uint32_t u; memcpy(&u, &f, 4); x[off + m] = u >> 16; } } }
+        CK(cudaMemcpy(g_xb, xb.data(), np * Kt * 2, cudaMemcpyHostToDevice)); pmark(tp, "dg8 x-host");
+        bf16_digits<<<dig_grid(np * KB), 256>>>(g_xb, g_xd, g_xl, g_xn, (int)np, Kt, DX24); pmark(tp, "dg8 x-digits");
+        CK(cudaMemset(g_nb, 0, 4));
+        tgemm_go<3, DX24, true, 64, 3>(g_wd, (const uint16_t *)dTs, nullptr, nullptr, g_xd, g_xl, g_xn, g_Y, Ko, (int)np, Kt, 24, g_nb);
+        CK(cudaGetLastError()); pmark(tp, "dg8 gemm");
+        CK(cudaMemset(g_lcnt, 0, 4)); CK(cudaMemset(g_nb, 0, 4));
+        nan_list<<<1024, 256>>>(g_Y, np * Ko, g_list, g_lcnt, G_CAP);
+        f8t_fixup<<<1024, 256>>>(C, g_xb, Kt, g_list, g_lcnt, G_CAP, g_Y, Ko, 24, g_nb);
+        unsigned lc; CK(cudaMemcpy(&lc, g_lcnt, 4, cudaMemcpyDeviceToHost)); st_fix24 += lc;
+        int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_fixopen += nb;
+        size_t left = (lc > G_CAP ? lc - G_CAP : 0) + nb; pmark(tp, "dg8 fixup");
+        float *y = Y.data() + n0 * Ko; CK(cudaMemcpy(y, g_Y, n * Ko * 4, cudaMemcpyDeviceToHost)); pmark(tp, "dg8 y-d2h");
+        if (left) {   // what is still NaN: every product into the host superaccumulator
+            if (hw[0].empty()) for (int i = 0; i < C.n; i++) {
+                hw[i].resize((size_t)C.Mo[i] * Ko); hs[i].resize((size_t)C.Mo[i] / 128 * (Ko / 128));
+                CK(cudaMemcpy(hw[i].data(), C.w[i], hw[i].size(), cudaMemcpyDeviceToHost)); CK(cudaMemcpy(hs[i].data(), C.sc[i], hs[i].size() * 2, cudaMemcpyDeviceToHost)); }
+            const uint8_t *pw[2] = {hw[0].data(), hw[1].data()}; const uint16_t *ps[2] = {hs[0].data(), hs[1].data()};
+            for (size_t r = 0; r < n; r++) { bool any = false; const uint16_t *xr = xb.data() + r * Kt;
+                for (int k = 0; k < Ko; k++) { float &o = y[r * Ko + k]; if (o == o) continue; any = true; Big pos, neg;
+                    for (int m = 0; m < Kt; m++) { int E; long long pr = f8t_term(C, pw, ps, k, m, xr[m], E); if (pr) (pr > 0 ? pos : neg).add((unsigned __int128)(pr > 0 ? pr : -pr), E); }
+                    bool ng = !pos.ge(neg); if (ng) { neg.sub(pos); pos = neg; } else pos.sub(neg);
+                    double v = big_round(pos, 1, 0, 24); o = (float)(ng ? -v : v); }
+                st_host += any; }
+            pmark(tp, "dg8 host");
+        }
+    }
+    st_rows += N; st_outs24 += (long long)N * Ko; t_gemm += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < Y.size(); i++) dX[i] += Y[i];
+    pmark(tp, "dg add");
+}
 // dX += [dY_1 | dY_2 | ...] [W_1 ; W_2 ; ...] (the forward was Y_i = X W_i^T): every output one correctly rounded FP32 of
 // the exact sum, added to the FP64 dX
 static void dgrad(const std::vector<DevW> &Ws, const std::vector<const std::vector<double> *> &dY, size_t N, std::vector<double> &dX) {
+    if (!HILO && std::all_of(Ws.begin(), Ws.end(), [](const DevW &W) { return W.fmt == F_E4M3B; })) { dgrad_f8(Ws, dY, N, dX); return; }
     auto tp = std::chrono::steady_clock::now();
     int kpad; DevW Wt = transposed(Ws, kpad); pmark(tp, "dg transpose");
     std::vector<float> X(N * (size_t)kpad, 0.f), Y(N * (size_t)Wt.M);
@@ -516,8 +575,65 @@ static int back_selftest() {
     return all < 1e-6 && same ? 0 : 1;
 }
 
+// ---- --dgtest <model dir> [layer] [expert] [tokens]: one expert's two dgrad products, hi|lo against tgemm.cu ------------
+// Gradients as the backward has them (FP64, a scale per token over 2^-30..2^-6, outliers 2^10 larger, 2 % exact zeros, one
+// zero row); both paths must agree bit for bit, and 4096 outputs of each are checked against the host superaccumulator.
+static int dg_test(int L, int e, size_t N) {
+    CK(cudaMallocHost(&pin, PIN));
+    bmm_init((size_t)std::max(D_FF, 16384) * D_H, std::max(D_FF, D_Q * D_HD), std::max(D_FF, 16384));
+    WT_MAX = (size_t)std::max(D_FF, 16384) * D_H * 2; CK(cudaMalloc(&dWt, WT_MAX)); CK(cudaMalloc(&dtbad, 4)); CK(cudaMemset(dtbad, 0, 4));
+    for (int i = 0; i < 3; i++) { CK(cudaMalloc(&dEw[i], (size_t)J_MFF * D_H)); CK(cudaMalloc(&dEs[i], (size_t)1 << 20)); }
+    std::string EP = "model.layers." + std::to_string(L) + ".mlp.experts." + std::to_string(e) + ".";
+    DevW Wg = fp8w_to(EP + "gate_proj", J_MFF, D_H, 0), Wu = fp8w_to(EP + "up_proj", J_MFF, D_H, 1), Wd = fp8w_to(EP + "down_proj", D_H, J_MFF, 2);
+    std::mt19937_64 rng(30102026); std::normal_distribution<double> nd;
+    auto grad = [&](size_t M) { std::vector<double> v(N * M);
+        for (size_t r = 0; r < N; r++) { double sc = r == 5 ? 0 : exp2(-6.0 - (double)(rng() % 25));
+            for (size_t m = 0; m < M; m++) v[r * M + m] = rng() % 50 == 0 ? 0.0 : nd(rng) * sc * (rng() % 211 == 0 ? 1024 : 1); }
+        return v; };
+    auto dy = grad(D_H), dg = grad(J_MFF), du = grad(J_MFF);
+    struct Case { const char *name; std::vector<DevW> Ws; std::vector<const std::vector<double> *> dY; int out; };
+    std::vector<Case> cs = {{"down", {Wd}, {&dy}, J_MFF}, {"gate+up", {Wg, Wu}, {&dg, &du}, D_H}};
+    int bad = 0;
+    for (auto &c : cs) {
+        std::vector<double> a(N * c.out), b(N * c.out); double ta = 1e30, tb = 1e30; long long fa = 0, fb = 0, ha = 0, hb = 0;
+        for (int rep = 0; rep < 3; rep++) {
+            std::fill(a.begin(), a.end(), 0.0); std::fill(b.begin(), b.end(), 0.0);
+            long long f0 = st_fix24, h0 = st_host; HILO = true; CK(cudaDeviceSynchronize()); auto t = std::chrono::steady_clock::now();
+            dgrad(c.Ws, c.dY, N, a); CK(cudaDeviceSynchronize()); ta = std::min(ta, secs(t)); fa = st_fix24 - f0; ha = st_host - h0;
+            f0 = st_fix24; h0 = st_host; HILO = false; t = std::chrono::steady_clock::now();
+            dgrad(c.Ws, c.dY, N, b); CK(cudaDeviceSynchronize()); tb = std::min(tb, secs(t)); fb = st_fix24 - f0; hb = st_host - h0;
+        }
+        size_t diff = 0; for (size_t i = 0; i < a.size(); i++) diff += memcmp(&a[i], &b[i], 8) != 0;
+        // the reference: every product exact in the superaccumulator, from the weights copied back
+        F8Cat C{}; C.n = (int)c.Ws.size(); C.Ko = c.Ws[0].K; std::vector<uint8_t> hw[2]; std::vector<uint16_t> hs[2]; int Kt = 0;
+        for (int i = 0; i < C.n; i++) { C.Mo[i] = c.Ws[i].M; Kt += C.Mo[i]; hw[i].resize((size_t)C.Mo[i] * C.Ko); hs[i].resize((size_t)C.Mo[i] / 128 * (C.Ko / 128));
+            CK(cudaMemcpy(hw[i].data(), c.Ws[i].w, hw[i].size(), cudaMemcpyDeviceToHost)); CK(cudaMemcpy(hs[i].data(), c.Ws[i].sw, hs[i].size() * 2, cudaMemcpyDeviceToHost)); }
+        const uint8_t *pw[2] = {hw[0].data(), hw[1].data()}; const uint16_t *ps[2] = {hs[0].data(), hs[1].data()};
+        size_t rdiff = 0; std::vector<uint16_t> xr(Kt);
+        for (int s = 0; s < 4096; s++) {
+            size_t tk = s < 64 ? 5 : rng() % N; int r = rng() % C.Ko;
+            for (int i = 0, off = 0; i < C.n; off += C.Mo[i], i++) for (int m = 0; m < C.Mo[i]; m++) {
+                float f = bf((*c.dY[i])[tk * C.Mo[i] + m]); uint32_t u; memcpy(&u, &f, 4); xr[off + m] = u >> 16; }
+            Big pos, neg;
+            for (int m = 0; m < Kt; m++) { int E; long long pr = f8t_term(C, pw, ps, r, m, xr[m], E); if (pr) (pr > 0 ? pos : neg).add((unsigned __int128)(pr > 0 ? pr : -pr), E); }
+            bool ng = !pos.ge(neg); if (ng) { neg.sub(pos); pos = neg; } else pos.sub(neg);
+            double v = big_round(pos, 1, 0, 24); float ref = (float)(ng ? -v : v), got = (float)b[tk * c.out + r];
+            rdiff += memcmp(&ref, &got, 4) != 0;
+        }
+        bad += diff + rdiff;
+        printf("dgtest L%d e%d %s: %zu tokens x %d outputs, K %d: hi|lo vs FP8 tiles %zu differ, superaccumulator 4096: %zu differ; "
+               "%.1f -> %.1f ms (%.1fx); fixup %lld -> %lld outputs, host rows %lld -> %lld\n", L, e, c.name, N, c.out, Kt, diff, rdiff,
+               ta * 1e3, tb * 1e3, ta / tb, fa, fb, ha, hb);
+        prof_dump(c.name);
+    }
+    printf("dgtest: %s\n", bad ? "FAILED" : "ok");
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "--selftest")) { DIR = argv[2]; MOE = jais_init(); return back_selftest(); }
+    if (argc > 2 && !strcmp(argv[1], "--dgtest")) { DIR = argv[2]; MOE = jais_init();
+        return dg_test(argc > 3 ? atoi(argv[3]) : 3, argc > 4 ? atoi(argv[4]) : 0, argc > 5 ? atol(argv[5]) : 341); }
     if (argc < 3) { fprintf(stderr, "usage: out_jlora <model dir> <token ids> [tokens N] [rank r] [alpha] [dB dir] | --selftest <model dir>\n"); return 1; }
     DIR = argv[1];
     // the data: a file of token ids (one sequence), or a .u32 file of sequences cut to OZ_CUT (1024) tokens: OZ_BATCH of them

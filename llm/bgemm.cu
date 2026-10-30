@@ -253,6 +253,8 @@ __global__ void __launch_bounds__(256) bf16_gemm2(const int8_t *__restrict__ wd,
     }
 }
 
+#include "tgemm.cu"
+
 // The outputs bf16_gemm could not certify (NaN), recomputed exactly on the CUDA cores, one warp each: the GEMV's sum (every
 // product exact, a 128-bit window at the row's and token's top bits, truncated terms counted). The list comes from
 // nan_list. Together the two kernels give every output correctly rounded.
@@ -291,6 +293,7 @@ constexpr int DW24 = 5, DX24 = 6;   // p = 24 (FP32 logits): 3 + 4 left most out
 // the BF16 product of N tokens (digit planes of the weights for the p in use already in wd): Y [N][M], NaN = uncertified.
 // dw: the weights' digits -- wdig(p), or 4 at p = 24 for weights that are FP8 times a block scale (hi or lo of one: on the
 // grid of 2^-9 times the scale, at most 26 bits, so 4 digits hold them exactly)
+static bool OLDK = getenv("OZ_OLDK");
 static void bf16_gemm_p(int p, int dw, const int8_t *wd, const int16_t *wl, const uint8_t *wn, const int8_t *xd, const int16_t *xl,
                         const uint8_t *xn, float *Y, int M, int N, int K, int *nbad) {
     static const bool k16 = getenv("OZ_K16");   // OZ_K16=1: the first kernel (m16n8k16, an accumulator per digit pair)
@@ -298,6 +301,12 @@ static void bf16_gemm_p(int p, int dw, const int8_t *wd, const int16_t *wl, cons
         if (p == 24 && dw == 4) bf16_gemm<4, DX24><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
         else if (p == 24) bf16_gemm<DW24, DX24><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
         else bf16_gemm<DWN, DXN><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
+        return; }
+    // OLDK (OZ_OLDK=1): bf16_gemm2, the kernel before tgemm.cu (the same outputs)
+    if (!OLDK) {
+        if (p == 24 && dw == 4) tgemm_go<4, DX24, false, 32, 4>(wd, nullptr, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
+        else if (p == 24) tgemm_go<DW24, DX24, false, 32, 4>(wd, nullptr, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
+        else tgemm_go<DWN, DXN, false, 64, 3>(wd, nullptr, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
         return; }
     auto go = [&](auto k1, auto k2) { if (N >= 64) k2<<<dim3((M + 127) / 128, (N + 15) / 16), 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
                                         else k1<<<dim3((M + 127) / 128, N / 8), 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad); };
@@ -368,6 +377,14 @@ int main(int argc, char **argv) {
     for (int r = 0; r < 5; r++) run(8);
     cudaEventRecord(e1); CK(cudaEventSynchronize(e1)); float ms; cudaEventElapsedTime(&ms, e0, e1); ms /= 5;
     printf("batched: %.2f ms for %d tokens (activation preparation + product + fixup) = %.2f TOPS\n", ms, N, 2.0 * M * K * N / (ms * 1e9));
+    if (!fp8) for (int p : {8, 24}) {   // the product alone, bf16_gemm2 against tgemm, the minimum of 5 (a training may share the GPU)
+        run(p); CK(cudaDeviceSynchronize()); float best[2] = {1e30f, 1e30f};
+        for (int r = 0; r < 10; r++) { OLDK = r & 1; cudaEventRecord(e0); bf16_gemm_p(p, wdig(p), wd, wl, wn, xd, xl, xn, Y, M, N, K, nb);
+            cudaEventRecord(e1); CK(cudaEventSynchronize(e1)); float t; cudaEventElapsedTime(&t, e0, e1); best[r & 1] = std::min(best[r & 1], t); }
+        OLDK = false; double ops = 2.0 * M * K * N * wdig(p) * xdig(p);
+        printf("p %d product alone: bf16_gemm2 %.2f ms (%.1f TOPS of digit products), tgemm %.2f ms (%.1f TOPS): %.2fx\n", p, best[1], ops / (best[1] * 1e9),
+               best[0], ops / (best[0] * 1e9), best[1] / best[0]);
+    }
     return 0;
 }
 #endif

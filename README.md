@@ -980,7 +980,23 @@ rrumbullakohet saktë, prandaj hapi s'varet nga grupimi i rreshtave, fijet apo n
 | + `bf16_gemm2` | 254.5 s | 129.0 s | 65.4 s |
 | + the forward's attention on the GPU (`OZ_GATT=1`) | **247.3 s** | 120.4 s | 65.6 s |
 
-Where it stands / Ku është: the product kernel still runs at ~6 % of the tensor cores (an MoE layer's two dgrad products: about
-92 ms per expert against a 5.4 ms floor); its per-block int128 epilogue costs as much as the MMAs themselves -- the next step
-is a tiled kernel (shared memory, cp.async) with a cheaper epilogue. The attention backward stays in FP64 on the host (the GPU
-`exp` is not glibc's, and the token-by-token model is the reference).
+30-10-2026, evening: **`llm/tgemm.cu`, the tiled product** -- a block of 256 threads computes 64 rows x 32 tokens (8 warps of
+16 x 16), K through 3-4 cp.async stages into shared memory (rows of BK + 16 bytes: ldmatrix without bank conflicts),
+m16n8k32 MMAs summed per digit shift, and after each block of 128 an int64 epilogue (a 63-bit window at the token's largest
+block, the headroom from the number of blocks) instead of the 125-bit one. Two uses:
+- *The experts' dgrad without hi|lo.* dX = dY W for an FP8 expert now runs on the weight's own E4M3 digits, transposed (three,
+  exact) with the 128 x 128 block scale applied per block, and dY in K once: 3 x 6 = 18 digit products a term where
+  [dY | dY] [W_hi ; W_lo] took 2 x 4 x 6 = 48. `out_jlora --dgtest <model> 3 0 341` (one expert of layer 3, 341 tokens as in
+  the training): **0 outputs differ** between the two paths, 4096 of each checked against the 2560-bit superaccumulator agree;
+  down 13.6 -> 4.2 ms, gate+up 68.1 -> 12.5 ms: **81.7 -> 16.7 ms an expert** (both dgrads, host work included).
+- *Every BF16 product* (`bf16_gemm_p`: the forward's p = 8, the backward's p = 24): the same windows' outputs, NaN for NaN as
+  `bf16_gemm2` (17 734 of 7.3 M left to the fixup by both on the shared expert's gate), the product alone on 4096 tokens
+  (`out_bgemm`, a training sharing the GPU): p 8 **26.1 -> 15.7 ms** (41 -> 69 TOPS of digit products), p 24 **48.7 -> 29.2 ms**
+  (56 -> 93 TOPS).
+
+The 4-layer tests keep their digests: 63e9904ca4c9d00f (128 tokens x 2) and 1dd8193b18cc200b (8 x 1024 + 2 held out), with
+`OZ_OLDK=1 OZ_HILO=1` (the kernels before) and without.
+
+Where it stands / Ku është: the attention backward stays in FP64 on the host (the GPU `exp` is not glibc's, and the
+token-by-token model is the reference) and is now the largest share of the step; the experts' forward still uses
+`fp8b_gemm` (no shared memory, the 125-bit epilogue).
