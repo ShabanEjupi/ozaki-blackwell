@@ -14,5 +14,5 @@ touch /opt/ozaki/chain.busy; pw 'Disable-ScheduledTask -TaskName model-lokal | O
 log "start ($(git -C $B rev-parse --short HEAD 2>/dev/null || cat $B/.version 2>/dev/null))"
 bash $B/llm/jlora_steps.sh
 rm -f /opt/ozaki/chain.busy
-pw 'Enable-ScheduledTask -TaskName model-lokal | Out-Null; Start-ScheduledTask -TaskName model-lokal'
+# model-lokal stays off at the end: Shabani, 29-10-2026 -- paused without limit while the training runs (no Enable here)
 log "done"

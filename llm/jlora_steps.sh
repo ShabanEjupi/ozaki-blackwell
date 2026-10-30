@@ -10,6 +10,7 @@ J=/opt/ozaki/jais; D=/opt/ozaki/jlora/step; C=/opt/ozaki/jlora/corpus; T=/opt/oz
 PS=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
 ac() { [ "$($PS -NoProfile -Command '(Get-CimInstance Win32_Battery).BatteryStatus' 2>/dev/null | tr -dc 0-9)" != 1 ]; }   # never on battery
 log() { echo "$(date '+%F %T') $*" >> $D/run.log; }
+if [ ! -s $T/ckpt.bin ]; then   # 30-10: with a checkpoint the training has begun -- straight to it (a restart with a new binary)
 ./out_jlora --selftest $J >> $D/run.log 2>&1; log "selftest rc=$?"
 until ac; do sleep 60; done
 mkdir -p $D/dB_40; log "step 1 OZ_NB=40 threads=7"
@@ -21,6 +22,7 @@ for s in 11 12; do for e in 0.004 -0.004; do
     until ac; do sleep 60; done
     log "fd seed $s eps $e: $(OZ_AHEAD=3 OZ_DSEED=$s OZ_EPS=$e ./out_jlora $J $D/gzk2512.ids 1024 16 32 2>/dev/null | grep -o 'loss [0-9.]*')"
 done; done
+fi
 [ -s $C/public-2910.u32 ] || python3 -I $(pwd)/llm/korpusi_prep.py tok $J $C/public-2910.jsonl $C/public-2910 1024 >> $D/run.log 2>&1
 log "public corpus: $(head -c 300 $C/public-2910.json 2>/dev/null | tr '\n' ' ')"
 data=$C/public-2910.u32; [ -s $data ] || data=$C/sample.u32; b=8; fails=0
