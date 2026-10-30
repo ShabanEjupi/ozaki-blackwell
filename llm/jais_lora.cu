@@ -133,7 +133,7 @@ static void gate_back(const float *lg, const int *ex, const double *dw, double *
     for (int k = 0; k < J_TOPK; k++) dl[ex[k]] = J_RSF * (dw[k] / S - q / (S * S)) * s[k] * (1 - s[k]);
 }
 // causal attention of one sequence (q, k after RoPE): dq, dk, dv from dO; P and dS are kept per head, query, key <= query
-static void attend_back(const std::vector<float> &q, const std::vector<float> &k, const std::vector<float> &v, const std::vector<double> &dO, size_t N,
+static void attend_back_ref(const std::vector<float> &q, const std::vector<float> &k, const std::vector<float> &v, const std::vector<double> &dO, size_t N,
                         std::vector<double> &dq, std::vector<double> &dk, std::vector<double> &dv) {
     const int HD = D_HD, G = D_Q / D_KV; const double sc = 1.0 / sqrt((double)HD);
     const size_t QD = (size_t)D_Q * HD, KVD = (size_t)D_KV * HD, TRI = N * (N + 1) / 2;
@@ -159,6 +159,47 @@ static void attend_back(const std::vector<float> &q, const std::vector<float> &k
             double p = P[hq * TRI + t * (t + 1) / 2 + u], ds = dS[hq * TRI + t * (t + 1) / 2 + u];
             const float *qt = q.data() + t * QD + hq * HD; const double *dot = dO.data() + t * QD + hq * HD;
             for (int d = 0; d < HD; d++) { dku[d] += ds * sc * qt[d]; dvu[d] += p * dot[d]; } }
+    }
+}
+// attend_back_ref bit for bit, faster (30-10-2026: the attention half took 775-872 s of a training step): the dot products over
+// d four keys at a time (four independent sums, each still in d order); part 2 in blocks of 16 keys, so a row of P and dS is
+// read in one piece instead of one cache line per query (each dk, dv element still sums over hq, then t, as before); P and dS
+// allocated once instead of zeroed per sequence. The selftest compares the two.
+static void attend_back(const std::vector<float> &q, const std::vector<float> &k, const std::vector<float> &v, const std::vector<double> &dO, size_t N,
+                        std::vector<double> &dq, std::vector<double> &dk, std::vector<double> &dv) {
+    const int HD = D_HD, G = D_Q / D_KV; const double sc = 1.0 / sqrt((double)HD);
+    const size_t QD = (size_t)D_Q * HD, KVD = (size_t)D_KV * HD, TRI = N * (N + 1) / 2, UB = 16;
+    dq.assign(N * QD, 0.0); dk.assign(N * KVD, 0.0); dv.assign(N * KVD, 0.0);
+    static std::vector<double> P, dS; if (P.size() < (size_t)D_Q * TRI) { P.resize((size_t)D_Q * TRI); dS.resize((size_t)D_Q * TRI); }
+    #pragma omp parallel for collapse(2) schedule(dynamic)
+    for (int hq = 0; hq < D_Q; hq++) for (size_t t = 0; t < N; t++) {
+        int g = hq / G; size_t T = t + 1; double *p = P.data() + hq * TRI + t * (t + 1) / 2, *ds = dS.data() + hq * TRI + t * (t + 1) / 2;
+        const float *qt = q.data() + t * QD + hq * HD, *kg = k.data() + g * HD, *vg = v.data() + g * HD; const double *dot = dO.data() + t * QD + hq * HD;
+        auto dot4 = [&](auto x, const float *base, double *out) {   // out[u] = sum_d x[d] base[u KVD + d], each sum in d order
+            size_t u = 0;
+            for (; u + 4 <= T; u += 4) { const float *r0 = base + u * KVD, *r1 = r0 + KVD, *r2 = r1 + KVD, *r3 = r2 + KVD; double a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+                for (int d = 0; d < HD; d++) { double xd = x[d]; a0 += xd * r0[d]; a1 += xd * r1[d]; a2 += xd * r2[d]; a3 += xd * r3[d]; }
+                out[u] = a0; out[u + 1] = a1; out[u + 2] = a2; out[u + 3] = a3; }
+            for (; u < T; u++) { const float *r = base + u * KVD; double a = 0; for (int d = 0; d < HD; d++) a += (double)x[d] * r[d]; out[u] = a; }
+        };
+        dot4(qt, kg, p); double mx = -1e300;
+        for (size_t u = 0; u < T; u++) { p[u] = p[u] * sc; mx = std::max(mx, p[u]); }
+        double den = 0; for (size_t u = 0; u < T; u++) { p[u] = exp(p[u] - mx); den += p[u]; }
+        for (size_t u = 0; u < T; u++) p[u] /= den;
+        dot4(dot, vg, ds); double sdp = 0; for (size_t u = 0; u < T; u++) sdp += p[u] * ds[u];
+        double *dqt = dq.data() + t * QD + hq * HD;
+        for (size_t u = 0; u < T; u++) { ds[u] = p[u] * (ds[u] - sdp); const float *ku = kg + u * KVD; for (int d = 0; d < HD; d++) dqt[d] += ds[u] * sc * ku[d]; }
+    }
+    #pragma omp parallel for collapse(2) schedule(dynamic)
+    for (int g = 0; g < D_KV; g++) for (size_t u0 = 0; u0 < N; u0 += UB) {
+        size_t u1 = std::min(N, u0 + UB);
+        for (int hq = g * G; hq < (g + 1) * G; hq++) for (size_t t = u0; t < N; t++) {
+            const double *pr = P.data() + hq * TRI + t * (t + 1) / 2, *dsr = dS.data() + hq * TRI + t * (t + 1) / 2;
+            const float *qt = q.data() + t * QD + hq * HD; const double *dot = dO.data() + t * QD + hq * HD;
+            for (size_t u = u0; u < std::min(u1, t + 1); u++) {
+                double p = pr[u], ds = dsr[u]; double *dku = dk.data() + u * KVD + g * HD, *dvu = dv.data() + u * KVD + g * HD;
+                for (int d = 0; d < HD; d++) { dku[d] += ds * sc * qt[d]; dvu[d] += p * dot[d]; } }
+        }
     }
 }
 
@@ -295,8 +336,16 @@ static void back_layer(int L, const std::vector<float> &h, size_t N, std::vector
     auto v = lora_proj(L, 1, Wv, x1);
     pmark(ta, "att qkv");
     std::vector<float> o(N * QD);
-    #pragma omp parallel for schedule(dynamic)
-    for (size_t r = 0; r < N; r++) attend_p(q.data() + r * QD, k.data() + r / SEQ * SEQ * KVD, v.data() + r / SEQ * SEQ * KVD, r % SEQ + 1, D_Q, D_KV, D_HD, o.data() + r * QD, false);
+    if (GATT == 1) {   // the forward's GPU attention (gatt, bit for bit attend_p), each sequence's own K/V as its cache
+        std::vector<BSeq> S(N / SEQ); std::vector<std::pair<int, size_t>> rows(N);
+        for (size_t j = 0; j < S.size(); j++) { S[j].kc.resize(L + 1); S[j].vc.resize(L + 1);
+            S[j].kc[L].assign(k.begin() + j * SEQ * KVD, k.begin() + (j + 1) * SEQ * KVD); S[j].vc[L].assign(v.begin() + j * SEQ * KVD, v.begin() + (j + 1) * SEQ * KVD); }
+        for (size_t r = 0; r < N; r++) rows[r] = {(int)(r / SEQ), r % SEQ};
+        gatt(S, rows, L, q, o);
+    } else {
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t r = 0; r < N; r++) attend_p(q.data() + r * QD, k.data() + r / SEQ * SEQ * KVD, v.data() + r / SEQ * SEQ * KVD, r % SEQ + 1, D_Q, D_KV, D_HD, o.data() + r * QD, false);
+    }
     pmark(ta, "att recompute");
     std::vector<float> hp = h; add_rows(hp, bmm(Wo, o));
     auto x2 = norm_rows(hp, N2[L]);
@@ -453,8 +502,18 @@ static int back_selftest() {
         probe("routing", {&lg}, {&dl}, [&]() { double S = 0, s = 0; for (int k = 0; k < J_TOPK; k++) S += 1.0 / (1.0 + exp(-(double)lg[ex[k]]));
             for (int k = 0; k < J_TOPK; k++) s += J_RSF / (1.0 + exp(-(double)lg[ex[k]])) / S * R[k]; return s; });
     }
-    printf("selftest: worst %.2e %s\n", all, all < 1e-6 ? "ok" : "FAILED");
-    return all < 1e-6 ? 0 : 1;
+    bool same = true;
+    std::vector<size_t> sizes{6, 45, 131}; if (getenv("OZ_ATTBENCH")) sizes.push_back(1024);   // OZ_ATTBENCH: a full sequence, timed
+    for (size_t n2 : sizes) {   // the fast attend_back against attend_back_ref, bit for bit
+        std::vector<float> q(n2 * QD), k(n2 * KVD), v(n2 * KVD); std::vector<double> R(n2 * QD), a[3], b[3];
+        grid(q); grid(k); grid(v); for (auto &x : R) x = rnd(sd);
+        auto t0 = std::chrono::steady_clock::now(); attend_back(q, k, v, R, n2, a[0], a[1], a[2]); double tf = secs(t0);
+        t0 = std::chrono::steady_clock::now(); attend_back_ref(q, k, v, R, n2, b[0], b[1], b[2]); double tr = secs(t0);
+        bool s = true; for (int i = 0; i < 3; i++) s = s && !memcmp(a[i].data(), b[i].data(), a[i].size() * 8);
+        printf("selftest attention, fast against reference, %zu tokens: %s (%.3f s, reference %.3f s)\n", n2, s ? "bit for bit" : "DIFFER", tf, tr); same = same && s;
+    }
+    printf("selftest: worst %.2e %s\n", all, all < 1e-6 && same ? "ok" : "FAILED");
+    return all < 1e-6 && same ? 0 : 1;
 }
 
 int main(int argc, char **argv) {

@@ -61,12 +61,15 @@ static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y) {
     std::vector<uint16_t> xb;
     for (size_t n0 = 0; n0 < N; n0 += G_NB) {
         size_t n = std::min(G_NB, N - n0), np = (n + 7) / 8 * 8; const float *x = X + n0 * K;
+        size_t left;   // NaNs still in Y after the GPU: the host GEMV's rows (none, as a rule: then no scan)
         if (fp8) {
             CK(cudaMemcpy(g_x, x, n * K * 4, cudaMemcpyHostToDevice));
             if (np > n) CK(cudaMemset(g_x + n * K, 0, (np - n) * K * 4));
             quant_fp8g<<<1024, 256>>>(g_x, g_xq, g_xs, np * KB);
             fp8_digits<<<1024, 256>>>(g_xq, g_xd, np * K); ph("f8 x", "", "");
+            CK(cudaMemset(g_nb, 0, 4));
             fp8b_gemm<<<dim3(M / 128, np / 8), 256>>>(g_wd, (const uint16_t *)W.sw, g_xd, g_xs, g_Y, M, np, K, p, g_nb); ph("f8 gemm", "", "");
+            int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); left = nb;   // fp8b_gemm counts every NaN it writes
         } else {
             xb.assign(np * K, 0);
             #pragma omp parallel for schedule(static)
@@ -79,18 +82,20 @@ static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y) {
             bf16_fixup<<<1024, 256>>>((const uint16_t *)W.w, g_xb, g_list, g_lcnt, G_CAP, g_Y, M, K, p, g_nb);
             unsigned lc; CK(cudaMemcpy(&lc, g_lcnt, 4, cudaMemcpyDeviceToHost)); (p == 24 ? st_fix24 : st_fix) += lc;
             int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_fixopen += nb;   // the fixup left them NaN: the GEMV below
+            left = (lc > G_CAP ? lc - G_CAP : 0) + nb;   // beyond the fixup's list, and what it left open
             ph("", "b8 fixup", "b24 fixup");
         }
         float *y = Y + n0 * M; CK(cudaMemcpy(y, g_Y, n * M * 4, cudaMemcpyDeviceToHost)); ph("f8 y-d2h", "b8 y-d2h", "b24 y-d2h");
         std::vector<char> open(n);   // rows with a NaN left, found in parallel (one thread scanned n x M floats per product)
-        #pragma omp parallel for schedule(static)
-        for (size_t r = 0; r < n; r++) { const float *yr = y + r * M; for (int m = 0; m < M && !open[r]; m++) open[r] = yr[m] != yr[m]; }
-        for (size_t r = 0; r < n; r++) {   // what is still NaN: the GEMV (beyond the fixup's list; FP8 outputs it could not certify)
+        if (left) {
+            #pragma omp parallel for schedule(static)
+            for (size_t r = 0; r < n; r++) { const float *yr = y + r * M; for (int m = 0; m < M && !open[r]; m++) open[r] = yr[m] != yr[m]; }
+        }
+        for (size_t r = 0; left && r < n; r++) {   // what is still NaN: the GEMV (beyond the fixup's list; FP8 outputs it could not certify)
             float *yr = y + r * M; if (!open[r]) continue; st_host++;
             std::vector<float> xv(x + r * K, x + (r + 1) * K); auto g = gemv(W, fp8 ? act_fp8g(xv) : act_plain(xv), p, 0);
             for (int m = 0; m < M; m++) if (yr[m] != yr[m]) yr[m] = g[m];
         }
-        if (fp8) CK(cudaMemset(g_nb, 0, 4));
         ph("f8 gemv", "b8 gemv", "b24 gemv");
     }
     st_rows += N; (p == 24 ? st_outs24 : st_outs) += (long long)N * M;

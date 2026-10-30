@@ -941,3 +941,46 @@ Motori me akumulim FP32 ndryshon 42–49 % të logit-ëve të ruterit (projeksio
 vendbanime, motori «2,994» — asnjëri s'ndodhet te 4,6T tokenat e trajnimit: të dy të shpikur, ndryshe. 123456789 × 987654321 = 121932631112635269 — saktë në të tri rrugët. Te K2-Think-V2 (72,6 B, nga disku, 0 të pacertifikuara) të dy motorët bien dakord mes tyre dhe ndahen nga rruga e saktë: shqip pas tokenit të 8-të (e sakta «qyteti më i madh në vend», motorët «qytet i vendosur në pjesën qendrore të vendit»), anglisht pas të 27-tit — të dyja të vërteta, rrumbullakimi zgjedh cilën. Për qasje të plotë te të
 dhënat: OLMo 2 32B (të gjitha të dhënat e trajnimit të kërkueshme), K2-Think-V2 (më i forti plotësisht i hapur); asnjë model
 plotësisht i hapur s'e kalon Ultra-n sot.
+
+## LoRA training of Jais-3-375B from disk, every product exact / Trajnim LoRA i Jais-3-375B nga disku, çdo produkt i saktë (29–30-10-2026, `llm/jais_lora.cu`, `llm/train.sh`)
+
+**EN** — Rank-16 LoRA on q_proj and v_proj of all 61 layers (58 MoE, 192 FP8 experts) of Jais-3-375B-A23B-FP8, the 375 GB
+checkpoint streamed from an NVMe disk once per forward and once per backward, on the laptop's 12 GB GPU. Every linear map of
+the forward and of the backward is one product on the INT8 tensor cores with every output correctly rounded; the gradient
+through an FP8 expert is exact (an E4M3 weight times its block scale splits exactly into two BF16 numbers), never quantized.
+Because every output is the unique correctly rounded value, a step does not depend on how rows are batched, cut into products
+or spread over threads, and a resumed run equals an uninterrupted one byte for byte.
+
+**SQ** — LoRA me rang 16 mbi q_proj dhe v_proj të 61 shtresave të Jais-3-375B-A23B-FP8, pikat e kontrollit 375 GB lexohen nga
+disku NVMe një herë për forward dhe një për backward, mbi GPU-në 12 GB të laptopit; çdo produkt i forward-it dhe i backward-it
+rrumbullakohet saktë, prandaj hapi s'varet nga grupimi i rreshtave, fijet apo ndërprerja e trajnimit.
+
+| measured / matur | value / vlera |
+|---|---|
+| reproducibility: step 1 of the 61-layer model, 4096 vs 40 rows per product, 24 vs 7 threads | 122 dB files byte-identical; dB, dA, g₀ digests identical |
+| resume: 2 steps at once vs 1 + 1 from the checkpoint (4 layers) | checkpoints byte-identical |
+| first-order check of the gradient: loss change of each update vs its prediction (1024 tokens) | −0.04588 / −0.02731 vs −0.04135 / −0.03288 |
+| training on the public Kosovo corpus (187 437 sequences, 191.9 M tokens), 8 × 1024 tokens a step, 2 sequences held out | held-out loss 1.51019 → 1.50738 → 1.50570 → 1.50056 (steps 1–4) |
+| outputs used uncertified | 2–7 a step before 30-10 → **0** (below) |
+
+30-10-2026: three changes, each bit-exact on the 4-layer test (dB digest unchanged), measured on 8 × 1024 tokens + 2 held out:
+- *Every output exact.* The GEMV and the CUDA-core fixup anchored their 125-bit window at max |w| + max |x| of a row; where
+  large weights meet small gradients every real product fell below it. The window now starts at the largest real product,
+  and an output it still leaves open is finished on the host in a 2560-bit superaccumulator (`exact_row`).
+- *Digit planes 40× faster.* `bf16_digits` wrote every byte from its own thread to its own sector: 27.5 of the 28 s of an MoE
+  layer's backward. One warp per block of 128 with 4-byte stores: 0.7 s.
+- *`bf16_gemm2`*: mma m16n8k32, the digit products summed per shift, two token tiles per weight load; 4 digits (not 5) for the
+  transposed FP8 experts, exact at 26 bits; the forward's attention (and its recomputation in the backward) on the GPU FP64
+  units, bit for bit the host's.
+
+| 4 layers, 10 240 rows | step | forward | MLP/MoE backward |
+|---|---|---|---|
+| before (6a02580) | 321.1 s | 158.9 s | 96.3 s |
+| digits + exactness | 275.7 s | 145.2 s | 65.8 s |
+| + `bf16_gemm2` | 254.5 s | 129.0 s | 65.4 s |
+| + the forward's attention on the GPU (`OZ_GATT=1`) | **247.3 s** | 120.4 s | 65.6 s |
+
+Where it stands / Ku është: the product kernel still runs at ~6 % of the tensor cores (an MoE layer's two dgrad products: about
+92 ms per expert against a 5.4 ms floor); its per-block int128 epilogue costs as much as the MMAs themselves -- the next step
+is a tiled kernel (shared memory, cp.async) with a cheaper epilogue. The attention backward stays in FP64 on the host (the GPU
+`exp` is not glibc's, and the token-by-token model is the reference).
