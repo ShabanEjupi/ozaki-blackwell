@@ -262,6 +262,112 @@ static void attend_back(const std::vector<float> &q, const std::vector<float> &k
     }
 }
 
+// ---- the attention backward on the GPU FP64 units, bit for bit attend_back (OZ_GBACK=1; on by default with OZ_GATT=1) ----
+// The long sums go to the GPU in the host's order and operations (__dmul_rn, __dadd_rn: the host build has no FMA): the
+// scores q.k (d order) times sc, dp = dO.v (d order), sdp = sum_u p dp (u order) and ds = p (dp - sdp), dq = sum_u (ds sc) k
+// (u order), dk = sum (ds sc) q and dv = sum p dO (over hq, then t). The softmax between them (max, exp, the sum, the
+// division) stays on the host: the same libm exp on the same doubles. P and dS: per head, query, key <= query (TRI).
+// S[hq][t][u <= t] = sum_d x[t][hq][d] y[u][g][d] in d order (times sc for the scores): tiles of 32 queries x 32 keys, their
+// rows in shared memory 64 d at a time (rows of 65: no bank conflicts), each thread 4 queries x 1 key; every sum is still one
+// thread's, in the host's order (a thread per key reading its row from global memory took 3x as long)
+template <typename XT, bool SCALE>
+__global__ void __launch_bounds__(256) ab_tri(const XT *x, const float *y, int N, int nq, int nkv, int hd, double sc, double *S) {
+    __shared__ double xs[32][65]; __shared__ float ys[32][65];
+    int tile = blockIdx.x, hq = blockIdx.y, g = hq / (nq / nkv), bt = (int)((sqrt(8.0 * tile + 1) - 1) / 2);
+    while ((bt + 1) * (bt + 2) / 2 <= tile) bt++;
+    while (bt * (bt + 1) / 2 > tile) bt--;
+    int t0 = bt * 32, u0 = (tile - bt * (bt + 1) / 2) * 32, tx = threadIdx.x & 31, ty = threadIdx.x >> 5; size_t TRI = (size_t)N * (N + 1) / 2;
+    double a[4] = {0, 0, 0, 0};
+    for (int d0 = 0; d0 < hd; d0 += 64) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < 32 * 64; i += 256) { int r = i / 64, c = i % 64, t = t0 + r, u = u0 + r;
+            xs[r][c] = t < N ? (double)x[((size_t)t * nq + hq) * hd + d0 + c] : 0.0; ys[r][c] = u < N ? y[((size_t)u * nkv + g) * hd + d0 + c] : 0.f; }
+        __syncthreads();
+        for (int c = 0; c < 64; c++) { double yv = ys[tx][c];
+#pragma unroll
+            for (int i = 0; i < 4; i++) a[i] = __dadd_rn(a[i], __dmul_rn(xs[ty * 4 + i][c], yv)); }
+    }
+    int u = u0 + tx;
+#pragma unroll
+    for (int i = 0; i < 4; i++) { int t = t0 + ty * 4 + i; if (t < N && u <= t) S[hq * TRI + (size_t)t * (t + 1) / 2 + u] = SCALE ? __dmul_rn(a[i], sc) : a[i]; }
+}
+__global__ void ab_ds(const double *P, double *DS, int N, double sc) {   // DS: dp in, ds sc out (the host forms ds sc at each use: the same double)
+    __shared__ double sdp;
+    int t = blockIdx.x, hq = blockIdx.y; size_t o = hq * ((size_t)N * (N + 1) / 2) + (size_t)t * (t + 1) / 2;
+    const double *p = P + o; double *ds = DS + o;
+    if (!threadIdx.x) { double s = 0; for (int u = 0; u <= t; u++) s = __dadd_rn(s, __dmul_rn(p[u], ds[u])); sdp = s; }
+    __syncthreads();
+    for (int u = threadIdx.x; u <= t; u += blockDim.x) ds[u] = __dmul_rn(__dmul_rn(p[u], __dsub_rn(ds[u], sdp)), sc);
+}
+__global__ void ab_dq(const double *DS, const float *k, int N, int nq, int nkv, int hd, double *dq) {   // a thread per d
+    int t = blockIdx.x, hq = blockIdx.y, g = hq / (nq / nkv), d = threadIdx.x;
+    const double *ds = DS + hq * ((size_t)N * (N + 1) / 2) + (size_t)t * (t + 1) / 2; double a = 0;
+    for (int u = 0; u <= t; u++) a = __dadd_rn(a, __dmul_rn(ds[u], (double)k[((size_t)u * nkv + g) * hd + d]));
+    dq[((size_t)t * nq + hq) * hd + d] = a;
+}
+__global__ void ab_dkv(const double *P, const double *DS, const float *q, const double *dO, int N, int nq, int nkv, int hd,
+                       double *dk, double *dv) {   // a thread per d of key u
+    int u = blockIdx.x, g = blockIdx.y, d = threadIdx.x, G = nq / nkv; size_t TRI = (size_t)N * (N + 1) / 2; double ak = 0, av = 0;
+    for (int hq = g * G; hq < (g + 1) * G; hq++) for (int t = u; t < N; t++) {
+        size_t i = hq * TRI + (size_t)t * (t + 1) / 2 + u, x = ((size_t)t * nq + hq) * hd + d;
+        ak = __dadd_rn(ak, __dmul_rn(DS[i], (double)q[x])); av = __dadd_rn(av, __dmul_rn(P[i], dO[x]));
+    }
+    dk[((size_t)u * nkv + g) * hd + d] = ak; dv[((size_t)u * nkv + g) * hd + d] = av;
+}
+static bool GBACK = getenv("OZ_GBACK") ? atoi(getenv("OZ_GBACK")) != 0 : getenv("OZ_GATT") && atoi(getenv("OZ_GATT")) == 1;
+static double t_ab_gpu, t_ab_host;   // the GPU's share and the host softmax's, for OZ_PROF
+static void attend_back_gpu(const std::vector<float> &q, const std::vector<float> &k, const std::vector<float> &v, const std::vector<double> &dO, size_t N,
+                            std::vector<double> &dq, std::vector<double> &dk, std::vector<double> &dv) {
+    const int HD = D_HD; const double sc = 1.0 / sqrt((double)HD);
+    const size_t QD = (size_t)D_Q * HD, KVD = (size_t)D_KV * HD, TRI = N * (N + 1) / 2, PS = (size_t)D_Q * TRI;
+    if (HD % 64 || HD > 1024) { attend_back(q, k, v, dO, N, dq, dk, dv); return; }   // ab_tri takes d 64 at a time, ab_dq a thread per d
+    static float *gq, *gk, *gv; static double *gO, *gQ, *gK, *gV, *gP, *gS, *hP; static size_t capP, capN;
+    if (PS > capP || N > capN) {
+        if (capP) { cudaFree(gq); cudaFree(gk); cudaFree(gv); cudaFree(gO); cudaFree(gQ); cudaFree(gK); cudaFree(gV); cudaFree(gP); cudaFree(gS); cudaFreeHost(hP); }
+        capP = PS; capN = N;
+        CK(cudaMalloc(&gq, N * QD * 4)); CK(cudaMalloc(&gk, N * KVD * 4)); CK(cudaMalloc(&gv, N * KVD * 4)); CK(cudaMalloc(&gO, N * QD * 8));
+        CK(cudaMalloc(&gQ, N * QD * 8)); CK(cudaMalloc(&gK, N * KVD * 8)); CK(cudaMalloc(&gV, N * KVD * 8));
+        CK(cudaMalloc(&gP, PS * 8)); CK(cudaMalloc(&gS, PS * 8)); CK(cudaMallocHost(&hP, PS * 8));
+    }
+    static const bool ABP = getenv("OZ_ABPROF"); auto tl = std::chrono::steady_clock::now(); std::string ph;   // OZ_ABPROF=1: each phase timed
+    auto mark = [&](const char *w) { if (!ABP) return; CK(cudaDeviceSynchronize()); auto n = std::chrono::steady_clock::now();
+        char b[48]; snprintf(b, sizeof b, " %s %.0f", w, std::chrono::duration<double>(n - tl).count() * 1e3); ph += b; tl = n; };
+    auto t0 = std::chrono::steady_clock::now();
+    mark("start");    CK(cudaMemcpy(gq, q.data(), N * QD * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(gk, k.data(), N * KVD * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(gv, v.data(), N * KVD * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(gO, dO.data(), N * QD * 8, cudaMemcpyHostToDevice));
+    const unsigned NT = (unsigned)((N + 31) / 32), TT = NT * (NT + 1) / 2;   // the 32 x 32 tiles of the causal triangle
+    ab_tri<float, true><<<dim3(TT, D_Q), 256>>>(gq, gk, (int)N, D_Q, D_KV, HD, sc, gP);
+    mark("scores");
+    CK(cudaMemcpy(hP, gP, PS * 8, cudaMemcpyDeviceToHost));
+    mark("P-d2h");
+    ab_tri<double, false><<<dim3(TT, D_Q), 256>>>(gO, gv, (int)N, D_Q, D_KV, HD, sc, gS);   // runs while the host takes the softmax
+    mark("dp");
+    auto t1 = std::chrono::steady_clock::now();
+    #pragma omp parallel for collapse(2) schedule(dynamic, 16)
+    for (int hq = 0; hq < D_Q; hq++) for (size_t t = 0; t < N; t++) {   // attend_back's softmax on the GPU's scores
+        double *p = hP + hq * TRI + t * (t + 1) / 2, mx = -1e300, den = 0; size_t T = t + 1;
+        for (size_t u = 0; u < T; u++) mx = std::max(mx, p[u]);
+        for (size_t u = 0; u < T; u++) { p[u] = exp(p[u] - mx); den += p[u]; }
+        for (size_t u = 0; u < T; u++) p[u] /= den;
+    }
+    t_ab_host += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+    mark("softmax");
+    CK(cudaMemcpy(gP, hP, PS * 8, cudaMemcpyHostToDevice));
+    mark("P-h2d");
+    ab_ds<<<dim3((unsigned)N, D_Q), 256>>>(gP, gS, (int)N, sc);
+    mark("ds");
+    ab_dq<<<dim3((unsigned)N, D_Q), HD>>>(gS, gk, (int)N, D_Q, D_KV, HD, gQ);
+    mark("dq");
+    ab_dkv<<<dim3((unsigned)N, D_KV), HD>>>(gP, gS, gq, gO, (int)N, D_Q, D_KV, HD, gK, gV);
+    mark("dkv");
+    CK(cudaGetLastError());
+    dq.resize(N * QD); dk.resize(N * KVD); dv.resize(N * KVD);
+    CK(cudaMemcpy(dq.data(), gQ, N * QD * 8, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(dk.data(), gK, N * KVD * 8, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(dv.data(), gV, N * KVD * 8, cudaMemcpyDeviceToHost));
+    mark("d2h"); if (ABP) fprintf(stderr, "attend_back_gpu %zu tokens, ms:%s\n", N, ph.c_str());
+    t_ab_gpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
 // ---- LoRA -----------------------------------------------------------------------------------------------------------------
 static int RK = 16; static double SC = 2.0;   // rank, alpha / rank (a power of two: the scaling is exact)
 static size_t SEQ;   // tokens per sequence: row r is position r % SEQ of sequence r / SEQ
@@ -428,7 +534,7 @@ static void back_layer(int L, const std::vector<float> &h, size_t N, std::vector
     dq.assign(N * QD, 0.0); dk.assign(N * KVD, 0.0); dv.assign(N * KVD, 0.0);
     for (size_t j = 0; j < N / SEQ; j++) {   // each sequence attends only to itself
         auto cut = [&](auto &a, size_t w) { return std::vector<typename std::decay_t<decltype(a)>::value_type>(a.begin() + j * SEQ * w, a.begin() + (j + 1) * SEQ * w); };
-        std::vector<double> sq, sk, sv; attend_back(cut(q, QD), cut(k, KVD), cut(v, KVD), cut(dO, QD), SEQ, sq, sk, sv);
+        std::vector<double> sq, sk, sv; (GBACK ? attend_back_gpu : attend_back)(cut(q, QD), cut(k, KVD), cut(v, KVD), cut(dO, QD), SEQ, sq, sk, sv);
         std::copy(sq.begin(), sq.end(), dq.begin() + j * SEQ * QD); std::copy(sk.begin(), sk.end(), dk.begin() + j * SEQ * KVD); std::copy(sv.begin(), sv.end(), dv.begin() + j * SEQ * KVD);
     }
     pmark(ta, "att back");
@@ -570,6 +676,9 @@ static int back_selftest() {
         t0 = std::chrono::steady_clock::now(); attend_back_ref(q, k, v, R, n2, b[0], b[1], b[2]); double tr = secs(t0);
         bool s = true; for (int i = 0; i < 3; i++) s = s && !memcmp(a[i].data(), b[i].data(), a[i].size() * 8);
         printf("selftest attention, fast against reference, %zu tokens: %s (%.3f s, reference %.3f s)\n", n2, s ? "bit for bit" : "DIFFER", tf, tr); same = same && s;
+        std::vector<double> c[3]; t0 = std::chrono::steady_clock::now(); attend_back_gpu(q, k, v, R, n2, c[0], c[1], c[2]); double tg = secs(t0);
+        bool sg = true; for (int i = 0; i < 3; i++) sg = sg && !memcmp(c[i].data(), b[i].data(), c[i].size() * 8);
+        printf("selftest attention, GPU against reference, %zu tokens: %s (%.3f s)\n", n2, sg ? "bit for bit" : "DIFFER", tg); same = same && sg;
     }
     printf("selftest: worst %.2e %s\n", all, all < 1e-6 && same ? "ok" : "FAILED");
     return all < 1e-6 && same ? 0 : 1;
