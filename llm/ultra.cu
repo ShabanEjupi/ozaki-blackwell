@@ -42,7 +42,7 @@ constexpr int H = 8192, VOC = 131072, MH = 256, MD = 64, MN = 128, NG = 8, DIN =
 enum { F_BF16, F_F32, F_E4M3, F_NVFP4, F_E4M3B = 5 };   // 4 = the logits slot of the shadow statistics
 
 // ---- the GEMV --------------------------------------------------------------------------------------------------------
-struct DevW { const void *w; const uint8_t *sw; int fmt, M, K; unsigned long long Gm; int Ge; float Gf; };
+struct DevW { const void *w; const uint8_t *sw; int fmt, M, K; unsigned long long Gm; int Ge; float Gf; int wd; };   // wd: digits for bmm, 0 = wdig(p)
 __host__ __device__ inline void wdec(const DevW &W, int row, int k, int &m, int &e) {
     size_t i = (size_t)row * W.K + k;
     if (W.fmt == F_BF16) {

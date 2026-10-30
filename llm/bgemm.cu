@@ -216,11 +216,14 @@ __global__ void bf16_fixup(const uint16_t *w, const uint16_t *xb, const unsigned
 
 constexpr int DWN = 3, DXN = 4;     // digits of a weight and of a token block (BF16), p = 8
 constexpr int DW24 = 5, DX24 = 6;   // p = 24 (FP32 logits): 3 + 4 left most outputs to the fixup
-// the BF16 product of N tokens (digit planes of the weights for the p in use already in wd): Y [N][M], NaN = uncertified
-static void bf16_gemm_p(int p, const int8_t *wd, const int16_t *wl, const uint8_t *wn, const int8_t *xd, const int16_t *xl,
+// the BF16 product of N tokens (digit planes of the weights for the p in use already in wd): Y [N][M], NaN = uncertified.
+// dw: the weights' digits -- wdig(p), or 4 at p = 24 for weights that are FP8 times a block scale (hi or lo of one: on the
+// grid of 2^-9 times the scale, at most 26 bits, so 4 digits hold them exactly)
+static void bf16_gemm_p(int p, int dw, const int8_t *wd, const int16_t *wl, const uint8_t *wn, const int8_t *xd, const int16_t *xl,
                         const uint8_t *xn, float *Y, int M, int N, int K, int *nbad) {
     dim3 g((M + 127) / 128, N / 8);
-    if (p == 24) bf16_gemm<DW24, DX24><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
+    if (p == 24 && dw == 4) bf16_gemm<4, DX24><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
+    else if (p == 24) bf16_gemm<DW24, DX24><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
     else bf16_gemm<DWN, DXN><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
 }
 static int wdig(int p) { return p == 24 ? DW24 : DWN; }
@@ -256,7 +259,7 @@ int main(int argc, char **argv) {
             fp8b_gemm<<<dim3(M / 128, N / 8), 256>>>(wd, (const uint16_t *)dS, xd, xsc, Y, M, N, K, p, nb);
         } else {
             bf16_digits<<<dig_grid((size_t)N * KB), 256>>>(dxb, xd, xl, xn, N, K, xdig(p));
-            bf16_gemm_p(p, wd, wl, wn, xd, xl, xn, Y, M, N, K, nb);
+            bf16_gemm_p(p, wdig(p), wd, wl, wn, xd, xl, xn, Y, M, N, K, nb);
             CK(cudaMemset(lcnt, 0, 4)); nan_list<<<1024, 256>>>(Y, (size_t)N * M, list, lcnt, cap);
             bf16_fixup<<<1024, 256>>>((const uint16_t *)W.w, dxb, list, lcnt, cap, Y, M, K, p, nb2);
         }

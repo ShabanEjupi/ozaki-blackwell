@@ -77,7 +77,9 @@ static DevW transposed(const std::vector<DevW> &Ws, int &kpad) {
         else { tr_bf16<<<g, b>>>((const uint16_t *)W.w, (uint16_t *)dWt, W.M, W.K, kpad, off); off += W.M; }
     }
     CK(cudaGetLastError());
-    return devw(dWt, K, kpad);
+    DevW Wt = devw(dWt, K, kpad);
+    if (std::all_of(Ws.begin(), Ws.end(), [](const DevW &W) { return W.fmt == F_E4M3B; })) Wt.wd = 4;   // hi | lo of FP8 x scale: exact in 4 digits
+    return Wt;
 }
 // dX += [dY_1 | dY_2 | ...] [W_1 ; W_2 ; ...] (the forward was Y_i = X W_i^T): every output one correctly rounded FP32 of
 // the exact sum, added to the FP64 dX
