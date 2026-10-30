@@ -988,7 +988,9 @@ block, the headroom from the number of blocks) instead of the 125-bit one. Two u
   exact) with the 128 x 128 block scale applied per block, and dY in K once: 3 x 6 = 18 digit products a term where
   [dY | dY] [W_hi ; W_lo] took 2 x 4 x 6 = 48. `out_jlora --dgtest <model> 3 0 341` (one expert of layer 3, 341 tokens as in
   the training): **0 outputs differ** between the two paths, 4096 of each checked against the 2560-bit superaccumulator agree;
-  down 13.6 -> 4.2 ms, gate+up 68.1 -> 12.5 ms: **81.7 -> 16.7 ms an expert** (both dgrads, host work included).
+  down 13.6 -> 4.2 ms, gate+up 68.1 -> 8.0 ms: **81.7 -> 12.2 ms an expert** (both dgrads, host work included, the GPU shared
+  with the training). The 63-bit window leaves ~0.02 % of the outputs to the fixup (109 of 611 K and 119 of 2.1 M here) where
+  the 125-bit one left none: the same outputs, from a third of the epilogue's instructions.
 - *Every BF16 product* (`bf16_gemm_p`: the forward's p = 8, the backward's p = 24): the same windows' outputs, NaN for NaN as
   `bf16_gemm2` (17 734 of 7.3 M left to the fixup by both on the shared expert's gate), the product alone on 4096 tokens
   (`out_bgemm`, a training sharing the GPU): p 8 **26.1 -> 15.7 ms** (41 -> 69 TOPS of digit products), p 24 **48.7 -> 29.2 ms**
