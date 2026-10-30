@@ -82,15 +82,17 @@ static DevW transposed(const std::vector<DevW> &Ws, int &kpad) {
 // dX += [dY_1 | dY_2 | ...] [W_1 ; W_2 ; ...] (the forward was Y_i = X W_i^T): every output one correctly rounded FP32 of
 // the exact sum, added to the FP64 dX
 static void dgrad(const std::vector<DevW> &Ws, const std::vector<const std::vector<double> *> &dY, size_t N, std::vector<double> &dX) {
-    int kpad; DevW Wt = transposed(Ws, kpad);
+    auto tp = std::chrono::steady_clock::now();
+    int kpad; DevW Wt = transposed(Ws, kpad); pmark(tp, "dg transpose");
     std::vector<float> X(N * (size_t)kpad, 0.f), Y(N * (size_t)Wt.M);
     #pragma omp parallel for schedule(static)
     for (size_t r = 0; r < N; r++) { size_t off = 0; float *x = X.data() + r * kpad;
         for (size_t i = 0; i < Ws.size(); i++) { int M = Ws[i].M; const double *g = dY[i]->data() + r * M;
             for (int rep = 0; rep < (Ws[i].fmt == F_E4M3B ? 2 : 1); rep++, off += M) for (int m = 0; m < M; m++) x[off + m] = bf(g[m]); } }
-    bmm(Wt, X.data(), N, 24, Y.data());
+    pmark(tp, "dg x-host"); bmm(Wt, X.data(), N, 24, Y.data()); tp = std::chrono::steady_clock::now();
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < Y.size(); i++) dX[i] += Y[i];
+    pmark(tp, "dg add");
 }
 static DevW up(const std::vector<float> &m, int M, int K, void *buf = nullptr) {   // a host matrix, rounded to BF16, as a BF16 map
     if (!buf && (size_t)M * K * 2 > SM_MAX) { fprintf(stderr, "%d x %d exceeds the small buffer\n", M, K); exit(1); }
@@ -232,6 +234,7 @@ static DevW fp8w_to(const std::string &name, int M, int K, int i) {
 }
 static double secs(std::chrono::steady_clock::time_point t) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(); }
 static void moe_back(const std::string &P, int L, const std::vector<float> &x2, const std::vector<double> &g, size_t N, std::vector<double> &dx2) {
+    auto tm = std::chrono::steady_clock::now();
     DevW Wr = load_w(P + "mlp.gate.weight", F_BF16, J_E, D_H, dRt); auto lg = bmm(Wr, x2);
     std::vector<std::vector<int>> ex(N); std::vector<std::vector<double>> wt(N);
     #pragma omp parallel for schedule(static)
@@ -239,23 +242,30 @@ static void moe_back(const std::string &P, int L, const std::vector<float> &x2, 
     std::vector<std::vector<std::pair<size_t, int>>> by(J_E);   // expert -> (row, slot)
     for (size_t r = 0; r < N; r++) for (int i = 0; i < J_TOPK; i++) by[ex[r][i]].push_back({r, i});
     std::vector<double> dw(N * J_TOPK, 0.0);   // dL/d(routing weight)
+    pmark(tm, "moe route");
     for (int e = 0; e < J_E; e++) {   // ascending id: each row's sum of its experts' dx in one order
         if (by[e].empty()) continue;
         std::string EP = P + "mlp.experts." + std::to_string(e) + ".";
         size_t n = by[e].size(); std::vector<float> xe(n * D_H);
         for (size_t i = 0; i < n; i++) std::copy(x2.begin() + by[e][i].first * D_H, x2.begin() + (by[e][i].first + 1) * D_H, xe.begin() + i * D_H);
+        pmark(tm, "moe gather");
         DevW Wg = fp8w_to(EP + "gate_proj", J_MFF, D_H, 0), Wu = fp8w_to(EP + "up_proj", J_MFF, D_H, 1), Wd = fp8w_to(EP + "down_proj", D_H, J_MFF, 2);
+        pmark(tm, "moe load");
         auto gg = bmm(Wg, xe), uu = bmm(Wu, xe), y = bmm(Wd, swiglu_rows(gg, uu));
+        pmark(tm, "moe forward");
         std::vector<double> dy(n * D_H);
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < n; i++) { size_t r = by[e][i].first; int s = by[e][i].second; double w = wt[r][s], d = 0;
             const double *gr = g.data() + r * D_H; const float *yi = y.data() + i * D_H;
             for (int c = 0; c < D_H; c++) { dy[i * D_H + c] = w * gr[c]; d += gr[c] * yi[c]; }
             dw[r * J_TOPK + s] = d; }
+        pmark(tm, "moe dy");
         std::vector<double> da(n * (size_t)J_MFF, 0.0), dg, du, dxe(n * D_H, 0.0);
-        dgrad({Wd}, {&dy}, n, da); swiglu_back(gg, uu, da, dg, du); dgrad({Wg, Wu}, {&dg, &du}, n, dxe);
+        dgrad({Wd}, {&dy}, n, da); pmark(tm, "moe dgrad down"); swiglu_back(gg, uu, da, dg, du); pmark(tm, "moe swiglu_back");
+        dgrad({Wg, Wu}, {&dg, &du}, n, dxe); pmark(tm, "moe dgrad gate+up");
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < n; i++) { double *d = dx2.data() + by[e][i].first * D_H; const double *s = dxe.data() + i * D_H; for (int c = 0; c < D_H; c++) d[c] += s[c]; }
+        pmark(tm, "moe add");
     }
     DevW Sg = load_w(P + "mlp.shared_experts.gate_proj.weight", F_BF16, J_MFF, D_H, dSh[0]);
     DevW Su = load_w(P + "mlp.shared_experts.up_proj.weight", F_BF16, J_MFF, D_H, dSh[1]);
@@ -267,6 +277,7 @@ static void moe_back(const std::string &P, int L, const std::vector<float> &x2, 
     #pragma omp parallel for schedule(static)
     for (size_t r = 0; r < N; r++) gate_back(lg.data() + r * J_E, ex[r].data(), dw.data() + r * J_TOPK, dl.data() + r * J_E);
     dgrad({Wr}, {&dl}, N, dx2);
+    pmark(tm, "moe shared+router"); prof_dump(P.c_str());
 }
 static void back_layer(int L, const std::vector<float> &h, size_t N, std::vector<double> &g, Lora &lo) {
     auto t0 = std::chrono::steady_clock::now();
@@ -537,8 +548,8 @@ int main(int argc, char **argv) {
         int tb; CK(cudaMemcpy(&tb, dtbad, 4, cudaMemcpyDeviceToHost));
         uint64_t dig = 1469598103934665603ULL, dia = dig;
         for (int L = 0; L < NL; L++) { dig = fnv(dig, lo[L].dBq); dig = fnv(dig, lo[L].dBv); dia = fnv(dia, lo[L].dAq); dia = fnv(dia, lo[L].dAv); }
-        printf("step %d dB digest %016llx, dA digest %016llx, g_0 digest %016llx; hi/lo splits not exact %d; uncertified %lld\n", st,
-               (unsigned long long)dig, (unsigned long long)dia, (unsigned long long)fnvd(1469598103934665603ULL, g), tb, st_bad);
+        printf("step %d dB digest %016llx, dA digest %016llx, g_0 digest %016llx; hi/lo splits not exact %d; uncertified %lld (finished on the host %lld)\n", st,
+               (unsigned long long)dig, (unsigned long long)dia, (unsigned long long)fnvd(1469598103934665603ULL, g), tb, st_bad, st_sup);
         if (st == 1) {
             std::vector<uint64_t> SEEDS{DSEED};
             if (const char *f = getenv("OZ_DSEEDS")) { SEEDS.clear(); std::stringstream ss(f); std::string t; while (std::getline(ss, t, ',')) SEEDS.push_back(strtoull(t.c_str(), 0, 0)); }

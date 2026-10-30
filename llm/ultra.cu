@@ -99,16 +99,20 @@ __device__ inline bool cert_round(__int128 acc, unsigned __int128 tail, int lsb,
     out = (float)(neg ? -lo : lo);
     return lo == hi;
 }
-// one warp per row; mode 0 exact, mode s > 0 FP32 engine with split-K s
-__global__ void gemv_k(DevW W, const int32_t *xm, const int16_t *xe, int hix, int p, int mode, float *y, int *nbad) {
+// one warp per row; mode 0 exact (NaN where the window leaves the rounding open: gemv() finishes those on the host),
+// mode s > 0 FP32 engine with split-K s
+__global__ void gemv_k(DevW W, const int32_t *xm, const int16_t *xe, int p, int mode, float *y, int *nbad) {
     int row = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x & 31, K = W.K;
     if (row >= W.M) return;
     if (mode == 0) {
-        int hiw = -100000;
-        for (int k = lane; k < K; k += 32) { int m, e; wdec(W, row, k, m, e); if (m) hiw = max(hiw, e + 32 - __clz(abs(m))); }
-        for (int o = 16; o; o >>= 1) hiw = max(hiw, __shfl_xor_sync(~0u, hiw, o));
-        if (hiw == -100000 || hix == -100000) { if (!lane) y[row] = 0.f; return; }
-        int lsb = hiw + hix + 16 - 125;   // K <= 2^15: |sum| < 2^(hiw+hix+15) = 2^124 units
+        // the window starts at the largest product, not at max |w| times max |x|: where a row's large weights meet small
+        // inputs (gradients span many binades) the old anchor left every real product below the window (30-10-2026)
+        int hip = -100000;
+        for (int k = lane; k < K; k += 32) { int m, e; wdec(W, row, k, m, e); int32_t a = xm[k];
+            if (m && a) hip = max(hip, e + xe[k] + 64 - __clz(abs(m)) - __clz(abs(a))); }
+        for (int o = 16; o; o >>= 1) hip = max(hip, __shfl_xor_sync(~0u, hip, o));
+        if (hip == -100000) { if (!lane) y[row] = 0.f; return; }
+        int lsb = hip + 16 - 125;   // K <= 2^15: |sum| < 2^(hip+15) = 2^124 units
         __int128 acc = 0; int tail = 0;
         for (int k = lane; k < K; k += 32) {
             int m, e; wdec(W, row, k, m, e); int32_t a = xm[k];
@@ -123,7 +127,7 @@ __global__ void gemv_k(DevW W, const int32_t *xm, const int16_t *xe, int hix, in
             acc += (__int128)(((unsigned __int128)hi << 64) | lo);
             tail += __shfl_xor_sync(~0u, tail, o);
         }
-        if (!lane) { float r; if (!cert_round(acc, tail, lsb, W.Gm, W.Ge, p, r)) atomicAdd(nbad, 1); y[row] = r; }
+        if (!lane) { float r; if (!cert_round(acc, tail, lsb, W.Gm, W.Ge, p, r)) { atomicAdd(nbad, 1); r = __int_as_float(0x7FC00000); } y[row] = r; }
     } else {
         int per = K / mode; float tot = 0.f;
         for (int c = 0; c < mode; c++) {
@@ -323,31 +327,7 @@ static DevW load_w(const std::string &name, int fmt, int M, int K, void *dst = n
     W.w = d;
     return W;
 }
-// stats: exact vs engine on the same input (shadow), per format
-static long long st_out[6], st_d1[6], st_d4[6], st_bad;   // per weight format; [4] = BF16 weights rounded to FP32 (logits)
-static std::vector<float> gemv(const DevW &W, const Act &a, int p, int mode, bool shadow = false) {
-    CK(cudaMemcpy(dxm, a.m.data(), a.m.size() * 4, cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dxe, a.e.data(), a.e.size() * 2, cudaMemcpyHostToDevice));
-    CK(cudaMemset(dbad, 0, 4));
-    gemv_k<<<(W.M + 7) / 8, 256>>>(W, dxm, dxe, a.hix, p, mode, dy, dbad);
-    std::vector<float> y(W.M); CK(cudaMemcpy(y.data(), dy, W.M * 4, cudaMemcpyDeviceToHost));
-    int nb; CK(cudaMemcpy(&nb, dbad, 4, cudaMemcpyDeviceToHost)); st_bad += nb;
-    static const bool shadow_on = !getenv("OZ_NOSHADOW");   // OZ_NOSHADOW=1: time the exact path alone
-    if (shadow && mode == 0 && shadow_on) {
-        std::vector<float> z(W.M);
-        int c = W.fmt == F_BF16 && p == 24 ? 4 : W.fmt;
-        for (int s : {1, 4}) {
-            gemv_k<<<(W.M + 7) / 8, 256>>>(W, dxm, dxe, a.hix, p, s, dy, dbad);
-            CK(cudaMemcpy(z.data(), dy, W.M * 4, cudaMemcpyDeviceToHost));
-            long long d = 0; for (int i = 0; i < W.M; i++) d += z[i] != y[i];
-            (s == 1 ? st_d1 : st_d4)[c] += d;
-        }
-        st_out[c] += W.M;
-    }
-    return y;
-}
-
-// ---- self-test: the kernel against an independent host superaccumulator (2560 bits, no window, no tail) ----------------
+// ---- the host superaccumulator (2560 bits, no window, no tail): the self-test's reference and the GEMV's last resort ----
 struct Big {   // nonnegative, bit i of limb j = 2^(64 j + i - OFF)
     static constexpr int NL = 40, OFF = 1280; uint64_t l[NL] = {};
     void add(unsigned __int128 v, int e) {   // v * 2^e
@@ -374,11 +354,56 @@ static double big_round(Big a, unsigned long long Gm, int Ge, int p) {   // a * 
     if (hb && (rest || (q & 1))) q++;
     return ldexp((double)q, lsb - Big::OFF + Ge);
 }
+// row r of a matrix in host memory (Wh) times a, every product exact, rounded once to p bits
+static float exact_dot(const DevW &Wh, int r, const Act &a, int p) {
+    Big pos, neg;
+    for (int k = 0; k < Wh.K; k++) { int m, e; wdec(Wh, r, k, m, e); long long pr = (long long)m * a.m[k]; if (!pr) continue;
+        (pr > 0 ? pos : neg).add((unsigned __int128)(pr > 0 ? pr : -pr), e + a.e[k]); }
+    bool ng = !pos.ge(neg); if (ng) { neg.sub(pos); pos = neg; } else pos.sub(neg);
+    double v = big_round(pos, Wh.Gm, Wh.Ge, p); return (float)(ng ? -v : v);
+}
+// the same for row r of a matrix on the GPU: the row (and its scales) copied back, then exact_dot on a one-row view
+static float exact_row(const DevW &W, int r, const Act &a, int p) {
+    size_t K = W.K, wb = W.fmt == F_BF16 ? 2 * K : W.fmt == F_F32 ? 4 * K : W.fmt == F_NVFP4 ? K / 2 : K,
+           sb = W.fmt == F_E4M3B ? K / 128 * 2 : W.fmt == F_NVFP4 ? K / 16 : 0, so = W.fmt == F_E4M3B ? (size_t)(r / 128) * sb : (size_t)r * sb;
+    std::vector<uint8_t> w(wb), s(sb + 1);
+    CK(cudaMemcpy(w.data(), (const uint8_t *)W.w + r * wb, wb, cudaMemcpyDeviceToHost));
+    if (sb) CK(cudaMemcpy(s.data(), W.sw + so, sb, cudaMemcpyDeviceToHost));
+    DevW Wh = W; Wh.w = w.data(); Wh.sw = s.data(); Wh.M = 1;
+    return exact_dot(Wh, 0, a, p);
+}
+// stats: exact vs engine on the same input (shadow), per format; st_sup: outputs the window left open, done on the host;
+// st_bad: outputs used uncertified (none since 30-10-2026: every path ends in exact_row)
+static long long st_out[6], st_d1[6], st_d4[6], st_bad, st_sup;   // per weight format; [4] = BF16 weights rounded to FP32 (logits)
+static std::vector<float> gemv(const DevW &W, const Act &a, int p, int mode, bool shadow = false) {
+    CK(cudaMemcpy(dxm, a.m.data(), a.m.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dxe, a.e.data(), a.e.size() * 2, cudaMemcpyHostToDevice));
+    CK(cudaMemset(dbad, 0, 4));
+    gemv_k<<<(W.M + 7) / 8, 256>>>(W, dxm, dxe, p, mode, dy, dbad);
+    std::vector<float> y(W.M); CK(cudaMemcpy(y.data(), dy, W.M * 4, cudaMemcpyDeviceToHost));
+    int nb; CK(cudaMemcpy(&nb, dbad, 4, cudaMemcpyDeviceToHost));
+    if (nb && mode == 0) { st_sup += nb; for (int r = 0; r < W.M; r++) if (y[r] != y[r]) y[r] = exact_row(W, r, a, p); }
+    static const bool shadow_on = !getenv("OZ_NOSHADOW");   // OZ_NOSHADOW=1: time the exact path alone
+    if (shadow && mode == 0 && shadow_on) {
+        std::vector<float> z(W.M);
+        int c = W.fmt == F_BF16 && p == 24 ? 4 : W.fmt;
+        for (int s : {1, 4}) {
+            gemv_k<<<(W.M + 7) / 8, 256>>>(W, dxm, dxe, p, s, dy, dbad);
+            CK(cudaMemcpy(z.data(), dy, W.M * 4, cudaMemcpyDeviceToHost));
+            long long d = 0; for (int i = 0; i < W.M; i++) d += z[i] != y[i];
+            (s == 1 ? st_d1 : st_d4)[c] += d;
+        }
+        st_out[c] += W.M;
+    }
+    return y;
+}
+
+// ---- self-test: the kernel against the host superaccumulator -----------------------------------------------------------
 static int selftest() {
     std::mt19937_64 rng(2027); int M = 256, K = 8192, fails = 0; long long checked = 0;
     CK(cudaMalloc(&dW, (size_t)M * K * 4)); CK(cudaMalloc(&dS, (size_t)M * K / 16)); CK(cudaMalloc(&dxm, K * 4)); CK(cudaMalloc(&dxe, K * 2));
     CK(cudaMalloc(&dy, M * 4)); CK(cudaMalloc(&dbad, 4));
-    for (int fmt : {F_BF16, F_F32, F_E4M3, F_NVFP4, F_E4M3B}) for (int trial = 0; trial < (fmt == F_BF16 ? 4 : 3); trial++) {
+    for (int fmt : {F_BF16, F_F32, F_E4M3, F_NVFP4, F_E4M3B}) for (int trial = 0; trial < (fmt == F_BF16 ? 6 : 3); trial++) {
         size_t wb = fmt == F_BF16 ? 2 : fmt == F_F32 ? 4 : 1; std::vector<uint8_t> w((size_t)M * K * wb), sw((size_t)M * K / 16);
         for (auto &b : w) b = rng();
         if (fmt == F_BF16) for (size_t i = 0; i < w.size(); i += 2) w[i + 1] = (w[i + 1] & 0x80) | (0x30 + rng() % (trial == 2 ? 0x40 : 0x10));   // exponents: narrow, or 2^-60 wide
@@ -389,27 +414,32 @@ static int selftest() {
         std::vector<float> x(K); std::normal_distribution<double> nd;
         for (int k = 0; k < K; k++) x[k] = bf(nd(rng) * (trial == 1 ? exp2(rng() % 40 - 20.0) : 1.0));
         if (trial == 2) for (int k = 0; k < K / 2; k++) x[K / 2 + k] = -x[k];   // heavy cancellation against w
-        if (trial == 3) {   // exact ties: w0 + 2^(e0-8) (rows r odd) or w0 + 2^(e0-24), x = (1, 1, 0, ...): nearest-even decides
+        if (trial == 3 || trial == 5) {   // exact ties: w0 + 2^(e0-8) (rows r odd) or w0 + 2^(e0-24), x = (1, 1, 0, ...): nearest-even decides
             std::fill(x.begin(), x.end(), 0.f); x[0] = x[1] = 1.f; std::fill(w.begin(), w.end(), 0);
             for (int r = 0; r < M; r++) { uint16_t w0 = (uint16_t)(0x3F80 | (rng() & 0x7F) | (r & 2 ? 0x8000 : 0)), w1 = (uint16_t)((w0 & 0x8000) | ((0x7F - (r & 1 ? 8 : 24)) << 7));
                 memcpy(&w[(size_t)r * K * 2], &w0, 2); memcpy(&w[((size_t)r * K + 1) * 2], &w1, 2); }
         }
+        if (trial == 4) {   // the anchor: weights 2^30 meet inputs 2^-100, weights 2^-90 meet 2^60 -- max |w| max |x| = 2^90, every
+            for (size_t i = 0; i < w.size(); i += 2) {   // real product below 2^-29: under the old anchor all of them fell out
+                bool lo = (i / 2) % K >= (size_t)K / 2; w[i + 1] = (uint8_t)((w[i + 1] & 0x80) | ((lo ? 127 - 90 : 127 + 30) >> 1)); w[i] = (uint8_t)((w[i] & 0x7F) | (((lo ? 127 - 90 : 127 + 30) & 1) << 7)); }
+            for (int k = 0; k < K; k++) x[k] = bf(nd(rng) * (k < K / 2 ? 0x1p-100 : 0x1p60));
+        }
+        if (trial == 5)   // trial 3 plus eight terms 2^-130: out of the window, the ties stay open -- exact_row decides (rows by r/4 % 3:
+            for (int r = 0; r < M; r++) for (int k = 2; k < 10; k++) {   // signs alternating, so nearest-even after all; all +; all -)
+                x[k] = 0x1p-70f; int c = (r >> 2) % 3, s = c == 0 ? (k & 1) : c == 2;
+                uint16_t u = (uint16_t)(s << 15 | (127 - 60) << 7); memcpy(&w[((size_t)r * K + k) * 2], &u, 2); }
         Act a = fmt == F_E4M3 ? act_fp8(x, 0.0123f) : fmt == F_NVFP4 ? act_nvfp4(x, 0.00731f) : fmt == F_E4M3B ? act_fp8g(x) : act_plain(x);
         CK(cudaMemcpy(dW, w.data(), w.size(), cudaMemcpyHostToDevice)); CK(cudaMemcpy(dS, sw.data(), sw.size(), cudaMemcpyHostToDevice));
         DevW W{}; W.w = dW; W.sw = (uint8_t *)dS; W.fmt = fmt; W.M = M; W.K = K; W.Gm = 1; W.Ge = 0; W.Gf = 1.f;
         if (fmt == F_E4M3 || fmt == F_NVFP4) gscale(W, 0.0371f, fmt == F_E4M3 ? 0.0123f : 0.00731f);
         DevW Wh = W; Wh.w = w.data(); Wh.sw = sw.data();
         for (int p : {8, 24}) {
-            st_bad = 0; auto y = gemv(W, a, p, 0);
+            st_sup = 0; auto y = gemv(W, a, p, 0);
             for (int r = 0; r < M; r++) {
-                Big pos, neg;
-                for (int k = 0; k < K; k++) { int m, e; wdec(Wh, r, k, m, e); long long pr = (long long)m * a.m[k]; if (!pr) continue;
-                    (pr > 0 ? pos : neg).add((unsigned __int128)(pr > 0 ? pr : -pr), e + a.e[k]); }
-                bool ng = !pos.ge(neg); if (ng) { neg.sub(pos); pos = neg; } else pos.sub(neg);
-                double ref = big_round(pos, W.Gm, W.Ge, p); if (ng) ref = -ref;
-                checked++; if ((float)ref != y[r]) { if (fails++ < 5) fprintf(stderr, "fmt %d trial %d p %d row %d: %.9g vs %.9g\n", fmt, trial, p, r, ref, y[r]); }
+                float ref = exact_dot(Wh, r, a, p);
+                checked++; if (ref != y[r]) { if (fails++ < 5) fprintf(stderr, "fmt %d trial %d p %d row %d: %.9g vs %.9g\n", fmt, trial, p, r, ref, y[r]); }
             }
-            printf("selftest fmt %d trial %d p %2d: %d rows, uncertified %lld\n", fmt, trial, p, M, st_bad);
+            printf("selftest fmt %d trial %d p %2d: %d rows, finished on the host %lld\n", fmt, trial, p, M, st_sup);
         }
     }
     printf("selftest: %lld outputs against the superaccumulator, %d differ\n", checked, fails);

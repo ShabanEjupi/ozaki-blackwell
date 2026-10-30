@@ -24,11 +24,22 @@
 #include "bgemm.cu"
 #include <omp.h>
 
+// OZ_PROF=1: each phase synchronized and timed under its name (prof_dump prints and clears); off, pmark only reads a flag
+static const bool PROF = getenv("OZ_PROF"); static std::map<std::string, double> prof;
+static void pmark(std::chrono::steady_clock::time_point &t, const char *what) {
+    if (!PROF) return;
+    CK(cudaDeviceSynchronize()); auto n = std::chrono::steady_clock::now(); prof[what] += std::chrono::duration<double>(n - t).count(); t = n;
+}
+static void prof_dump(const char *head) {
+    if (!PROF) return;
+    fprintf(stderr, "prof %s:", head); for (auto &kv : prof) fprintf(stderr, " %s %.2f", kv.first.c_str(), kv.second); fprintf(stderr, "\n"); prof.clear();
+}
+
 // ---- the batched product: Y[n][M] = X[n][K] W^T to p bits, every output certified ------------------------------------------
 static int8_t *g_wd, *g_xd; static int16_t *g_wl, *g_xl; static uint8_t *g_wn, *g_xn, *g_xq; static uint16_t *g_xb;
 static float *g_x, *g_xs, *g_Y; static unsigned *g_list, *g_lcnt; static int *g_nb; static size_t G_NB;
 static const unsigned G_CAP = 1u << 22;
-static long long st_rows, st_outs, st_outs24, st_fix, st_fix24, st_host;   // rows, outputs (p 8; p 24), left to the CUDA-core fixup, rows to the host GEMV
+static long long st_rows, st_outs, st_outs24, st_fix, st_fix24, st_host, st_fixopen;   // rows, outputs (p 8; p 24), left to the CUDA-core fixup, rows to the host GEMV, fixup outputs it left open
 static double t_gemm;
 
 static void bmm_init(size_t maxMK, size_t maxK, size_t maxM) {
@@ -40,10 +51,12 @@ static void bmm_init(size_t maxMK, size_t maxK, size_t maxM) {
     CK(cudaMalloc(&g_list, (size_t)G_CAP * 4)); CK(cudaMalloc(&g_lcnt, 4)); CK(cudaMalloc(&g_nb, 4));
 }
 static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y) {
-    auto t0 = std::chrono::steady_clock::now();
+    auto t0 = std::chrono::steady_clock::now(), tp = t0;
     int M = W.M, K = W.K, KB = K / 128; bool fp8 = W.fmt == F_E4M3B;
+    auto ph = [&](const char *f8, const char *b8, const char *b24) { pmark(tp, fp8 ? f8 : p == 24 ? b24 : b8); };
     if (fp8) fp8_digits<<<1024, 256>>>((const uint8_t *)W.w, g_wd, (size_t)M * K);
-    else bf16_digits<<<(unsigned)(((size_t)M * KB + 255) / 256), 256>>>((const uint16_t *)W.w, g_wd, g_wl, g_wn, M, K, wdig(p));
+    else bf16_digits<<<dig_grid((size_t)M * KB), 256>>>((const uint16_t *)W.w, g_wd, g_wl, g_wn, M, K, wdig(p));
+    ph("f8 w-digits", "b8 w-digits", "b24 w-digits");
     std::vector<uint16_t> xb;
     for (size_t n0 = 0; n0 < N; n0 += G_NB) {
         size_t n = std::min(G_NB, N - n0), np = (n + 7) / 8 * 8; const float *x = X + n0 * K;
@@ -51,21 +64,22 @@ static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y) {
             CK(cudaMemcpy(g_x, x, n * K * 4, cudaMemcpyHostToDevice));
             if (np > n) CK(cudaMemset(g_x + n * K, 0, (np - n) * K * 4));
             quant_fp8g<<<1024, 256>>>(g_x, g_xq, g_xs, np * KB);
-            fp8_digits<<<1024, 256>>>(g_xq, g_xd, np * K);
-            fp8b_gemm<<<dim3(M / 128, np / 8), 256>>>(g_wd, (const uint16_t *)W.sw, g_xd, g_xs, g_Y, M, np, K, p, g_nb);
+            fp8_digits<<<1024, 256>>>(g_xq, g_xd, np * K); ph("f8 x", "", "");
+            fp8b_gemm<<<dim3(M / 128, np / 8), 256>>>(g_wd, (const uint16_t *)W.sw, g_xd, g_xs, g_Y, M, np, K, p, g_nb); ph("f8 gemm", "", "");
         } else {
             xb.assign(np * K, 0);
             for (size_t i = 0; i < n * K; i++) { uint32_t u; memcpy(&u, &x[i], 4); xb[i] = u >> 16; }   // BF16 values: exact
-            CK(cudaMemcpy(g_xb, xb.data(), np * K * 2, cudaMemcpyHostToDevice));
-            bf16_digits<<<(unsigned)((np * KB + 255) / 256), 256>>>(g_xb, g_xd, g_xl, g_xn, np, K, xdig(p));
-            bf16_gemm_p(p, g_wd, g_wl, g_wn, g_xd, g_xl, g_xn, g_Y, M, np, K, g_nb);
+            CK(cudaMemcpy(g_xb, xb.data(), np * K * 2, cudaMemcpyHostToDevice)); ph("", "b8 x-host", "b24 x-host");
+            bf16_digits<<<dig_grid(np * KB), 256>>>(g_xb, g_xd, g_xl, g_xn, np, K, xdig(p)); ph("", "b8 x-digits", "b24 x-digits");
+            bf16_gemm_p(p, g_wd, g_wl, g_wn, g_xd, g_xl, g_xn, g_Y, M, np, K, g_nb); ph("", "b8 gemm", "b24 gemm");
             CK(cudaMemset(g_lcnt, 0, 4)); CK(cudaMemset(g_nb, 0, 4));
             nan_list<<<1024, 256>>>(g_Y, np * M, g_list, g_lcnt, G_CAP);
             bf16_fixup<<<1024, 256>>>((const uint16_t *)W.w, g_xb, g_list, g_lcnt, G_CAP, g_Y, M, K, p, g_nb);
             unsigned lc; CK(cudaMemcpy(&lc, g_lcnt, 4, cudaMemcpyDeviceToHost)); (p == 24 ? st_fix24 : st_fix) += lc;
-            int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_bad += nb;   // the fixup's own (never seen)
+            int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_fixopen += nb;   // the fixup left them NaN: the GEMV below
+            ph("", "b8 fixup", "b24 fixup");
         }
-        float *y = Y + n0 * M; CK(cudaMemcpy(y, g_Y, n * M * 4, cudaMemcpyDeviceToHost));
+        float *y = Y + n0 * M; CK(cudaMemcpy(y, g_Y, n * M * 4, cudaMemcpyDeviceToHost)); ph("f8 y-d2h", "b8 y-d2h", "b24 y-d2h");
         for (size_t r = 0; r < n; r++) {   // what is still NaN: the GEMV (beyond the fixup's list; FP8 outputs it could not certify)
             float *yr = y + r * M; bool any = false; for (int m = 0; m < M && !any; m++) any = yr[m] != yr[m];
             if (!any) continue; st_host++;
@@ -73,6 +87,7 @@ static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y) {
             for (int m = 0; m < M; m++) if (yr[m] != yr[m]) yr[m] = g[m];
         }
         if (fp8) CK(cudaMemset(g_nb, 0, 4));
+        ph("f8 gemv", "b8 gemv", "b24 gemv");
     }
     st_rows += N; (p == 24 ? st_outs24 : st_outs) += (long long)N * M;
     t_gemm += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -302,9 +317,9 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
     }
     fflush(stdout);
     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    fprintf(stderr, "pass %zu rows: %.1f s (disk %.1f s, %.1f GB; products %.1f s; attention %.1f s %s), fixup %lld, host GEMV rows %lld, uncertified %lld%s\n",
+    fprintf(stderr, "pass %zu rows: %.1f s (disk %.1f s, %.1f GB; products %.1f s; attention %.1f s %s), fixup %lld (open %lld), host GEMV rows %lld, finished on the host %lld, uncertified %lld%s\n",
             R, sec, t_disk - d0, (bytes_disk - b0) / 1e9, t_gemm - g0, t_att - a0, GATT == 1 ? "GPU" : GATT ? "GPU + host" : "host",
-            st_fix, st_host, st_bad, GATT == 2 ? (", attention outputs differing GPU/host " + std::to_string(st_attdiff)).c_str() : "");
+            st_fix, st_fixopen, st_host, st_sup, st_bad, GATT == 2 ? (", attention outputs differing GPU/host " + std::to_string(st_attdiff)).c_str() : "");
 }
 
 // the device buffers, lm_head, the norms and router biases of the NL layers (after jais_init; also jais_lora.cu's)

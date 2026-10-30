@@ -95,27 +95,34 @@ __global__ void __launch_bounds__(256) fp8b_gemm(const int8_t *__restrict__ wd, 
     }
 }
 
-// BF16 bits [R][K] -> three digit planes of v = floor(x / 2^l) per block of 128 on the grid l = top bit - 19 (lexp), and the
-// count of elements with bits below l (ntr). One thread per row and block.
+// BF16 bits [R][K] -> nd digit planes of v = floor(x / 2^l) per block of 128 on the grid l = top bit - (7 nd - 2) (lexp), and
+// the count of elements with bits below l (ntr). One warp per row and block, four elements per lane, so loads and stores
+// coalesce (one thread per block put every byte in a sector of its own: 27 of the 28 s of an MoE layer's backward, 30-10-2026).
+static unsigned dig_grid(size_t nblk) { return (unsigned)std::min<size_t>((nblk + 7) / 8, 1u << 20); }   // bf16_digits: a warp per block
 __global__ void bf16_digits(const uint16_t *src, int8_t *d, int16_t *lexp, uint8_t *ntr, int R, int K, int nd) {
-    size_t KB = K / 128, nblk = (size_t)R * KB, n = (size_t)R * K;
-    for (size_t bi = blockIdx.x * (size_t)blockDim.x + threadIdx.x; bi < nblk; bi += (size_t)gridDim.x * blockDim.x) {
-        size_t base = (bi / KB) * K + (bi % KB) * 128; int top = -100000, cnt = 0;
-        for (int i = 0; i < 128; i++) { uint16_t u = src[base + i]; int ex = (u >> 7) & 255, f = u & 127; if (!(u & 0x7FFF)) continue;
+    size_t KB = K / 128, nblk = (size_t)R * KB, n = (size_t)R * K; int lane = threadIdx.x & 31;
+    for (size_t bi = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) / 32; bi < nblk; bi += (size_t)gridDim.x * blockDim.x / 32) {
+        size_t base = (bi / KB) * K + (bi % KB) * 128 + lane * 4; uint2 raw = *(const uint2 *)(src + base);
+        uint16_t us[4] = {(uint16_t)raw.x, (uint16_t)(raw.x >> 16), (uint16_t)raw.y, (uint16_t)(raw.y >> 16)}; int top = -100000, cnt = 0;
+        for (int i = 0; i < 4; i++) { uint16_t u = us[i]; int ex = (u >> 7) & 255, f = u & 127; if (!(u & 0x7FFF)) continue;
             top = max(top, (ex ? ex - 134 : -133) + 31 - __clz(ex ? 128 + f : f)); }
+        for (int o = 16; o; o >>= 1) top = max(top, __shfl_xor_sync(~0u, top, o));
         int l = top == -100000 ? -32768 : top - (7 * nd - 2);   // |v| < 2^(7 nd - 1): nd balanced base-128 digits; -32768: all zero
-        for (int i = 0; i < 128; i++) {
-            uint16_t u = src[base + i]; int ex = (u >> 7) & 255, f = u & 127, sig = ex ? 128 + f : f, sh = (ex ? ex - 134 : -133) - l; long long v;   // up to 2^41 (6 digits)
+        uint32_t pk[8] = {};   // plane q's four bytes of this lane
+        for (int i = 0; i < 4; i++) {
+            uint16_t u = us[i]; int ex = (u >> 7) & 255, f = u & 127, sig = ex ? 128 + f : f, sh = (ex ? ex - 134 : -133) - l; long long v;   // up to 2^41 (6 digits)
             if (!(u & 0x7FFF)) v = 0;
             else if (sh >= 0) v = (u >> 15) ? -((long long)sig << sh) : (long long)sig << sh;
             else {   // floor: the dropped part is in [0, 1) units for both signs
                 int q = sh > -9 ? sig >> -sh : 0, rem = sh > -9 ? (sig & ((1 << -sh) - 1)) != 0 : 1; cnt += rem;
                 v = (u >> 15) ? -(q + rem) : q;
             }
-            for (int q = 0; q < nd - 1; q++) { int dq = (int)((v + 64) & 127) - 64; d[q * n + base + i] = (int8_t)dq; v = (v - dq) >> 7; }
-            d[(nd - 1) * n + base + i] = (int8_t)v;
+            for (int q = 0; q < nd - 1; q++) { int dq = (int)((v + 64) & 127) - 64; pk[q] |= (uint32_t)(uint8_t)dq << (8 * i); v = (v - dq) >> 7; }
+            pk[nd - 1] |= (uint32_t)(uint8_t)v << (8 * i);
         }
-        lexp[bi] = (int16_t)l; ntr[bi] = (uint8_t)cnt;
+        for (int q = 0; q < nd; q++) *(uint32_t *)(d + q * n + base) = pk[q];
+        for (int o = 16; o; o >>= 1) cnt += __shfl_xor_sync(~0u, cnt, o);
+        if (!lane) { lexp[bi] = (int16_t)l; ntr[bi] = (uint8_t)cnt; }
     }
 }
 // One warp: 16 rows x 8 tokens; weights in DW digits (|vw| < 2^(7 DW - 1)), tokens in DX (|vx| < 2^(7 DX - 1)): activations spread
@@ -187,11 +194,12 @@ __global__ void bf16_fixup(const uint16_t *w, const uint16_t *xb, const unsigned
     unsigned nl = min(*cnt, cap), lane = threadIdx.x & 31;
     for (unsigned j = (blockIdx.x * blockDim.x + threadIdx.x) / 32; j < nl; j += gridDim.x * blockDim.x / 32) {
         size_t i = list[j], tok = i / M, row = i % M; const uint16_t *wr = w + row * K, *xr = xb + tok * K;
-        int hw = -100000, hx = -100000;
-        for (int k = lane; k < K; k += 32) { int m, e; bf16_me(wr[k], m, e); if (m) hw = max(hw, e + 32 - __clz(abs(m)));
-                                             bf16_me(xr[k], m, e); if (m) hx = max(hx, e + 32 - __clz(abs(m))); }
-        for (int o = 16; o; o >>= 1) { hw = max(hw, __shfl_xor_sync(~0u, hw, o)); hx = max(hx, __shfl_xor_sync(~0u, hx, o)); }
-        int lsb = hw + hx + 16 - 125; __int128 acc = 0; int tail = 0;
+        int hp = -100000;   // the largest product's top bit (gemv_k: anchoring at max |w| + max |x| lost whole rows, 30-10-2026)
+        for (int k = lane; k < K; k += 32) { int mw, ew, mx, ex; bf16_me(wr[k], mw, ew); bf16_me(xr[k], mx, ex);
+                                             if (mw && mx) hp = max(hp, ew + ex + 64 - __clz(abs(mw)) - __clz(abs(mx))); }
+        for (int o = 16; o; o >>= 1) hp = max(hp, __shfl_xor_sync(~0u, hp, o));
+        if (hp == -100000) { if (!lane) Y[i] = 0.f; continue; }
+        int lsb = hp + 16 - 125; __int128 acc = 0; int tail = 0;
         for (int k = lane; k < K; k += 32) {
             int mw, ew, mx, ex; bf16_me(wr[k], mw, ew); bf16_me(xr[k], mx, ex); if (!mw || !mx) continue;
             long long pr = (long long)mw * mx; int sh = ew + ex - lsb;
@@ -202,7 +210,7 @@ __global__ void bf16_fixup(const uint16_t *w, const uint16_t *xb, const unsigned
             lo = __shfl_xor_sync(~0u, lo, o); hi = __shfl_xor_sync(~0u, hi, o);
             acc += (__int128)(((unsigned __int128)hi << 64) | lo); tail += __shfl_xor_sync(~0u, tail, o);
         }
-        if (!lane) { float r; if (!cert_round(acc, tail, lsb, 1, 0, p, r)) atomicAdd(nbad, 1); Y[i] = r; }
+        if (!lane) { float r; if (!cert_round(acc, tail, lsb, 1, 0, p, r)) { atomicAdd(nbad, 1); r = __int_as_float(0x7FC00000); } Y[i] = r; }   // NaN: the host GEMV
     }
 }
 
@@ -241,13 +249,13 @@ int main(int argc, char **argv) {
     CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(dxb, xb.data(), xb.size() * 2, cudaMemcpyHostToDevice));
     if (fp8) fp8_digits<<<1024, 256>>>((const uint8_t *)W.w, wd, (size_t)M * K);
     auto run = [&](int p) {
-        if (!fp8) bf16_digits<<<(M * KB + 255) / 256, 256>>>((const uint16_t *)W.w, wd, wl, wn, M, K, wdig(p));
+        if (!fp8) bf16_digits<<<dig_grid((size_t)M * KB), 256>>>((const uint16_t *)W.w, wd, wl, wn, M, K, wdig(p));
         if (fp8) {
             quant_fp8g<<<1024, 256>>>(dx, xq, xsc, (size_t)N * KB);
             fp8_digits<<<1024, 256>>>(xq, xd, (size_t)N * K);
             fp8b_gemm<<<dim3(M / 128, N / 8), 256>>>(wd, (const uint16_t *)dS, xd, xsc, Y, M, N, K, p, nb);
         } else {
-            bf16_digits<<<(N * KB + 255) / 256, 256>>>(dxb, xd, xl, xn, N, K, xdig(p));
+            bf16_digits<<<dig_grid((size_t)N * KB), 256>>>(dxb, xd, xl, xn, N, K, xdig(p));
             bf16_gemm_p(p, wd, wl, wn, xd, xl, xn, Y, M, N, K, nb);
             CK(cudaMemset(lcnt, 0, 4)); nan_list<<<1024, 256>>>(Y, (size_t)N * M, list, lcnt, cap);
             bf16_fixup<<<1024, 256>>>((const uint16_t *)W.w, dxb, list, lcnt, cap, Y, M, K, p, nb2);
@@ -264,15 +272,15 @@ int main(int argc, char **argv) {
             std::vector<float> xv(x.begin() + (size_t)n * K, x.begin() + (size_t)(n + 1) * K); auto r = gemv(W, act(xv), p, 0);
             for (int m = 0; m < M; m++) if (y[(size_t)n * M + m] != y[(size_t)n * M + m]) y[(size_t)n * M + m] = r[m];
         }
-        long long diff = 0; st_bad = 0;
+        long long diff = 0; st_sup = 0;
         for (int n = 0; n < NREF; n++) {
             std::vector<float> xv(x.begin() + (size_t)n * K, x.begin() + (size_t)(n + 1) * K);
             auto r = gemv(W, act(xv), p, 0);
             for (int m = 0; m < M; m++) diff += r[m] != y[(size_t)n * M + m];
         }
         printf("%s %s %d x %d, %d tokens, p %d: batched vs per-token GEMV on %d tokens: %lld of %lld differ; tensor cores left %d outputs "
-               "(%.4f%%) to the CUDA-core fixup (uncertified there %d), %lld tokens to the host GEMV; GEMV uncertified %lld\n", T.c_str(),
-               fp8 ? "FP8" : "BF16", M, K, N, p, NREF, diff, (long long)NREF * M, hb, 100.0 * hb / ((double)N * M), hb2, nan_tok, st_bad);
+               "(%.4f%%) to the CUDA-core fixup (uncertified there %d), %lld tokens to the host GEMV; GEMV outputs finished on the host %lld\n", T.c_str(),
+               fp8 ? "FP8" : "BF16", M, K, N, p, NREF, diff, (long long)NREF * M, hb, 100.0 * hb / ((double)N * M), hb2, nan_tok, st_sup);
     }
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0);
     for (int r = 0; r < 5; r++) run(8);
