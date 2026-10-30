@@ -145,11 +145,16 @@ __global__ void gemv_k(DevW W, const int32_t *xm, const int16_t *xe, int p, int 
 }
 
 // ---- host numerics ---------------------------------------------------------------------------------------------------
-static float bf(double v) {   // once to BF16, nearest even
+static float bf_slow(double v) {   // once to BF16, nearest even: the definition (and the path below 2^-126, BF16's subnormals)
     if (v == 0 || !std::isfinite(v)) return (float)v;
     int ex; frexp(v, &ex);
     int q = std::max(ex - 8, -133);
     return (float)ldexp(nearbyint(ldexp(v, -q)), q);
+}
+static float bf(double v) {   // the same from the bits: the significand rounded at its 8th bit, ties to even (tools/bftest.cpp;
+    if (!(fabs(v) >= 0x1p-126) || !std::isfinite(v)) return bf_slow(v);   // frexp, two ldexp and nearbyint cost ~20 ns a call)
+    uint64_t u; memcpy(&u, &v, 8); u += ((1ULL << 44) - 1) + ((u >> 45) & 1); u &= ~((1ULL << 45) - 1);
+    double r; memcpy(&r, &u, 8); return (float)r;
 }
 static float bf16f(uint16_t u) { uint32_t b = (uint32_t)u << 16; float f; memcpy(&f, &b, 4); return f; }
 static uint64_t fnv(uint64_t h, const std::vector<float> &v) {   // FNV-1a 64 over the bits: a transcript digest of the exact path
