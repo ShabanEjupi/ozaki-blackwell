@@ -88,6 +88,9 @@ static int NL; static std::vector<bool> MOE; static std::vector<std::vector<floa
 static DevW LM; static bool VALIDATE; static std::vector<int> SCORE;
 // jais_lora.cu: HSAVE collects the residual stream entering every layer and leaving the last; HEMB may change the embeddings
 static std::vector<std::vector<float>> *HSAVE; static void (*HEMB)(std::vector<float> &);
+// of the first HSAVE_ROWS rows only (rows after them ride along, a held-out batch); EXUSED[L][e]: an expert of layer L that
+// one of those rows was routed to (the backward announces the same reads to the read-ahead)
+static size_t HSAVE_ROWS = SIZE_MAX; static std::vector<std::vector<char>> *EXUSED;
 static std::vector<float> (*PROJ)(int L, int which, const DevW &W, const std::vector<float> &x);   // q (0) and v (1) maps, when set
 
 // the rows' function f(row vector) -> row vector, in parallel over rows: the per-token host code on each row as it is
@@ -205,7 +208,7 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
     if (HEMB) HEMB(h);
     std::vector<std::vector<float>> hist(VALIDATE ? R : 0);   // every row's residual stream after every layer (the digest)
     for (int L = 0; L < NL; L++) {
-        if (HSAVE) HSAVE->push_back(h);
+        if (HSAVE) HSAVE->emplace_back(h.begin(), h.begin() + std::min(R, HSAVE_ROWS) * D_H);
         std::string P = "model.layers." + std::to_string(L) + ".";
         std::vector<float> x = norm_rows(h, N1[L]);
         if (!MOE[L] && L + 1 < NL) part0(L + 1);
@@ -233,6 +236,7 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
             if (GATT) for (size_t i = 0; i < o.size(); i++) st_attdiff += memcmp(&o[i], &oh[i], 4) != 0;
             o.swap(oh); if (!GATT) t_att += std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
         }
+        if (HSAVE) for (auto &s : S) { std::vector<float>().swap(s.kc[L]); std::vector<float>().swap(s.vc[L]); }   // training: K, V come again from the saved input
         W = load_w(P + "self_attn.o_proj.weight", F_BF16, D_H, QD); add_rows(h, bmm(W, o));
         x = norm_rows(h, N2[L]);
         std::vector<float> out;
@@ -247,6 +251,8 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
             for (size_t r = 0; r < R; r++) route(std::vector<float>(lg.begin() + r * J_E, lg.begin() + (r + 1) * J_E), BIAS[L], ex[r], wt[r]);
             std::vector<std::vector<std::pair<size_t, double>>> by(J_E);   // expert -> (row, weight)
             for (size_t r = 0; r < R; r++) for (int i = 0; i < J_TOPK; i++) by[ex[r][i]].push_back({r, wt[r][i]});
+            if (EXUSED) { auto &u = (*EXUSED)[L]; u.assign(J_E, 0);
+                for (int e = 0; e < J_E; e++) for (auto &p : by[e]) if (p.first < HSAVE_ROWS) { u[e] = 1; break; } }
             for (int e = 0; e < J_E; e++) if (!by[e].empty()) for (const char *n : {"gate_proj", "up_proj", "down_proj"}) for (const char *s : {".weight", ".weight_scale"})
                 ahead.push(P + "mlp.experts." + std::to_string(e) + "." + n + s);
             for (const char *n : {"gate_proj", "up_proj", "down_proj"}) ahead.push(P + "mlp.shared_experts." + n + ".weight");

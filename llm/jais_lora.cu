@@ -28,6 +28,8 @@
 #define JAIS_BATCH_LIB
 #include "jais_batch.cu"
 #include <functional>
+#include <numeric>
+#include <sys/stat.h>
 
 static uint64_t sm64(uint64_t x) {
     x += 0x9E3779B97F4A7C15ULL; x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL; x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL; return x ^ (x >> 31);
@@ -351,6 +353,21 @@ static double loss_back(const std::vector<float> &hN, const std::vector<int> &tg
     return loss;
 }
 
+// the backward's reads announced to the read-ahead (OZ_AHEAD) in the order back_layer asks for them: the attention maps,
+// then the dense MLP, or the router, the experts the forward routed the training rows to (USED) and the shared expert
+static std::vector<std::vector<char>> USED;
+static void announce(int L) {
+    std::string P = "model.layers." + std::to_string(L) + ".";
+    for (const char *n : {"q_proj", "k_proj", "v_proj", "o_proj"}) ahead.push(P + "self_attn." + n + ".weight");
+    if (!MOE[L]) { for (const char *n : {"gate_proj", "up_proj", "down_proj"}) ahead.push(P + "mlp." + n + ".weight"); return; }
+    ahead.push(P + "mlp.gate.weight");
+    for (int e = 0; e < J_E; e++) if (USED[L][e]) for (const char *n : {"gate_proj", "up_proj", "down_proj"}) for (const char *s : {".weight", ".weight_scale"})
+        ahead.push(P + "mlp.experts." + std::to_string(e) + "." + n + s);
+    for (const char *n : {"gate_proj", "up_proj", "down_proj"}) ahead.push(P + "mlp.shared_experts." + n + ".weight");
+}
+static long vmhwm_mb() { FILE *f = fopen("/proc/self/status", "r"); char l[256]; long kb = 0;
+    while (f && fgets(l, sizeof l, f)) if (!strncmp(l, "VmHWM:", 6)) kb = atol(l + 6);
+    if (f) fclose(f); return kb / 1024; }
 static double norm2(const std::vector<double> &v) { double s = 0; for (double x : v) s += x * x; return sqrt(s); }
 static double norm2f(const std::vector<float> &v) { double s = 0; for (float x : v) s += (double)x * x; return sqrt(s); }
 static uint64_t fnvd(uint64_t h, const std::vector<double> &v) {
@@ -422,19 +439,34 @@ int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: out_jlora <model dir> <token ids> [tokens N] [rank r] [alpha] [dB dir] | --selftest <model dir>\n"); return 1; }
     DIR = argv[1];
     // the data: a file of token ids (one sequence), or a .u32 file of sequences cut to OZ_CUT (1024) tokens: OZ_BATCH of them
-    // from number OZ_FIRST, the first N tokens of each
-    std::vector<std::vector<int>> seqs; size_t N = argc > 3 ? atol(argv[3]) : 512; std::string inp = argv[2];
-    if (inp.size() > 4 && inp.substr(inp.size() - 4) == ".u32") {
-        int B = getenv("OZ_BATCH") ? atoi(getenv("OZ_BATCH")) : 1; size_t first = getenv("OZ_FIRST") ? atol(getenv("OZ_FIRST")) : 0;
-        size_t CUT = getenv("OZ_CUT") ? atol(getenv("OZ_CUT")) : 1024; std::vector<uint32_t> b(CUT); N = std::min(N, CUT);
-        FILE *f = fopen(inp.c_str(), "rb"); if (!f) { perror(inp.c_str()); return 1; }
-        for (int j = 0; j < B; j++) { fseeko(f, (off_t)((first + j) * CUT * 4), SEEK_SET);
-            if (fread(b.data(), 4, CUT, f) != CUT) { fprintf(stderr, "%s holds no sequence %zu\n", inp.c_str(), first + j); return 1; }
-            seqs.emplace_back(b.begin(), b.begin() + N); }
-        fclose(f);
-    } else { std::vector<int> toks; std::ifstream f(inp); int v; while (f >> v) toks.push_back(v); N = std::min(toks.size(), N); toks.resize(N); seqs.push_back(toks); }
-    SEQ = N; const size_t R = seqs.size() * N;   // rows: sequence after sequence
-    std::vector<int> tgt(R, -1); for (size_t j = 0; j < seqs.size(); j++) for (size_t t = 0; t + 1 < N; t++) tgt[j * N + t] = seqs[j][t + 1];
+    // from number OZ_FIRST, the first N tokens of each. OZ_NEXT=1: every step its own batch, the training sequences (all but
+    // the last OZ_EVAL) in a seeded order (OZ_SEED). OZ_EVAL=<E>: the file's last E sequences, a held-out batch riding along
+    // in every forward with its own loss; it changes no bit of the training rows (every product is exact row by row)
+    std::vector<int> one; size_t N = argc > 3 ? atol(argv[3]) : 512; std::string inp = argv[2];
+    const bool U32 = inp.size() > 4 && inp.substr(inp.size() - 4) == ".u32", NEXT = getenv("OZ_NEXT") && atoi(getenv("OZ_NEXT"));
+    const int B = U32 && getenv("OZ_BATCH") ? atoi(getenv("OZ_BATCH")) : 1, E = U32 && getenv("OZ_EVAL") ? atoi(getenv("OZ_EVAL")) : 0;
+    const size_t first = getenv("OZ_FIRST") ? atol(getenv("OZ_FIRST")) : 0, CUT = getenv("OZ_CUT") ? atol(getenv("OZ_CUT")) : 1024;
+    size_t NSEQ = 0; std::vector<size_t> order;
+    if (U32) {
+        struct stat sb; if (stat(inp.c_str(), &sb)) { perror(inp.c_str()); return 1; }
+        N = std::min(N, CUT); NSEQ = sb.st_size / 4 / CUT;
+        if (NSEQ < (size_t)(B + E) || (!NEXT && first + B > NSEQ - E)) { fprintf(stderr, "%s holds %zu sequences\n", inp.c_str(), NSEQ); return 1; }
+        if (NEXT) { order.resize(NSEQ - E); std::iota(order.begin(), order.end(), 0); uint64_t sd = getenv("OZ_SEED") ? strtoull(getenv("OZ_SEED"), 0, 0) : 1;
+            for (size_t i = order.size() - 1; i > 0; i--) std::swap(order[i], order[sm64(sd ^ (i << 8)) % (i + 1)]); }
+    } else { std::ifstream f(inp); int v; while (f >> v) one.push_back(v); N = std::min(one.size(), N); one.resize(N); }
+    auto read_seq = [&](size_t i) { std::vector<uint32_t> b(N); FILE *f = fopen(inp.c_str(), "rb");
+        if (!f || fseeko(f, (off_t)(i * CUT * 4), SEEK_SET) || fread(b.data(), 4, N, f) != N) { fprintf(stderr, "%s holds no sequence %zu\n", inp.c_str(), i); exit(1); }
+        fclose(f); return std::vector<int>(b.begin(), b.end()); };
+    auto batch = [&](int st) { std::vector<std::vector<int>> s;   // step st's training sequences
+        if (!U32) s.push_back(one);
+        else for (int j = 0; j < B; j++) s.push_back(read_seq(NEXT ? order[((size_t)(st - 1) * B + j) % order.size()] : first + j));
+        return s; };
+    auto targets = [&](const std::vector<std::vector<int>> &s) { std::vector<int> t(s.size() * N, -1);
+        for (size_t j = 0; j < s.size(); j++) for (size_t p = 0; p + 1 < N; p++) t[j * N + p] = s[j][p + 1];
+        return t; };
+    std::vector<std::vector<int>> evs; for (int j = 0; j < E; j++) evs.push_back(read_seq(NSEQ - E + j));
+    SEQ = N; const size_t R = (size_t)B * N, RE = evs.size() * N;   // rows: sequence after sequence, the held-out ones last
+    const std::vector<int> tge = targets(evs);
     RK = argc > 4 ? atoi(argv[4]) : 16; double alpha = argc > 5 ? atof(argv[5]) : 32; SC = alpha / RK;
     std::string out = argc > 6 ? argv[6] : "";
     EPS = getenv("OZ_EPS") ? atof(getenv("OZ_EPS")) : 0; if (getenv("OZ_DSEED")) DSEED = strtoull(getenv("OZ_DSEED"), 0, 0); std::vector<double> FDEPS;
@@ -458,26 +490,46 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "jais_lora: %d layers (%d MoE), %zu tokens, rank %d, alpha %g%s\n", NL, (int)std::count(MOE.begin(), MOE.end(), true), N, RK, alpha,
             EPS ? (", forward only, embeddings moved by " + std::to_string(EPS)).c_str() : "");
-    // OZ_STEPS steps of AdamW (OZ_LR) on the one sequence: step 1 at B = 0, then the adapters in the forward too
+    // OZ_CKPT=<file>: the adapters and AdamW's moments after every step (to <file>.tmp, then renamed), read back when a run
+    // starts: a run of OZ_STEPS steps continues the last one, and every step's update is applied
+    const char *CKPT = getenv("OZ_CKPT"); int st0 = 0;
+    auto io = [&](FILE *f, bool w) { bool ok = true;
+        auto vf = [&](auto &v) { uint64_t n = v.size(); ok = ok && (w ? fwrite(&n, 8, 1, f) : fread(&n, 8, 1, f)) == 1; if (!ok) return;
+            if (!w) v.resize(n);
+            ok = (w ? fwrite(v.data(), sizeof v[0], n, f) : fread(v.data(), sizeof v[0], n, f)) == n; };
+        for (auto &l : lo) { vf(l.Aq); vf(l.Av); vf(l.Bq); vf(l.Bv); for (int i = 0; i < 4; i++) { vf(l.m[i]); vf(l.v[i]); } }
+        return ok; };
+    if (CKPT) if (FILE *f = fopen(CKPT, "rb")) {
+        int h[4]; bool ok = fread(h, 4, 4, f) == 4 && h[0] == NL && h[1] == RK && h[2] == D_H && io(f, false); fclose(f);
+        if (!ok) { fprintf(stderr, "%s is no checkpoint of these %d layers at rank %d\n", CKPT, NL, RK); return 1; }
+        st0 = h[3]; fprintf(stderr, "checkpoint %s: %d steps done\n", CKPT, st0);
+    }
+    // OZ_STEPS steps of AdamW (OZ_LR): step 1 at B = 0, then the adapters in the forward too
     const int STEPS = getenv("OZ_STEPS") ? atoi(getenv("OZ_STEPS")) : 1; const double LR = getenv("OZ_LR") ? atof(getenv("OZ_LR")) : 1e-4;
     PROJ = lora_proj; double prev = 0, predicted = 0;
-    for (int st = 1; st <= STEPS; st++) {
+    for (int st = st0 + 1; st <= st0 + STEPS; st++) {
         auto t0 = std::chrono::steady_clock::now(); t_back_mlp = t_back_att = 0;
-        std::vector<BSeq> S(seqs.size()); std::vector<std::pair<int, size_t>> rows;
-        for (size_t j = 0; j < seqs.size(); j++) { auto &s = S[j]; s.prompt = j; s.toks = seqs[j]; s.plen = N; s.end = N; s.kc.resize(NL); s.vc.resize(NL);
-            for (size_t t = 0; t < N; t++) rows.push_back({(int)j, t}); }
-        std::vector<std::vector<float>> HS; HSAVE = &HS; if (EPS) HEMB = perturb;
-        pass(S, rows, std::vector<bool>(R, false)); HSAVE = nullptr; S.clear();
+        const auto seqs = batch(st); const auto tgt = targets(seqs);
+        std::vector<BSeq> S(seqs.size() + evs.size()); std::vector<std::pair<int, size_t>> rows;
+        for (size_t j = 0; j < S.size(); j++) { auto &s = S[j]; s.prompt = j; s.toks = j < seqs.size() ? seqs[j] : evs[j - seqs.size()]; s.plen = N; s.end = N;
+            s.kc.resize(NL); s.vc.resize(NL); for (size_t t = 0; t < N; t++) rows.push_back({(int)j, t}); }
+        std::vector<std::vector<float>> HS; HSAVE = &HS; HSAVE_ROWS = R; USED.assign(NL, {}); EXUSED = &USED; if (EPS) HEMB = perturb;
+        pass(S, rows, std::vector<bool>(R + RE, false)); HSAVE = nullptr; EXUSED = nullptr; S.clear();
+        if (!EPS) announce(NL - 1);   // the backward's first reads, behind the loss
+        std::vector<float> he(HS[NL].begin() + R * D_H, HS[NL].end()); HS[NL].resize(R * D_H);
         std::vector<double> g(R * D_H, 0.0);
         double loss = loss_back(HS[NL], tgt, R, EPS ? nullptr : &g);
         double tf = secs(t0);
         printf("step %d loss %.17g (perplexity %.6g) over %zu predictions; forward %.1f s\n", st, loss, exp(loss), seqs.size() * (N - 1), tf);
-        if (st > 1) printf("step %d: the update changed the loss by %.9e, its first-order prediction %.9e\n", st, loss - prev, predicted);
-        if (EPS) return 0;
+        if (RE) { double le = loss_back(he, tge, RE, nullptr);
+            printf("step %d held-out loss %.17g (perplexity %.6g) over %zu predictions\n", st, le, exp(le), evs.size() * (N - 1)); }
+        if (st > st0 + 1 && !NEXT) printf("step %d: the update changed the loss by %.9e, its first-order prediction %.9e\n", st, loss - prev, predicted);
+        if (EPS) { ahead.finish(); return 0; }
         printf("layer %d |g| %.6e\n", NL, norm2(g));
         double d0 = t_disk, b0 = bytes_disk;
         for (int L = NL - 1; L >= 0; L--) {
             auto tl = std::chrono::steady_clock::now();
+            if (L > 0) announce(L - 1);
             back_layer(L, HS[L], R, g, lo[L]);
             printf("layer %d |g| %.6e |dBq| %.6e |dBv| %.6e |dAq| %.6e |dAv| %.6e  %.1f s\n", L, norm2(g), norm2f(lo[L].dBq), norm2f(lo[L].dBv),
                    norm2f(lo[L].dAq), norm2f(lo[L].dAv), secs(tl)); fflush(stdout);
@@ -502,13 +554,18 @@ int main(int argc, char **argv) {
         }
         printf("step %d time %.1f s: forward %.1f, backward %.1f (MLP/MoE %.1f, attention and LoRA %.1f), backward disk %.1f s for %.1f GB\n", st, secs(t0), tf,
                secs(t0) - tf, t_back_mlp, t_back_att, t_disk - d0, (bytes_disk - b0) / 1e9);
+        printf("step %d peak memory %ld MB\n", st, vmhwm_mb());
         fflush(stdout);
-        if (st == STEPS) break;
+        if (st == st0 + STEPS && !CKPT) break;
         predicted = 0;
         for (int L = 0; L < NL; L++) { auto &l = lo[L];
             predicted += adamw(l.Bq, l.dBq, l.m[0], l.v[0], st, LR) + adamw(l.Bv, l.dBv, l.m[1], l.v[1], st, LR);
             if (!l.dAq.empty()) predicted += adamw(l.Aq, l.dAq, l.m[2], l.v[2], st - 1, LR) + adamw(l.Av, l.dAv, l.m[3], l.v[3], st - 1, LR); }   // A moves from step 2 on
         prev = loss;
+        if (CKPT) { std::string tmp = std::string(CKPT) + ".tmp"; FILE *f = fopen(tmp.c_str(), "wb"); int h[4] = {NL, RK, D_H, st};
+            bool ok = f && fwrite(h, 4, 4, f) == 4 && io(f, true); if (f) ok = fclose(f) == 0 && ok;
+            if (!ok || rename(tmp.c_str(), CKPT)) { perror(CKPT); return 1; } }
     }
+    ahead.finish();
     return 0;
 }
