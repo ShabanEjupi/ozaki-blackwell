@@ -40,7 +40,8 @@ static int8_t *g_wd, *g_xd; static int16_t *g_wl, *g_xl; static uint8_t *g_wn, *
 static float *g_x, *g_xs, *g_Y; static unsigned *g_list, *g_lcnt; static int *g_nb; static size_t G_NB;
 static const unsigned G_CAP = 1u << 22;
 static long long st_rows, st_outs, st_outs24, st_fix, st_fix24, st_host, st_fixopen;   // rows, outputs (p 8; p 24), left to the CUDA-core fixup, rows to the host GEMV, fixup outputs it left open
-static double t_gemm;
+static long long st_fix8;   // FP8 outputs the XF8 tiles left to f8x_fixup
+static double t_gemm; static const bool OLDK8 = getenv("OZ_OLDK8");
 
 static void bmm_init(size_t maxMK, size_t maxK, size_t maxM) {
     G_NB = getenv("OZ_NB") ? atol(getenv("OZ_NB")) : 4096;
@@ -68,8 +69,19 @@ static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y) {
             quant_fp8g<<<1024, 256>>>(g_x, g_xq, g_xs, np * KB);
             fp8_digits<<<1024, 256>>>(g_xq, g_xd, np * K); ph("f8 x", "", "");
             CK(cudaMemset(g_nb, 0, 4));
-            fp8b_gemm<<<dim3(M / 128, np / 8), 256>>>(g_wd, (const uint16_t *)W.sw, g_xd, g_xs, g_Y, M, np, K, p, g_nb); ph("f8 gemm", "", "");
-            int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); left = nb;   // fp8b_gemm counts every NaN it writes
+            if (OLDK8) {   // OZ_OLDK8=1: fp8b_gemm, the kernel before tgemm.cu's XF8 (the same outputs)
+                fp8b_gemm<<<dim3(M / 128, np / 8), 256>>>(g_wd, (const uint16_t *)W.sw, g_xd, g_xs, g_Y, M, np, K, p, g_nb); ph("f8 gemm", "", "");
+                int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); left = nb;   // fp8b_gemm counts every NaN it writes
+            } else {
+                tgemm_go<3, 3, true, 64, 3, true>(g_wd, (const uint16_t *)W.sw, nullptr, nullptr, g_xd, nullptr, nullptr, g_Y, M, (int)np, K, p, g_nb, g_xs);
+                ph("f8 gemm", "", "");
+                CK(cudaMemset(g_lcnt, 0, 4)); CK(cudaMemset(g_nb, 0, 4));
+                nan_list<<<1024, 256>>>(g_Y, np * M, g_list, g_lcnt, G_CAP);
+                f8x_fixup<<<1024, 256>>>((const uint8_t *)W.w, (const uint16_t *)W.sw, g_xq, g_xs, K, g_list, g_lcnt, G_CAP, g_Y, M, p, g_nb);
+                unsigned lc; CK(cudaMemcpy(&lc, g_lcnt, 4, cudaMemcpyDeviceToHost)); st_fix8 += lc;
+                int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_fixopen += nb;
+                left = (lc > G_CAP ? lc - G_CAP : 0) + nb; ph("f8 fixup", "", "");   // beyond the list, and what fp8b_gemm would leave open too
+            }
         } else {
             xb.assign(np * K, 0);
             #pragma omp parallel for schedule(static)
@@ -326,9 +338,9 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
     }
     fflush(stdout);
     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    fprintf(stderr, "pass %zu rows: %.1f s (disk %.1f s, %.1f GB; products %.1f s; attention %.1f s %s), fixup %lld (open %lld), host GEMV rows %lld, finished on the host %lld, uncertified %lld%s\n",
+    fprintf(stderr, "pass %zu rows: %.1f s (disk %.1f s, %.1f GB; products %.1f s; attention %.1f s %s), fixup %lld + FP8 %lld (open %lld), host GEMV rows %lld, finished on the host %lld, uncertified %lld%s\n",
             R, sec, t_disk - d0, (bytes_disk - b0) / 1e9, t_gemm - g0, t_att - a0, GATT == 1 ? "GPU" : GATT ? "GPU + host" : "host",
-            st_fix, st_fixopen, st_host, st_sup, st_bad, GATT == 2 ? (", attention outputs differing GPU/host " + std::to_string(st_attdiff)).c_str() : "");
+            st_fix, st_fix8, st_fixopen, st_host, st_sup, st_bad, GATT == 2 ? (", attention outputs differing GPU/host " + std::to_string(st_attdiff)).c_str() : "");
 }
 
 // the device buffers, lm_head, the norms and router biases of the NL layers (after jais_init; also jais_lora.cu's)

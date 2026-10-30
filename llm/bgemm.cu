@@ -319,7 +319,7 @@ static int xdig(int p) { return p == 24 ? DX24 : DXN; }
 #ifndef BGEMM_LIB
 int main(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: out_bgemm <model dir> <tensor> <M> <K> [N]\n"); return 1; }
-    DIR = argv[1]; std::string T = argv[2]; int M = atoi(argv[3]), K = atoi(argv[4]), N = argc > 5 ? atoi(argv[5]) : 4096, NREF = 256, KB = K / 128;
+    DIR = argv[1]; std::string T = argv[2]; int M = atoi(argv[3]), K = atoi(argv[4]), N = argc > 5 ? atoi(argv[5]) : 4096, NREF = std::min(256, N), KB = K / 128;
     read_index();
     bool fp8 = idx.at(T + ".weight").dt == "F8_E4M3";
     CK(cudaMallocHost(&pin, PIN)); CK(cudaMalloc(&dW, (size_t)M * K * 2)); CK(cudaMalloc(&dS, (size_t)8 << 20));
@@ -377,6 +377,22 @@ int main(int argc, char **argv) {
     for (int r = 0; r < 5; r++) run(8);
     cudaEventRecord(e1); CK(cudaEventSynchronize(e1)); float ms; cudaEventElapsedTime(&ms, e0, e1); ms /= 5;
     printf("batched: %.2f ms for %d tokens (activation preparation + product + fixup) = %.2f TOPS\n", ms, N, 2.0 * M * K * N / (ms * 1e9));
+    if (fp8) for (int p : {8, 24}) {   // fp8b_gemm against tgemm.cu's XF8 tiles + f8x_fixup: the same outputs bit for bit (NaN: the GEMV's in both), the minimum of 5
+        quant_fp8g<<<1024, 256>>>(dx, xq, xsc, (size_t)N * KB); fp8_digits<<<1024, 256>>>(xq, xd, (size_t)N * K);
+        std::vector<float> y[2]; float best[2] = {1e30f, 1e30f}; int open[2] = {}; unsigned fx = 0;
+        for (int r = 0; r < 10; r++) { int k = r & 1; CK(cudaMemset(nb, 0, 4)); CK(cudaMemset(nb2, 0, 4)); cudaEventRecord(e0);
+            if (!k) fp8b_gemm<<<dim3(M / 128, N / 8), 256>>>(wd, (const uint16_t *)dS, xd, xsc, Y, M, N, K, p, nb);
+            else { tgemm_go<3, 3, true, 64, 3, true>(wd, (const uint16_t *)dS, nullptr, nullptr, xd, nullptr, nullptr, Y, M, N, K, p, nb, xsc);
+                   CK(cudaMemset(lcnt, 0, 4)); nan_list<<<1024, 256>>>(Y, (size_t)N * M, list, lcnt, cap);
+                   f8x_fixup<<<1024, 256>>>((const uint8_t *)W.w, (const uint16_t *)dS, xq, xsc, K, list, lcnt, cap, Y, M, p, nb2); }
+            cudaEventRecord(e1); CK(cudaEventSynchronize(e1)); float t; cudaEventElapsedTime(&t, e0, e1); best[k] = std::min(best[k], t);
+            if (r < 2) { y[k].resize((size_t)N * M); CK(cudaMemcpy(y[k].data(), Y, y[k].size() * 4, cudaMemcpyDeviceToHost));
+                         CK(cudaMemcpy(&open[k], k ? nb2 : nb, 4, cudaMemcpyDeviceToHost)); if (k) CK(cudaMemcpy(&fx, lcnt, 4, cudaMemcpyDeviceToHost)); }
+        }
+        size_t diff = 0; for (size_t i = 0; i < y[0].size(); i++) diff += memcmp(&y[0][i], &y[1][i], 4) != 0;
+        printf("FP8 p %d, %d tokens: fp8b_gemm vs XF8 tiles + f8x_fixup: %zu of %zu differ; open (NaN, to the GEMV) %d / %d; to the fixup %u; "
+               "%.2f -> %.2f ms (%.2fx)\n", p, N, diff, y[0].size(), open[0], open[1], fx, best[0], best[1], best[0] / best[1]);
+    }
     if (!fp8) for (int p : {8, 24}) {   // the product alone, bf16_gemm2 against tgemm, the minimum of 5 (a training may share the GPU)
         run(p); CK(cudaDeviceSynchronize()); float best[2] = {1e30f, 1e30f};
         for (int r = 0; r < 10; r++) { OLDK = r & 1; cudaEventRecord(e0); bf16_gemm_p(p, wdig(p), wd, wl, wn, xd, xl, xn, Y, M, N, K, nb);
