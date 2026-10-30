@@ -180,6 +180,78 @@ __global__ void __launch_bounds__(256) bf16_gemm(const int8_t *__restrict__ wd, 
         Y[(size_t)tok[i] * M + row[i]] = r;
     }
 }
+__device__ inline void mma16832acc(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// bf16_gemm with m16n8k32 (twice the work per instruction), the digit products summed per shift 7 (pw + px) inside a block
+// of 128 (DW + DX - 1 accumulators instead of DW DX; |sum| < min(DW, DX) 2^19), and NT tiles of 8 tokens per warp on one
+// load of the weight digits. The same exact block sums and the same bounds: bit for bit bf16_gemm.
+template <int DW, int DX, int NT>
+__global__ void __launch_bounds__(256) bf16_gemm2(const int8_t *__restrict__ wd, const int16_t *__restrict__ wl, const uint8_t *__restrict__ wn,
+        const int8_t *__restrict__ xd, const int16_t *__restrict__ xl, const uint8_t *__restrict__ xn, float *Y, int M, int N, int K, int p, int *nbad) {
+    constexpr int NS = DW + DX - 1;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+    int m0 = (blockIdx.x * 8 + warp) * 16, n0 = blockIdx.y * 8 * NT, KB = K / 128;
+    if (m0 >= M) return;
+    size_t PW = (size_t)M * K, PX = (size_t)N * K;
+    int row[4], tok[NT][4], lsb[NT][4]; bool live[NT];
+    for (int i = 0; i < 4; i++) row[i] = m0 + g + (i < 2 ? 0 : 8);
+    for (int t = 0; t < NT; t++) { live[t] = n0 + t * 8 < N;
+        for (int i = 0; i < 4; i++) { tok[t][i] = n0 + t * 8 + t4 * 2 + (i & 1); int hi = -100000;
+            if (live[t]) for (int b = 0; b < KB; b++) hi = max(hi, wl[(size_t)row[i] * KB + b] + xl[(size_t)tok[t][i] * KB + b]);
+            lsb[t][i] = hi + 7 * (DW + DX) + 11 - 125; } }
+    __int128 acc[NT][4] = {}; unsigned __int128 tail[NT][4] = {};
+    for (int b = 0; b < KB; b++) {
+        int P[NS][NT][4] = {};
+        for (int kk = b * 128; kk < b * 128 + 128; kk += 32) {
+            uint32_t a[DW][4];
+#pragma unroll
+            for (int q = 0; q < DW; q++) {
+                const int8_t *w0 = wd + q * PW + (size_t)(m0 + g) * K + kk + t4 * 4, *w1 = w0 + (size_t)8 * K;
+                a[q][0] = *(const uint32_t *)w0; a[q][1] = *(const uint32_t *)w1; a[q][2] = *(const uint32_t *)(w0 + 16); a[q][3] = *(const uint32_t *)(w1 + 16);
+            }
+#pragma unroll
+            for (int t = 0; t < NT; t++) {
+                if (!live[t]) continue;
+                uint32_t b0[DX], b1[DX];
+#pragma unroll
+                for (int q = 0; q < DX; q++) { const int8_t *x = xd + q * PX + (size_t)(n0 + t * 8 + g) * K + kk + t4 * 4;
+                    b0[q] = *(const uint32_t *)x; b1[q] = *(const uint32_t *)(x + 16); }
+#pragma unroll
+                for (int pw = 0; pw < DW; pw++)
+#pragma unroll
+                    for (int px = 0; px < DX; px++) mma16832acc(P[pw + px][t], a[pw], b0[px], b1[px]);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+            if (!live[t]) continue;
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                __int128 S = 0;
+#pragma unroll
+                for (int s = 0; s < NS; s++) S += (__int128)P[s][t][i] << (7 * s);
+                size_t wi = (size_t)row[i] * KB + b, xi = (size_t)tok[t][i] * KB + b;
+                if (wl[wi] == -32768 || xl[xi] == -32768) continue;   // a zero block: its product is exactly 0, no bound (padding rows)
+                int e = wl[wi] + xl[xi] - lsb[t][i], nw = wn[wi], nx = xn[xi];
+                unsigned long long bound = ((unsigned long long)nx << (7 * DW - 1)) + ((unsigned long long)nw << (7 * DX - 1)) + min(nw, nx);
+                if (S) { if (e >= 0) acc[t][i] += S << e; else { tail[t][i]++; acc[t][i] += e > -127 ? S >> -e : (S < 0 ? -1 : 0); } }
+                if (bound) tail[t][i] += e >= 0 ? (unsigned __int128)bound << e : ((unsigned __int128)bound >> min(-e, 127)) + 1;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; t++) {
+        if (!live[t]) continue;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float r;
+            if (!cert_round(acc[t][i], tail[t][i], lsb[t][i], 1, 0, p, r)) { atomicAdd(nbad, 1); r = __int_as_float(0x7FC00000); }
+            Y[(size_t)tok[t][i] * M + row[i]] = r;
+        }
+    }
+}
 
 // The outputs bf16_gemm could not certify (NaN), recomputed exactly on the CUDA cores, one warp each: the GEMV's sum (every
 // product exact, a 128-bit window at the row's and token's top bits, truncated terms counted). The list comes from
@@ -221,10 +293,17 @@ constexpr int DW24 = 5, DX24 = 6;   // p = 24 (FP32 logits): 3 + 4 left most out
 // grid of 2^-9 times the scale, at most 26 bits, so 4 digits hold them exactly)
 static void bf16_gemm_p(int p, int dw, const int8_t *wd, const int16_t *wl, const uint8_t *wn, const int8_t *xd, const int16_t *xl,
                         const uint8_t *xn, float *Y, int M, int N, int K, int *nbad) {
-    dim3 g((M + 127) / 128, N / 8);
-    if (p == 24 && dw == 4) bf16_gemm<4, DX24><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
-    else if (p == 24) bf16_gemm<DW24, DX24><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
-    else bf16_gemm<DWN, DXN><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
+    static const bool k16 = getenv("OZ_K16");   // OZ_K16=1: the first kernel (m16n8k16, an accumulator per digit pair)
+    if (k16) { dim3 g((M + 127) / 128, N / 8);
+        if (p == 24 && dw == 4) bf16_gemm<4, DX24><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
+        else if (p == 24) bf16_gemm<DW24, DX24><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
+        else bf16_gemm<DWN, DXN><<<g, 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
+        return; }
+    auto go = [&](auto k1, auto k2) { if (N >= 64) k2<<<dim3((M + 127) / 128, (N + 15) / 16), 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad);
+                                        else k1<<<dim3((M + 127) / 128, N / 8), 256>>>(wd, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad); };
+    if (p == 24 && dw == 4) go(bf16_gemm2<4, DX24, 1>, bf16_gemm2<4, DX24, 2>);
+    else if (p == 24) go(bf16_gemm2<DW24, DX24, 1>, bf16_gemm2<DW24, DX24, 2>);
+    else go(bf16_gemm2<DWN, DXN, 1>, bf16_gemm2<DWN, DXN, 2>);
 }
 static int wdig(int p) { return p == 24 ? DW24 : DWN; }
 static int xdig(int p) { return p == 24 ? DX24 : DXN; }

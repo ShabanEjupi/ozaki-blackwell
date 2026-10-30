@@ -520,6 +520,8 @@ int main(int argc, char **argv) {
     // OZ_STEPS steps of AdamW (OZ_LR): step 1 at B = 0, then the adapters in the forward too
     const int STEPS = getenv("OZ_STEPS") ? atoi(getenv("OZ_STEPS")) : 1; const double LR = getenv("OZ_LR") ? atof(getenv("OZ_LR")) : 1e-4;
     PROJ = lora_proj; double prev = 0, predicted = 0;
+    GATT = getenv("OZ_GATT") ? atoi(getenv("OZ_GATT")) : 0;   // the forward's attention on the GPU FP64 units, bit for bit attend_p (jais_batch.cu)
+    if (GATT) gatt_init(R + RE);
     for (int st = st0 + 1; st <= st0 + STEPS; st++) {
         auto t0 = std::chrono::steady_clock::now(); t_back_mlp = t_back_att = 0;
         const auto seqs = batch(st); const auto tgt = targets(seqs);
