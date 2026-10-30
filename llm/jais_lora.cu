@@ -279,10 +279,11 @@ static void moe_back(const std::string &P, int L, const std::vector<float> &x2, 
     #pragma omp parallel for schedule(static)
     for (size_t r = 0; r < N; r++) gate_back(lg.data() + r * J_E, ex[r].data(), dw.data() + r * J_TOPK, dl.data() + r * J_E);
     dgrad({Wr}, {&dl}, N, dx2);
-    pmark(tm, "moe shared+router"); prof_dump(P.c_str());
+    pmark(tm, "moe shared+router");
 }
 static void back_layer(int L, const std::vector<float> &h, size_t N, std::vector<double> &g, Lora &lo) {
     auto t0 = std::chrono::steady_clock::now();
+    auto ta = t0;
     std::string P = "model.layers." + std::to_string(L) + ".";
     const size_t QD = (size_t)D_Q * D_HD, KVD = (size_t)D_KV * D_HD;
     // the attention half again: the forward's functions on the forward's values
@@ -292,9 +293,11 @@ static void back_layer(int L, const std::vector<float> &h, size_t N, std::vector
     auto q = lora_proj(L, 0, Wq, x1); rows_map(q, QD, [&](size_t r, std::vector<float> &v) { rope_part(v, D_Q, r % SEQ); });
     auto k = bmm(Wk, x1); rows_map(k, KVD, [&](size_t r, std::vector<float> &v) { rope_part(v, D_KV, r % SEQ); });
     auto v = lora_proj(L, 1, Wv, x1);
+    pmark(ta, "att qkv");
     std::vector<float> o(N * QD);
     #pragma omp parallel for schedule(dynamic)
     for (size_t r = 0; r < N; r++) attend_p(q.data() + r * QD, k.data() + r / SEQ * SEQ * KVD, v.data() + r / SEQ * SEQ * KVD, r % SEQ + 1, D_Q, D_KV, D_HD, o.data() + r * QD, false);
+    pmark(ta, "att recompute");
     std::vector<float> hp = h; add_rows(hp, bmm(Wo, o));
     auto x2 = norm_rows(hp, N2[L]);
     // the MLP half and its backward
@@ -311,16 +314,21 @@ static void back_layer(int L, const std::vector<float> &h, size_t N, std::vector
     std::vector<double> gh = g; norm_back(hp, N2[L], dx2, gh);   // dL/dh' = g + the MLP branch
     double tmlp = secs(t1); t_back_mlp += tmlp;
     // the attention backward
+    ta = std::chrono::steady_clock::now();
     std::vector<double> dO(N * QD, 0.0), dq, dk, dv; dgrad({Wo}, {&gh}, N, dO);
+    pmark(ta, "att dgrad o");
     dq.assign(N * QD, 0.0); dk.assign(N * KVD, 0.0); dv.assign(N * KVD, 0.0);
     for (size_t j = 0; j < N / SEQ; j++) {   // each sequence attends only to itself
         auto cut = [&](auto &a, size_t w) { return std::vector<typename std::decay_t<decltype(a)>::value_type>(a.begin() + j * SEQ * w, a.begin() + (j + 1) * SEQ * w); };
         std::vector<double> sq, sk, sv; attend_back(cut(q, QD), cut(k, KVD), cut(v, KVD), cut(dO, QD), SEQ, sq, sk, sv);
         std::copy(sq.begin(), sq.end(), dq.begin() + j * SEQ * QD); std::copy(sk.begin(), sk.end(), dk.begin() + j * SEQ * KVD); std::copy(sv.begin(), sv.end(), dv.begin() + j * SEQ * KVD);
     }
+    pmark(ta, "att back");
     #pragma omp parallel for schedule(static)
     for (size_t r = 0; r < N; r++) { rope_back(dq.data() + r * QD, D_Q, r % SEQ); rope_back(dk.data() + r * KVD, D_KV, r % SEQ); }
+    pmark(ta, "att rope_back");
     lo.dBq = lora_db(dq, QD, lora_h(lo.Aq, x1), N); lo.dBv = lora_db(dv, KVD, lora_h(lo.Av, x1), N);
+    pmark(ta, "att dB");
     std::vector<double> dx1(N * D_H, 0.0);
     if (lo.Bq.empty()) dgrad({Wq, Wk, Wv}, {&dq, &dk, &dv}, N, dx1);   // B = 0: G B = 0, no dA and no adapter term in dx1
     else {   // U = s G B; dA = U^T x; the adapters' share of dx1, U A, in the same product as q, k and v
@@ -329,9 +337,11 @@ static void back_layer(int L, const std::vector<float> &h, size_t N, std::vector
         DevW Aq = up(lo.Aq, RK, D_H, dLA[0]), Av = up(lo.Av, RK, D_H, dLA[1]);
         dgrad({Wq, Wk, Wv, Aq, Av}, {&dq, &dk, &dv, &Uq, &Uv}, N, dx1);
     }
+    pmark(ta, "att lora+dgrad qkv");
     norm_back(h, N1[L], dx1, gh);
     g.swap(gh);
     t_back_att += secs(t0) - tmlp;
+    prof_dump(P.c_str());
 }
 
 // ---- the loss and the backward of lm_head ---------------------------------------------------------------------------------

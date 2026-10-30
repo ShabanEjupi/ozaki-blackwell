@@ -15,6 +15,13 @@ Qëllimi: një GPU e zakonshme të punojë si një kartelë FP64 e qendrave të 
 > Kod me burim të dukshëm, **jo open source**: falas vetëm për studim privat (90 ditë) dhe kërkim akademik të hapur; çdo
 > përdorim tjetër kërkon licencë me pagesë; përdorimet e ndaluara të nenit 4 vlejnë për këdo.
 
+**Train a LoRA adapter of a 375B model on one laptop GPU / Trajno një adapter LoRA të një modeli 375B mbi një GPU laptopi**
+(within the license): `llm/train.sh <Jais-3-375B-A23B-FP8 dir> <documents.jsonl> <out dir>` -- the documents tokenized once,
+the model streamed from an NVMe disk layer by layer, every product of the forward and the backward correctly rounded on the
+INT8 tensor cores (so a run is reproducible bit for bit, and resumes bit for bit from its checkpoint), and after every run
+`<out>/adapter` as a PEFT adapter (`peft.PeftModel.from_pretrained(base, "<out>/adapter")`). Needs a CUDA 12.8 GPU of
+compute capability 12.0 (12 GB is enough), about 50 GB of RAM and the 375 GB checkpoint on a fast disk.
+
 ## Measured / Matur (15-10-2026, `bench/peak.cu`)
 
 | Unit | Throughput |

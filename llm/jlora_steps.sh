@@ -29,7 +29,7 @@ data=$C/public-2910.u32; [ -s $data ] || data=$C/sample.u32; b=8; fails=0
 while [ ! -e $T/STOP ]; do
     while [ -e /opt/ozaki/spex.want ]; do rm -f /opt/ozaki/chain.busy; sleep 60; done; touch /opt/ozaki/chain.busy
     until ac; do sleep 60; done
-    OZ_AHEAD=3 OZ_NEXT=1 OZ_BATCH=$b OZ_EVAL=2 OZ_STEPS=2 OZ_LR=1e-4 OZ_CKPT=$T/ckpt.bin ./out_jlora $J $data 1024 16 32 >> $T/train.log 2>> $T/train.err
+    OZ_AHEAD=3 OZ_GATT=1 OZ_NEXT=1 OZ_BATCH=$b OZ_EVAL=2 OZ_STEPS=2 OZ_LR=1e-4 OZ_CKPT=$T/ckpt.bin ./out_jlora $J $data 1024 16 32 >> $T/train.log 2>> $T/train.err
     rc=$?; log "train rc=$rc batch $b: $(grep -h 'loss\|time\|peak' $T/train.log | tail -6 | tr '\n' ' ')"
     if [ $rc != 0 ]; then fails=$((fails + 1)); [ $fails -ge 2 ] && { log "train: two failures, stop"; break; }; b=4; else fails=0; fi
 done
