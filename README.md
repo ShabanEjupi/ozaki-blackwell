@@ -8,6 +8,13 @@ Goal: make a consumer GPU behave like a data-center FP64 part.
 tensor core-t INT8 (skema Ozaki II: prodhime të sakta me numra të plotë + teorema kineze e mbetjeve), në CUDA C dhe PTX.
 Qëllimi: një GPU e zakonshme të punojë si një kartelë FP64 e qendrave të të dhënave.
 
+> **License / Licenca** — source-available under the [Ozaki-Blackwell Restricted Source License 1.0](LICENSE), **not open
+> source**: free only for private study (90 days) and open academic research; every other use -- any company or organization,
+> any product or service, publishing trained adapters or models -- needs a paid license. The prohibited uses of section 4
+> (interest, gambling, alcohol, images of living beings, music, weapons, surveillance...) bind every licensee.
+> Kod me burim të dukshëm, **jo open source**: falas vetëm për studim privat (90 ditë) dhe kërkim akademik të hapur; çdo
+> përdorim tjetër kërkon licencë me pagesë; përdorimet e ndaluara të nenit 4 vlejnë për këdo.
+
 ## Measured / Matur (15-10-2026, `bench/peak.cu`)
 
 | Unit | Throughput |

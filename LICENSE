@@ -1,0 +1,118 @@
+Ozaki-Blackwell Restricted Source License, version 1.0
+
+Copyright (c) 2026 Shaban Ejupi. All rights reserved, except the narrow permissions in section 2.
+
+This is NOT an open-source license. The source is published so that it can be read, checked and cited. Free use is
+limited to private study and open academic research; every other use needs a paid commercial license (section 8). The
+prohibited uses of section 4 bind everyone, commercial licensees included.
+
+1. Definitions
+
+"Software" means everything in this repository and in its history: source code, kernels, scripts, documentation, the
+paper, figures, measurements, and every binary built from any of them.
+
+"Licensor" means Shaban Ejupi.
+
+"You" means the natural person who obtains the Software. A company, partnership, foundation, association, public body,
+government, army or any other organization is never "You" under section 2, and neither is a person acting for one.
+
+"Output" means anything produced by running the Software or anything derived from it: trained adapters, model weights,
+checkpoints, gradients, digests, logs, benchmark numbers and any model or dataset made with their help.
+
+"Personal Study" means reading the Software and running it privately, on hardware You own, to learn how it works.
+
+"Academic Research" means non-commercial research by a person enrolled at or employed by an accredited university, not
+funded, directed or owned by a company, a government body or an army, whose results are published openly and in full.
+
+"Commercial Use" means every use that is not Personal Study or Academic Research, including: any use by or for an
+organization; use in or for a product, service, consultancy, hosted or cloud offering; training, tuning or evaluating
+models that are used, offered or shared beyond Personal Study or Academic Research; and any use that brings You or anyone
+else money, savings or any other advantage, directly or indirectly.
+
+2. The free permissions -- the only ones
+
+While You comply with every section of this license, and for no other purpose, You may:
+  (a) read the Software;
+  (b) for Personal Study: build it and run it on hardware You own, privately, for at most 90 days in total counted from
+      the first time You run any part of it;
+  (c) for Academic Research: build it and run it on hardware You own or that Your university provides, for the duration
+      of the research project, and publish the scientific results with the attribution of section 5.
+Nothing else is permitted. Rights not expressly granted are reserved.
+
+3. Restrictions
+
+You may not, and may not let or help anyone else:
+  (a) make any Commercial Use of the Software or of any Output;
+  (b) copy, publish, distribute, upload, sublicense, sell, rent, lend, host or give access to the Software or any part of
+      it, changed or not, except by linking to the Licensor's official repository;
+  (c) change the Software, translate it to another language or framework, or write code derived from it, except privately
+      for Academic Research, and never distribute or publish such changes or code;
+  (d) publish, share or distribute any Output -- for example a trained adapter or model on a model hub -- or use Output
+      outside Personal Study or Academic Research, without the Licensor's prior written permission;
+  (e) use the Software or any Output to build, improve or benchmark a product, library or service that competes with the
+      Software or with any offering of the Licensor;
+  (f) use the Software, its text or any Output as training, tuning or evaluation data for any machine-learning model or
+      dataset, including code assistants and language models;
+  (g) remove, change or hide any copyright, license or attribution notice;
+  (h) get around any limit of this license through a third party, a contractor, a subsidiary or a hosted service;
+  (i) use the Software or any Output for any prohibited use of section 4.
+
+4. Prohibited uses -- they bind everyone, every licensee included
+
+The Software and every Output must never be used for, in, or in support of:
+  (a) interest (riba), interest-bearing lending, credit or deposits, or credit scoring or pricing for such products;
+  (b) gambling, betting, lotteries, games of chance, or speculative products built on uncertainty (gharar);
+  (c) alcohol, narcotics, pork, or tobacco and vaping products;
+  (d) pornography, sexual or indecent content, or the promotion of immorality;
+  (e) generating, editing or animating images, video or 3D models of living beings, human or animal;
+  (f) producing, generating or promoting music;
+  (g) content that insults Allah, any prophet, or Islam;
+  (h) weapons, military or intelligence use, the surveillance, tracking or profiling of people, or face recognition;
+  (i) fraud, deception, disinformation, impersonation, deepfakes, harassment, or discrimination against any person;
+  (j) anything unlawful in the Republic of Kosovo or wherever the use takes place.
+
+5. Attribution
+
+Every permitted publication of results obtained with the Software must cite the Software as
+"Shaban Ejupi, ozaki-blackwell, https://git.spacecode.tech/shaban/ozaki-blackwell" and the accompanying paper, and must
+state that the Software is used under this license.
+
+6. Termination and unlicensed use
+
+Any breach of this license ends all permissions automatically and at once, without notice and without a period to cure.
+You must then stop every use and delete every copy of the Software and of the Output in Your possession or control.
+Any use beyond section 2 without a commercial license is Commercial Use; for it You owe the Licensor three times the
+commercial license fee that would have applied to the whole period and scope of that use, in addition to every other
+remedy the law gives the Licensor. Sections 3 to 12 survive termination.
+
+7. Patents
+
+No patent license is granted, except to the extent strictly needed to exercise section 2. That limited license ends if You
+make any patent claim against the Licensor or anyone else concerning the Software.
+
+8. Commercial licenses
+
+Every use outside section 2 -- every Commercial Use, every use by an organization, and every publication or use of Output
+beyond section 2 -- requires a separate written license from the Licensor, for a fee, on the Licensor's terms. The
+prohibited uses of section 4 are part of every such license. Write to: shaban.ejupi@student.uni-pr.edu
+
+9. Contributions
+
+The Licensor accepts no contribution unless its author first assigns its copyright to the Licensor in writing.
+
+10. No warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING ANY WARRANTY OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, OR NON-INFRINGEMENT.
+
+11. Limitation of liability
+
+TO THE EXTENT THE LAW ALLOWS, THE LICENSOR IS NOT LIABLE FOR ANY DAMAGE OF ANY KIND -- DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, CONSEQUENTIAL OR PUNITIVE -- ARISING FROM THE SOFTWARE, ITS OUTPUT, OR THIS LICENSE, EVEN IF ADVISED OF ITS
+POSSIBILITY.
+
+12. Law, courts and versions
+
+This license is governed by the law of the Republic of Kosovo. The courts of Prishtina have exclusive jurisdiction. If a
+provision is held unenforceable, it is limited to the minimum extent needed and the rest stays in force. The Licensor may
+publish new versions of this license; each release of the Software is governed by the version it carries.
