@@ -995,10 +995,27 @@ block, the headroom from the number of blocks) instead of the 125-bit one. Two u
   `bf16_gemm2` (17 734 of 7.3 M left to the fixup by both on the shared expert's gate), the product alone on 4096 tokens
   (`out_bgemm`, a training sharing the GPU): p 8 **26.1 -> 15.7 ms** (41 -> 69 TOPS of digit products), p 24 **48.7 -> 29.2 ms**
   (56 -> 93 TOPS).
+- *The experts' forward* (XF8, b49fbd3, 30-10 night): `fp8b_gemm`'s product -- W's E4M3 digits times the E4M3 bytes of
+  `act_fp8g`, each token's block of 128 with its FP32 scale -- in the same tiles. The block term (S s) sig is at most 2^75 times
+  its power of two: a 64 x 32 -> 128-bit product, shifted down into the 63-bit window. What the window cannot certify goes to
+  `f8x_fixup`, which recomputes it exactly as `fp8b_gemm` does (its 128-bit window and lsb), so every output, NaN or not, is
+  `fp8b_gemm`'s. `out_bgemm` on gate (1792 x 6144) and down (6144 x 1792) of layer 3 expert 0 and layer 40 expert 100,
+  p 8 and p 24: **0 outputs differ** of 72 K to 25 M each; the fixup takes ~0.01 % (339 of 25.2 M at 4096 tokens, p 24).
+  Product + fixup, the GPU shared with the training:
+
+  | tokens an expert | 40 | 48 | 64 | 128 | 256 | 432 (a training step's mean) | 4096 |
+  |---|---|---|---|---|---|---|---|
+  | gate, p 8 | 0.20 -> 0.26 ms | 0.27 -> 0.28 | 0.46 -> 0.29 | 0.60 -> 0.43 | 1.29 -> 0.92 | 1.79 -> 1.30 (1.38x) | -- |
+  | down, p 8 | 0.19 -> 0.20 ms | 0.26 -> 0.23 | 0.35 -> 0.25 | 0.63 -> 0.47 | 1.01 -> 0.78 | 1.72 -> 1.39 (1.23x) | 16.54 -> 11.85 (1.40x) |
+
+  Below ~48 tokens the 64 x 32 tile is mostly empty and `fp8b_gemm`'s 16 x 8 warps win by up to 0.06 ms a call -- about 0.1 s
+  of a 520 s pass, so there is no switch for it. In the training the forward pass's products went 221 -> 186 s (the pass
+  587 -> 524 s); a whole step, 1805.5 s (step 16) -> 1791.8 s (step 17), is within the noise of a laptop shared with other
+  work that night.
 
 The 4-layer tests keep their digests: 63e9904ca4c9d00f (128 tokens x 2) and 1dd8193b18cc200b (8 x 1024 + 2 held out), with
-`OZ_OLDK=1 OZ_HILO=1` (the kernels before) and without.
+`OZ_OLDK=1 OZ_HILO=1` (the kernels before) and without; `llm/jlora_test.sh` with the training's binary and with XF8 (`llm/xf8_check.sh`,
+which deployed it): the same losses and digests (63e9904ca4c9d00f; two steps 01251efec47ce820, ebab54c4741448eb; resumed: the same bytes).
 
 Where it stands / Ku është: the attention backward stays in FP64 on the host (the GPU `exp` is not glibc's, and the
-token-by-token model is the reference) and is now the largest share of the step; the experts' forward still uses
-`fp8b_gemm` (no shared memory, the 125-bit epilogue).
+token-by-token model is the reference) and is now the largest share of the step; every expert product now runs in the tiles.
