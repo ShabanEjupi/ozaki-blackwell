@@ -1,7 +1,7 @@
 # .hosts -- copy to .hosts (kept out of git) when the GPU is on another machine. Each function takes one shell command:
 #   oz_gpu: runs it in the GPU machine's Linux with stdin attached (wsl.sh pipes the source folder into it)
 #   oz_win: runs it on the GPU machine's Windows side (bench/energy_det_host.sh reads the RAPL counters there)
-#   oz_tex: runs it in this repository's paper/ folder on a machine with docker (paper/build.sh)
+#   oz_tex: runs it in this repository's paper/ folder (OZ_TEX_DIR: another, e.g. paper-lora) on a machine with docker (paper/build.sh)
 oz_gpu() { ssh gpu-box "timeout ${TIMEOUT:-580} bash -c \"$1\""; }
 oz_win() { ssh gpu-box-windows "$1"; }
-oz_tex() { ssh docker-box "cd ~/ozaki-blackwell/paper && $1"; }
+oz_tex() { ssh docker-box "cd ~/ozaki-blackwell/${OZ_TEX_DIR:-paper} && $1"; }
