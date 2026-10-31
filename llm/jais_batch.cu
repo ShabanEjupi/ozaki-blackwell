@@ -51,9 +51,36 @@ static void bmm_init(size_t maxMK, size_t maxK, size_t maxM) {
     CK(cudaMalloc(&g_xn, G_NB * maxK / 128)); CK(cudaMalloc(&g_Y, G_NB * maxM * 4));
     CK(cudaMalloc(&g_list, (size_t)G_CAP * 4)); CK(cudaMalloc(&g_lcnt, 4)); CK(cudaMalloc(&g_nb, 4));
 }
-static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y) {
+// A layer's input for its experts, on the GPU once: quant_fp8g works per row and group of 128, so a row's E4M3 bytes and
+// scales are the same in every expert's product, and each expert gathers its rows there (rows_up, then bmm with rdev)
+// instead of the host gathering them and bmm uploading and quantizing them again -- twice per expert, for gate and up.
+// g_rl: every expert's rows, one list after another (the device copy of the host list bmm's rhost points into).
+static uint8_t *g_rq; static float *g_rs; static int *g_rl; static size_t G_RQN, G_RLN;
+static void rows_up(const float *X, size_t N, int K, const std::vector<size_t> &rows) {
+    if (N * K > G_RQN) { if (g_rq) { CK(cudaFree(g_rq)); CK(cudaFree(g_rs)); } G_RQN = N * K; CK(cudaMalloc(&g_rq, G_RQN)); CK(cudaMalloc(&g_rs, G_RQN / 128 * 4)); }
+    if (rows.size() > G_RLN) { if (g_rl) CK(cudaFree(g_rl)); G_RLN = rows.size(); CK(cudaMalloc(&g_rl, G_RLN * 4)); }
+    for (size_t n0 = 0; n0 < N; n0 += G_NB) {
+        size_t n = std::min(G_NB, N - n0);
+        CK(cudaMemcpy(g_x, X + n0 * K, n * K * 4, cudaMemcpyHostToDevice));
+        quant_fp8g<<<1024, 256>>>(g_x, g_rq + n0 * K, g_rs + n0 * (K / 128), n * (K / 128));
+    }
+    std::vector<int> r(rows.begin(), rows.end()); CK(cudaMemcpy(g_rl, r.data(), r.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaGetLastError());
+}
+// chunk row i = layer row rows[i], as quant_fp8g left it; rows n .. np-1 are the zero rows bmm pads with (quant_fp8g of zeros)
+__global__ void gather_q(const uint8_t *rq, const float *rs, const int *rows, size_t n, size_t np, int K, uint8_t *q, float *s) {
+    int K16 = K / 16, KB = K / 128;
+    for (size_t i = blockIdx.x; i < np; i += gridDim.x) {
+        const uint4 *src = (const uint4 *)(rq + (i < n ? (size_t)rows[i] * K : 0)); uint4 *dst = (uint4 *)(q + i * K);
+        for (int k = threadIdx.x; k < K16; k += blockDim.x) dst[k] = i < n ? src[k] : make_uint4(0, 0, 0, 0);
+        for (int b = threadIdx.x; b < KB; b += blockDim.x) s[i * KB + b] = i < n ? rs[(size_t)rows[i] * KB + b] : fmaxf(0.f, 1e-10f) / 448.f;
+    }
+}
+// rdev, rhost: the rows of X (all rows of the layer, already on the GPU by rows_up) this product takes -- FP8 maps only
+static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y, const int *rdev = nullptr, const size_t *rhost = nullptr) {
     auto t0 = std::chrono::steady_clock::now(), tp = t0;
     int M = W.M, K = W.K, KB = K / 128; bool fp8 = W.fmt == F_E4M3B;
+    if (rdev && !fp8) { fprintf(stderr, "bmm: gathered rows only for FP8 maps\n"); exit(1); }
     auto ph = [&](const char *f8, const char *b8, const char *b24) { pmark(tp, fp8 ? f8 : p == 24 ? b24 : b8); };
     if (fp8) fp8_digits<<<1024, 256>>>((const uint8_t *)W.w, g_wd, (size_t)M * K);
     int dw = W.wd ? W.wd : wdig(p);
@@ -64,9 +91,12 @@ static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y) {
         size_t n = std::min(G_NB, N - n0), np = (n + 7) / 8 * 8; const float *x = X + n0 * K;
         size_t left;   // NaNs still in Y after the GPU: the host GEMV's rows (none, as a rule: then no scan)
         if (fp8) {
-            CK(cudaMemcpy(g_x, x, n * K * 4, cudaMemcpyHostToDevice));
-            if (np > n) CK(cudaMemset(g_x + n * K, 0, (np - n) * K * 4));
-            quant_fp8g<<<1024, 256>>>(g_x, g_xq, g_xs, np * KB);
+            if (rdev) gather_q<<<(unsigned)std::min<size_t>(np, 4096), 128>>>(g_rq, g_rs, rdev + n0, n, np, K, g_xq, g_xs);
+            else {
+                CK(cudaMemcpy(g_x, x, n * K * 4, cudaMemcpyHostToDevice));
+                if (np > n) CK(cudaMemset(g_x + n * K, 0, (np - n) * K * 4));
+                quant_fp8g<<<1024, 256>>>(g_x, g_xq, g_xs, np * KB);
+            }
             fp8_digits<<<1024, 256>>>(g_xq, g_xd, np * K); ph("f8 x", "", "");
             CK(cudaMemset(g_nb, 0, 4));
             if (OLDK8) {   // OZ_OLDK8=1: fp8b_gemm, the kernel before tgemm.cu's XF8 (the same outputs)
@@ -105,7 +135,8 @@ static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y) {
         }
         for (size_t r = 0; left && r < n; r++) {   // what is still NaN: the GEMV (beyond the fixup's list; FP8 outputs it could not certify)
             float *yr = y + r * M; if (!open[r]) continue; st_host++;
-            std::vector<float> xv(x + r * K, x + (r + 1) * K); auto g = gemv(W, fp8 ? act_fp8g(xv) : act_plain(xv), p, 0);
+            const float *xr = rhost ? X + rhost[n0 + r] * K : x + r * K;
+            std::vector<float> xv(xr, xr + K); auto g = gemv(W, fp8 ? act_fp8g(xv) : act_plain(xv), p, 0);
             for (int m = 0; m < M; m++) if (yr[m] != yr[m]) yr[m] = g[m];
         }
         ph("f8 gemv", "b8 gemv", "b24 gemv");
@@ -115,6 +146,10 @@ static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y) {
 }
 static std::vector<float> bmm(const DevW &W, const std::vector<float> &X, int p = 8) {
     size_t N = X.size() / W.K; std::vector<float> Y(N * W.M); bmm(W, X.data(), N, p, Y.data()); return Y;
+}
+// the n rows rhost[0 .. n) of X (rows_up put X on the GPU; rdev is the same list there)
+static std::vector<float> bmm(const DevW &W, const std::vector<float> &X, const int *rdev, const size_t *rhost, size_t n) {
+    std::vector<float> Y(n * W.M); bmm(W, X.data(), n, 8, Y.data(), rdev, rhost); return Y;
 }
 
 // ---- prompts and passes ----------------------------------------------------------------------------------------------------
@@ -294,13 +329,15 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
             for (const char *n : {"gate_proj", "up_proj", "down_proj"}) ahead.push(P + "mlp.shared_experts." + n + ".weight");
             if (L + 1 < NL) part0(L + 1);
             std::vector<double> acc(R * D_H, 0.0);
+            std::vector<size_t> rl, off(J_E);   // expert e's rows: rl[off[e] ..)
+            for (int e = 0; e < J_E; e++) { off[e] = rl.size(); for (auto &p : by[e]) rl.push_back(p.first); }
+            rows_up(x.data(), R, D_H, rl);
             for (int e = 0; e < J_E; e++) {   // ascending id, as the std::set of jais.cu: the same FP64 sum order per row
                 if (by[e].empty()) continue;
                 std::string EP = P + "mlp.experts." + std::to_string(e) + ".";
-                size_t n = by[e].size(); std::vector<float> xe(n * D_H);
-                for (size_t i = 0; i < n; i++) std::copy(x.begin() + by[e][i].first * D_H, x.begin() + (by[e][i].first + 1) * D_H, xe.begin() + i * D_H);
-                W = fp8w(EP + "gate_proj", J_MFF, D_H); auto g = bmm(W, xe);
-                W = fp8w(EP + "up_proj", J_MFF, D_H); g = swiglu_rows(g, bmm(W, xe));
+                size_t n = by[e].size(); const int *rd = g_rl + off[e]; const size_t *rh = rl.data() + off[e];
+                W = fp8w(EP + "gate_proj", J_MFF, D_H); auto g = bmm(W, x, rd, rh, n);
+                W = fp8w(EP + "up_proj", J_MFF, D_H); g = swiglu_rows(g, bmm(W, x, rd, rh, n));
                 W = fp8w(EP + "down_proj", D_H, J_MFF); auto d = bmm(W, g);
                 #pragma omp parallel for schedule(static)
                 for (size_t i = 0; i < n; i++) { double w = by[e][i].second; double *a = acc.data() + by[e][i].first * D_H; const float *dd = d.data() + i * D_H;

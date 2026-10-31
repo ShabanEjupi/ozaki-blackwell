@@ -450,16 +450,17 @@ static void moe_back(const std::string &P, int L, const std::vector<float> &x2, 
     std::vector<std::vector<std::pair<size_t, int>>> by(J_E);   // expert -> (row, slot)
     for (size_t r = 0; r < N; r++) for (int i = 0; i < J_TOPK; i++) by[ex[r][i]].push_back({r, i});
     std::vector<double> dw(N * J_TOPK, 0.0);   // dL/d(routing weight)
+    std::vector<size_t> rl, off(J_E);   // expert e's rows: rl[off[e] ..), on the GPU with x2 (rows_up)
+    for (int e = 0; e < J_E; e++) { off[e] = rl.size(); for (auto &p : by[e]) rl.push_back(p.first); }
+    rows_up(x2.data(), N, D_H, rl);
     pmark(tm, "moe route");
     for (int e = 0; e < J_E; e++) {   // ascending id: each row's sum of its experts' dx in one order
         if (by[e].empty()) continue;
         std::string EP = P + "mlp.experts." + std::to_string(e) + ".";
-        size_t n = by[e].size(); std::vector<float> xe(n * D_H);
-        for (size_t i = 0; i < n; i++) std::copy(x2.begin() + by[e][i].first * D_H, x2.begin() + (by[e][i].first + 1) * D_H, xe.begin() + i * D_H);
-        pmark(tm, "moe gather");
+        size_t n = by[e].size(); const int *rd = g_rl + off[e]; const size_t *rh = rl.data() + off[e];
         DevW Wg = fp8w_to(EP + "gate_proj", J_MFF, D_H, 0), Wu = fp8w_to(EP + "up_proj", J_MFF, D_H, 1), Wd = fp8w_to(EP + "down_proj", D_H, J_MFF, 2);
         pmark(tm, "moe load");
-        auto gg = bmm(Wg, xe), uu = bmm(Wu, xe), y = bmm(Wd, swiglu_rows(gg, uu));
+        auto gg = bmm(Wg, x2, rd, rh, n), uu = bmm(Wu, x2, rd, rh, n), y = bmm(Wd, swiglu_rows(gg, uu));
         pmark(tm, "moe forward");
         std::vector<double> dy(n * D_H);
         #pragma omp parallel for schedule(static)
