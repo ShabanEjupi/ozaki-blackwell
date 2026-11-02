@@ -187,8 +187,8 @@ last checkpoint.
 \caption{The step is a function of its inputs.}\label{tab:verify}
 \begin{tabular}{p{9.2cm}p{5.4cm}}\toprule
 test & result \\\midrule
-step 1 of the 61-layer model, 1\,024 tokens: 4\,096 vs 40 rows per product, 24 vs 7 threads$^{*}$ & 122 $dB$ files
-byte-identical; $dB$, $dA$ and $g_0$ digests identical \\
+step 1 of the 61-layer model, 1\,024 tokens: 4\,096 vs 40 rows per product, 24 vs 7 threads, every output exact
+(2 November) & 122 $dB$ files byte-identical; $dB$, $dA$ and $g_0$ digests identical; $dB$ as on 29--30 October$^{*}$ \\
 2 steps in one run vs 1 + 1 resumed from the checkpoint (4 layers) & checkpoints byte-identical \\
 three generations of product kernels (\texttt{bf16\_gemm2} vs tiled; $[dY|dY][W_{hi};W_{lo}]$ vs E4M3 digits; reference FP8
 kernel vs tiled), 4 layers & digests \texttt{63e9904ca4c9d00f} (128 tokens $\times$ 2) and \texttt{1dd8193b18cc200b}
@@ -200,8 +200,8 @@ superaccumulator agree \\
 attention backward, GPU vs host (6, 45, 131, 1\,024 tokens) & bit for bit \\
 outputs used uncertified in the training & 0 since step 5; 2, 5, 6 and 9 in steps 1--4, before the host superaccumulator
 (which has since finished 0--17 outputs a step, 60 in 121 steps) \\\bottomrule
-\multicolumn{2}{p{14.8cm}}{\footnotesize $^{*}$29--30 October, before the host superaccumulator: in each run 3 outputs of
-that step were used uncertified, and the digests still agree.}
+\multicolumn{2}{p{14.8cm}}{\footnotesize $^{*}$the same test on 29--30 October, before the host superaccumulator, used 3 outputs uncertified in
+each run: its $dB$ digest (\texttt{f0865bb95f43be2d}) is the exact run's, its $g_0$ digest is not.}
 \end{tabular}
 \end{table}
 
