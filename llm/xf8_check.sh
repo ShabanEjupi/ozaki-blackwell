@@ -34,5 +34,4 @@ log "4 layers, training's binary: $(keep xf8.old | tr '\n' ' ')"
 log "4 layers, XF8: $(keep xf8.new | tr '\n' ' ')"
 if ! diff <(keep xf8.old) <(keep xf8.new) > /dev/null || ! grep -q 'resume: same bytes' xf8.new || grep -q 'rc=[1-9]' xf8.new; then bad=$((bad + 1)); log "4 layers DIFFER"; fi
 if [ $bad != 0 ]; then log "NOT deployed: $bad checks failed"; exit 1; fi
-cp $R/out_jlora $R/out_jlora.pre-xf8   # (/opt/ozaki/src/.version is the last wsl.sh tree, not always the binary's)
-cp out_jlora_new $R/out_jlora.xf8 && mv -f $R/out_jlora.xf8 $R/out_jlora && log "deployed: $R/out_jlora = $(cat .version | tr '\n' ' ') (old: out_jlora.pre-xf8)"
+. llm/deploy_bin.sh; deploy_bin out_jlora_new xf8

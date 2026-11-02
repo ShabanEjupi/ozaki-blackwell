@@ -41,5 +41,4 @@ for b in old new; do
 done
 [ "$(grep -h 'dB digest' $T/prof_old.log | cut -d';' -f1)" = "$(grep -h 'dB digest' $T/prof_new.log | cut -d';' -f1)" ] || { bad=$((bad + 1)); log "timed step: digests DIFFER"; }
 if [ $bad != 0 ]; then log "NOT deployed: $bad checks failed"; exit 1; fi
-cp $R/out_jlora $R/out_jlora.pre-rows
-cp out_jlora_new $R/out_jlora.rows && mv -f $R/out_jlora.rows $R/out_jlora && log "deployed: $R/out_jlora = $(cat .version | tr '\n' ' ') (old: out_jlora.pre-rows)"
+. llm/deploy_bin.sh; deploy_bin out_jlora_new rows
