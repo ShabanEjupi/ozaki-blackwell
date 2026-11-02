@@ -30,6 +30,7 @@
 #include <functional>
 #include <numeric>
 #include <sys/stat.h>
+#include <malloc.h>
 
 static uint64_t sm64(uint64_t x) {
     x += 0x9E3779B97F4A7C15ULL; x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL; x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL; return x ^ (x >> 31);
@@ -746,6 +747,10 @@ static int dg_test(int L, int e, size_t N) {
 }
 
 int main(int argc, char **argv) {
+    // 02-11: the MoE backward allocates ~70 MB of vectors per expert (dy, da, dxe, Y, xb) and frees them, 192 x 58 times a
+    // step; with glibc's defaults the top of the heap goes back to the kernel each time and the next expert faults and zeroes
+    // the pages again. Freed memory stays in the heap instead (no trim; mmap only above 32 MB). OZ_TRIM=1: glibc's defaults.
+    if (!getenv("OZ_TRIM")) { mallopt(M_MMAP_THRESHOLD, 32 << 20); mallopt(M_TRIM_THRESHOLD, -1); }
     if (argc > 2 && !strcmp(argv[1], "--selftest")) { DIR = argv[2]; MOE = jais_init(); return back_selftest(); }
     if (argc > 2 && !strcmp(argv[1], "--dgtest")) { DIR = argv[2]; MOE = jais_init();
         return dg_test(argc > 3 ? atoi(argv[3]) : 3, argc > 4 ? atoi(argv[4]) : 0, argc > 5 ? atol(argv[5]) : 341); }
