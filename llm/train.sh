@@ -18,5 +18,5 @@ while [ ! -e "$O/STOP" ] && { [ "$RUNS" = 0 ] || [ $run -lt "$RUNS" ]; }; do
     OZ_AHEAD=${OZ_AHEAD:-3} OZ_GATT=${OZ_GATT:-1} OZ_NEXT=1 OZ_BATCH=${OZ_BATCH:-8} OZ_EVAL=${OZ_EVAL:-2} OZ_STEPS=${OZ_STEPS:-2} \
         OZ_LR=${OZ_LR:-1e-4} OZ_CKPT="$O/ckpt.bin" ./out_jlora "$J" "$O/data.u32" 1024 16 32 >> "$O/train.log" 2>> "$O/train.err"
     python3 -I llm/lora_export.py "$O/ckpt.bin" "$O/adapter" 32
-    run=$((run + 1)); grep -h 'held-out loss\|time' "$O/train.log" | tail -2
+    run=$((run + 1)); grep -a -h 'held-out loss\|time' "$O/train.log" | tail -2
 done
