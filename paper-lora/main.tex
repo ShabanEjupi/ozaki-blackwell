@@ -3,7 +3,9 @@
 % public-2910.json, the checkpoint's config.json and safetensors headers, ../README.md for the kernel timings; ranges are
 % min-max over every step the sentence covers, sizes in GB = 1e9 bytes, memory in GiB (VmHWM). The 31-10 draft had seven
 % numbers wrong (ranges from a subset of steps, MiB read as GB, an untraceable slope, a 61-layer finite-difference claim that
-% the measurement contradicts). The related work was checked against the papers themselves on 31-10-2026.
+% the measurement contradicts). The training runs 2 steps a process and its logs printed the process's running totals of
+% uncertified and host-finished outputs at the 2nd step; the per-step counts here subtract them at the process boundaries
+% (train.err "checkpoint ...: N steps done"); binaries from 41fac68+1 print per-step counts. The related work was checked against the papers themselves on 31-10-2026.
 % Build: ./build.sh (docker texlive, here or where oz_tex of ../.hosts runs)
 \documentclass[11pt]{article}
 \usepackage[T1]{fontenc}
@@ -196,8 +198,8 @@ an expert's rows gathered on the host vs on the GPU, 4 layers, one and two steps
 experts' $dX$, old vs new kernel (layer 3, expert 0, 341 tokens) & 0 outputs differ; 4\,096 checked against the
 superaccumulator agree \\
 attention backward, GPU vs host (6, 45, 131, 1\,024 tokens) & bit for bit \\
-outputs used uncertified in the training & 0 since step 5; 2, 7, 6 and 15 in steps 1--4, before the host superaccumulator
-(which has since finished 0--22 outputs a step) \\\bottomrule
+outputs used uncertified in the training & 0 since step 5; 2, 5, 6 and 9 in steps 1--4, before the host superaccumulator
+(which has since finished 0--17 outputs a step, 60 in 121 steps) \\\bottomrule
 \multicolumn{2}{p{14.8cm}}{\footnotesize $^{*}$29--30 October, before the host superaccumulator: in each run 3 outputs of
 that step were used uncertified, and the digests still agree.}
 \end{tabular}

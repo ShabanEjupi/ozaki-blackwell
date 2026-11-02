@@ -266,6 +266,9 @@ static void gatt(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
 // one pass: rows (sequence, position), in increasing position within a sequence; logits for the rows marked in want
 static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>> &rows, const std::vector<bool> &want) {
     auto t0 = std::chrono::steady_clock::now(); double d0 = t_disk, b0 = bytes_disk, g0 = t_gemm, a0 = t_att;
+    // the counts printed at the end are this pass's (02-11: they were the process's totals beside per-pass times, so a second
+    // pass in one process reported its own fixups plus everything before it)
+    const long long fx0 = st_fix, f80 = st_fix8, fo0 = st_fixopen, ho0 = st_host, su0 = st_sup, ba0 = st_bad;
     size_t R = rows.size(), QD = (size_t)D_Q * D_HD, KVD = (size_t)D_KV * D_HD;
     auto part0 = [&](int L) {   // read-ahead (OZ_AHEAD): a layer's tensors before routing, in the order they are used
         std::string P = "model.layers." + std::to_string(L) + ".";
@@ -377,7 +380,7 @@ static void pass(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     fprintf(stderr, "pass %zu rows: %.1f s (disk %.1f s, %.1f GB; products %.1f s; attention %.1f s %s), fixup %lld + FP8 %lld (open %lld), host GEMV rows %lld, finished on the host %lld, uncertified %lld%s\n",
             R, sec, t_disk - d0, (bytes_disk - b0) / 1e9, t_gemm - g0, t_att - a0, GATT == 1 ? "GPU" : GATT ? "GPU + host" : "host",
-            st_fix, st_fix8, st_fixopen, st_host, st_sup, st_bad, GATT == 2 ? (", attention outputs differing GPU/host " + std::to_string(st_attdiff)).c_str() : "");
+            st_fix - fx0, st_fix8 - f80, st_fixopen - fo0, st_host - ho0, st_sup - su0, st_bad - ba0, GATT == 2 ? (", attention outputs differing GPU/host " + std::to_string(st_attdiff)).c_str() : "");
 }
 
 // the device buffers, lm_head, the norms and router biases of the NL layers (after jais_init; also jais_lora.cu's)

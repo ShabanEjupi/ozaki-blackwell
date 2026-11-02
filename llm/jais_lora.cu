@@ -829,6 +829,7 @@ int main(int argc, char **argv) {
     if (GATT) gatt_init(R + RE);
     for (int st = st0 + 1; st <= st0 + STEPS; st++) {
         auto t0 = std::chrono::steady_clock::now(); t_back_mlp = t_back_att = 0;
+        const long long bad0 = st_bad, sup0 = st_sup;   // this step's counts (02-11: the second step of a run printed both steps')
         const auto seqs = batch(st); const auto tgt = targets(seqs);
         std::vector<BSeq> S(seqs.size() + evs.size()); std::vector<std::pair<int, size_t>> rows;
         for (size_t j = 0; j < S.size(); j++) { auto &s = S[j]; s.prompt = j; s.toks = j < seqs.size() ? seqs[j] : evs[j - seqs.size()]; s.plen = N; s.end = N;
@@ -858,7 +859,7 @@ int main(int argc, char **argv) {
         uint64_t dig = 1469598103934665603ULL, dia = dig;
         for (int L = 0; L < NL; L++) { dig = fnv(dig, lo[L].dBq); dig = fnv(dig, lo[L].dBv); dia = fnv(dia, lo[L].dAq); dia = fnv(dia, lo[L].dAv); }
         printf("step %d dB digest %016llx, dA digest %016llx, g_0 digest %016llx; hi/lo splits not exact %d; uncertified %lld (finished on the host %lld)\n", st,
-               (unsigned long long)dig, (unsigned long long)dia, (unsigned long long)fnvd(1469598103934665603ULL, g), tb, st_bad, st_sup);
+               (unsigned long long)dig, (unsigned long long)dia, (unsigned long long)fnvd(1469598103934665603ULL, g), tb, st_bad - bad0, st_sup - sup0);
         if (st == 1) {
             std::vector<uint64_t> SEEDS{DSEED};
             if (const char *f = getenv("OZ_DSEEDS")) { SEEDS.clear(); std::stringstream ss(f); std::string t; while (std::getline(ss, t, ',')) SEEDS.push_back(strtoull(t.c_str(), 0, 0)); }
