@@ -963,8 +963,8 @@ rrumbullakohet saktë, prandaj hapi s'varet nga grupimi i rreshtave, fijet apo n
 | reproducibility: step 1 of the 61-layer model, 4096 vs 40 rows per product, 24 vs 7 threads | 122 dB files byte-identical; dB, dA, g₀ digests identical |
 | resume: 2 steps at once vs 1 + 1 from the checkpoint (4 layers) | checkpoints byte-identical |
 | first-order check of the gradient: loss change of each update vs its prediction (1024 tokens) | −0.04588 / −0.02731 vs −0.04135 / −0.03288 |
-| training on the public Kosovo corpus (187 437 sequences, 191.9 M tokens), 8 × 1024 tokens a step, 2 sequences held out | held-out loss 1.51019 → 1.50738 → 1.50570 → 1.50056 (steps 1–4) |
-| outputs used uncertified | 2–7 a step before 30-10 → **0** (below) |
+| training on the public Kosovo corpus (21 institutions, 187 437 sequences, 191.9 M tokens), 8 × 1024 tokens a step, 2 sequences held out | held-out loss 1.51019 (step 1) → 1.46337 (16) → 1.43865 (50) → **1.40664 (101)**, 1.4066–1.4165 through step 125; 1 603–1 716 s a step (22–125) |
+| outputs used uncertified | 2, 5, 6, 9 in steps 1–4 (before the host superaccumulator) → **0** from step 5 (below; the logs printed a 2-step run's running totals at its 2nd step until 091d7a4) |
 
 30-10-2026: three changes, each bit-exact on the 4-layer test (dB digest unchanged), measured on 8 × 1024 tokens + 2 held out:
 - *Every output exact.* The GEMV and the CUDA-core fixup anchored their 125-bit window at max |w| + max |x| of a row; where
