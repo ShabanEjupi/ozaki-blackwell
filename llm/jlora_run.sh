@@ -13,6 +13,10 @@ log "waiting: SPEX, ozaki-job, AC"
 # and this loop would have waited for it forever): every process that set it is gone
 if [ -e /opt/ozaki/chain.busy ] && [ "$(stat -c %Y /opt/ozaki/chain.busy)" -lt $(( $(date +%s) - $(cut -d. -f1 /proc/uptime) )) ]; then
     log "stale chain.busy ($(date -r /opt/ozaki/chain.busy '+%F %T'), before this boot) removed"; rm -f /opt/ozaki/chain.busy; fi
+# the same for spex.want (02-11): a measurement or the voice job that held it died with the boot, and jlora_steps.sh would
+# yield to it forever
+if [ -e /opt/ozaki/spex.want ] && [ "$(stat -c %Y /opt/ozaki/spex.want)" -lt $(( $(date +%s) - $(cut -d. -f1 /proc/uptime) )) ]; then
+    log "stale spex.want ($(date -r /opt/ozaki/spex.want '+%F %T'): $(head -c 40 /opt/ozaki/spex.want), before this boot) removed"; rm -f /opt/ozaki/spex.want; fi
 while pgrep -x out_spex > /dev/null || [ "$(pw '(Get-ScheduledTask -TaskName ozaki-job).State')" = Running ] || ! ac || [ -e /opt/ozaki/chain.busy ]; do sleep 60; done
 touch /opt/ozaki/chain.busy; pw 'Disable-ScheduledTask -TaskName model-lokal | Out-Null; Get-Process ollama -ErrorAction SilentlyContinue | Stop-Process -Force'
 log "start ($(git -C $B rev-parse --short HEAD 2>/dev/null || cat $B/.version 2>/dev/null))"

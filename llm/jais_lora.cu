@@ -35,8 +35,13 @@ static uint64_t sm64(uint64_t x) {
     x += 0x9E3779B97F4A7C15ULL; x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL; x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL; return x ^ (x >> 31);
 }
 static double EPS; static uint64_t DSEED = 0xD1CEULL;
-static void perturb(std::vector<float> &h) {   // h -> BF16(h + EPS d), d_i = +-1
-    for (size_t i = 0; i < h.size(); i++) h[i] = bf((double)h[i] + EPS * ((sm64(i ^ DSEED) & 1) ? 1.0 : -1.0));
+// Seed 0 is the direction d = sign(g_0) of a step run (OZ_GSIGN=<file>: that run writes it, the OZ_EPS runs read it).
+// A seeded +-1 direction predicts L(+e) - L(-e) ~ e |g_0|_2, below the forward's BF16 rounding noise through all 61
+// layers (30-10: both directions measured with the opposite sign); sign(g_0) predicts ~ 2 e |g_0|_1, ~sqrt(n) times more.
+static std::vector<int8_t> GSIGN;
+static double dir(size_t i, uint64_t sd) { return sd ? ((sm64(i ^ sd) & 1) ? 1.0 : -1.0) : (i < GSIGN.size() ? GSIGN[i] : 0); }
+static void perturb(std::vector<float> &h) {   // h -> BF16(h + EPS d)
+    for (size_t i = 0; i < h.size(); i++) h[i] = bf((double)h[i] + EPS * dir(i, DSEED));
 }
 
 // ---- transposed weights for dX = dY W -------------------------------------------------------------------------------------
@@ -778,6 +783,11 @@ int main(int argc, char **argv) {
     RK = argc > 4 ? atoi(argv[4]) : 16; double alpha = argc > 5 ? atof(argv[5]) : 32; SC = alpha / RK;
     std::string out = argc > 6 ? argv[6] : "";
     EPS = getenv("OZ_EPS") ? atof(getenv("OZ_EPS")) : 0; if (getenv("OZ_DSEED")) DSEED = strtoull(getenv("OZ_DSEED"), 0, 0); std::vector<double> FDEPS;
+    const char *gsf = getenv("OZ_GSIGN");
+    if (EPS && !DSEED) {   // the sign direction: read what the step run wrote
+        FILE *f = gsf ? fopen(gsf, "rb") : nullptr; if (!f) { fprintf(stderr, "OZ_DSEED=0 needs OZ_GSIGN=<file of a step run>\n"); return 1; }
+        fseek(f, 0, SEEK_END); GSIGN.resize(ftell(f)); fseek(f, 0, SEEK_SET);
+        if (fread(GSIGN.data(), 1, GSIGN.size(), f) != GSIGN.size()) { fprintf(stderr, "short read %s\n", gsf); return 1; } fclose(f); }
     if (const char *f = getenv("OZ_FDEPS")) { std::stringstream ss(f); std::string t; while (std::getline(ss, t, ',')) FDEPS.push_back(atof(t.c_str())); }
     MOE = jais_init(); NL = MOE.size();
     if (getenv("OZ_NL")) { NL = std::min(NL, atoi(getenv("OZ_NL"))); MOE.resize(NL); }
@@ -852,11 +862,18 @@ int main(int argc, char **argv) {
         if (st == 1) {
             std::vector<uint64_t> SEEDS{DSEED};
             if (const char *f = getenv("OZ_DSEEDS")) { SEEDS.clear(); std::stringstream ss(f); std::string t; while (std::getline(ss, t, ',')) SEEDS.push_back(strtoull(t.c_str(), 0, 0)); }
+            if (gsf) {   // sign(g_0) for the seed-0 runs; |g_0|_1 and the share of nonzero entries say what it predicts
+                GSIGN.resize(g.size()); size_t nz = 0; double l1 = 0;
+                for (size_t i = 0; i < g.size(); i++) { GSIGN[i] = (g[i] > 0) - (g[i] < 0); nz += GSIGN[i] != 0; l1 += fabs(g[i]); }
+                FILE *f = fopen(gsf, "wb"); fwrite(GSIGN.data(), 1, GSIGN.size(), f); fclose(f);
+                printf("sign direction: %s, %zu of %zu entries nonzero, |g_0|_1 %.6e, |g_0|_2 %.6e\n", gsf, nz, g.size(), l1, norm2(g));
+            }
             for (uint64_t sd : SEEDS) for (double e : FDEPS) {   // the predicted L(+e) - L(-e) for the moves the OZ_EPS runs make
-                double pr = 0; const auto &h0 = HS[0];
-                for (size_t i = 0; i < h0.size(); i++) { double d = (sm64(i ^ sd) & 1) ? 1.0 : -1.0;
-                    pr += g[i] * ((double)bf((double)h0[i] + e * d) - (double)bf((double)h0[i] - e * d)); }
-                printf("predicted seed %llu L(+%g) - L(-%g) = %.9e\n", (unsigned long long)sd, e, e, pr);
+                if (!sd && GSIGN.empty()) continue;
+                double pr = 0; const auto &h0 = HS[0]; size_t moved = 0;
+                for (size_t i = 0; i < g.size() && i < h0.size(); i++) { double d = dir(i, sd), up = bf((double)h0[i] + e * d), dn = bf((double)h0[i] - e * d);
+                    pr += g[i] * (up - dn); moved += up != dn; }
+                printf("predicted seed %llu L(+%g) - L(-%g) = %.9e (%zu entries move)\n", (unsigned long long)sd, e, e, pr, moved);
             }
             if (!out.empty()) for (int L = 0; L < NL; L++) for (int w = 0; w < 2; w++) {
                 std::string fn = out + "/dB" + (w ? "v_" : "q_") + std::to_string(L) + ".f32"; FILE *f = fopen(fn.c_str(), "wb");
