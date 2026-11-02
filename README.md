@@ -20,7 +20,7 @@ Qëllimi: një GPU e zakonshme të punojë si një kartelë FP64 e qendrave të 
 the model streamed from an NVMe disk layer by layer, every product of the forward and the backward correctly rounded on the
 INT8 tensor cores (so a run is reproducible bit for bit, and resumes bit for bit from its checkpoint), and after every run
 `<out>/adapter` as a PEFT adapter (`peft.PeftModel.from_pretrained(base, "<out>/adapter")`). Needs a CUDA 12.8 GPU of
-compute capability 12.0 (12 GB is enough), about 50 GB of RAM and the 375 GB checkpoint on a fast disk.
+compute capability 12.0 (12 GB is enough), about 50 GB of RAM and the 391 GB checkpoint (390 599 656 950 bytes) on a fast disk.
 
 ## Measured / Matur (15-10-2026, `bench/peak.cu`)
 
@@ -648,16 +648,19 @@ and chemical plants.
 | fidap026 | 2163 | 74195 | 4.7e18 | 153 | 194835 | 2.12 | > 7200 |  | -- | ok | 0.0 (1568) | 0.0 (1530) |
 | mhd3200a | 3200 | 68026 | 6.5e39 | 130 | 186119 | 4.02 | 1290.8 | 321x | yes | ok | 0.0 (2876) | 0.0 (2768) |
 | fidap014 | 3251 | 65747 | 2.6e16 | 124 | 256431 | 4.74 | > 7200 |  | -- | ok | 7.6 (0) | 8.0 (0) |
-| lns_3937 | 3937 | 25407 | 1.0e17 | 79 | 195969 | 4.31 | -- |  | -- | ok | 10.1 (2) | 7.4 (1) |
-| fidap012 | 3973 | 79017 | 2.2e20 | 119 | 271165 | 7.44 | -- |  | -- | ok | 0.0 (483) | 0.0 (482) |
-| mhd4800a | 4800 | 102252 | 3.2e47 | 131 | 281770 | 34.39 | -- |  | -- | ok | 0.0 (3923) | 0.0 (4754) |
-| sherman3 | 5005 | 20033 | 6.9e16 | 102 | 170131 | 14.25 | -- |  | -- | ok | 11.8 (0) | 12.4 (0) |
+| lns_3937 | 3937 | 25407 | 1.0e17 | 79 | 195969 | 4.31 | 5475.3 ᵃ | 1270x | yes | ok | 10.1 (2) | 7.4 (1) |
+| fidap012 | 3973 | 79017 | 2.2e20 | 119 | 271165 | 7.44 | 10422.9 ᵇ | 1401x | yes | ok | 0.0 (483) | 0.0 (482) |
+| mhd4800a | 4800 | 102252 | 3.2e47 | 131 | 281770 | 34.39 | 4341.4 ᵇ | 126x | yes | ok | 0.0 (3923) | 0.0 (4754) |
+| sherman3 | 5005 | 20033 | 6.9e16 | 102 | 170131 | 14.25 | 13517.7 ᶜ | 949x | yes | ok | 11.8 (0) | 12.4 (0) |
 | fidapm15 | 9287 | 96099 | 1.36e20 | 63 | 510845 | 78.66 | -- |  | -- | ok | 0.0 (2251) | 0.0 (5260) |
 | cry10000 | 10000 | 49699 | 6.9e20 | 76 | 574553 | 115.02 | -- |  | -- | ok | 4.2 (66) | 1.6 (923) |
 
 GPU s: A⁻¹ + lifting + reconstruction + all numerators (the determinant's det/d step apart; where it needs more than the
 ~78 000 bits the 16-bit primes give, it is reported as not computed — the solution does not depend on it). SPEX ran in the
-night after the GPU pass (CPU alone), limit 2 h each.
+night after the GPU pass (CPU alone), limit 2 h each; ᵃ 3 h limit, beside the 290 GB K2-Think-V2 download (27-10);
+ᵇ 3 h limit, the night of 28/29-10 after the GPU jobs; ᶜ 8 h limit, the machine otherwise idle (31-10 11:35–15:24; 14 141.6 s
+and 14 369.0 s on 29-10 and 30-10 beside light load). Every finished SPEX digest equals the GPU's (`/opt/ozaki/real/*/gpu.log`,
+`spex*.log`). fidapm07, fidap026, fidap014: 8 h on an idle machine, one a night from 02-11 (`llm/night_checks.sh`).
 
 What the table says: on **7 of 13 real systems FP64 has not one correct digit** — LAPACK and SuperLU alike, with the right
 order of magnitude only by accident (mhd3200a / mhd4800a: normwise error 10⁸, 82–99 % of the entries without a correct digit) —
@@ -944,14 +947,14 @@ plotësisht i hapur s'e kalon Ultra-n sot.
 
 ## LoRA training of Jais-3-375B from disk, every product exact / Trajnim LoRA i Jais-3-375B nga disku, çdo produkt i saktë (29–30-10-2026, `llm/jais_lora.cu`, `llm/train.sh`)
 
-**EN** — Rank-16 LoRA on q_proj and v_proj of all 61 layers (58 MoE, 192 FP8 experts) of Jais-3-375B-A23B-FP8, the 375 GB
+**EN** — Rank-16 LoRA on q_proj and v_proj of all 61 layers (58 MoE, 192 FP8 experts) of Jais-3-375B-A23B-FP8, the 391 GB
 checkpoint streamed from an NVMe disk once per forward and once per backward, on the laptop's 12 GB GPU. Every linear map of
 the forward and of the backward is one product on the INT8 tensor cores with every output correctly rounded; the gradient
 through an FP8 expert is exact (an E4M3 weight times its block scale splits exactly into two BF16 numbers), never quantized.
 Because every output is the unique correctly rounded value, a step does not depend on how rows are batched, cut into products
 or spread over threads, and a resumed run equals an uninterrupted one byte for byte.
 
-**SQ** — LoRA me rang 16 mbi q_proj dhe v_proj të 61 shtresave të Jais-3-375B-A23B-FP8, pikat e kontrollit 375 GB lexohen nga
+**SQ** — LoRA me rang 16 mbi q_proj dhe v_proj të 61 shtresave të Jais-3-375B-A23B-FP8, pikat e kontrollit 391 GB lexohen nga
 disku NVMe një herë për forward dhe një për backward, mbi GPU-në 12 GB të laptopit; çdo produkt i forward-it dhe i backward-it
 rrumbullakohet saktë, prandaj hapi s'varet nga grupimi i rreshtave, fijet apo ndërprerja e trajnimit.
 

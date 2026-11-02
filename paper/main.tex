@@ -370,22 +370,24 @@ fidapm07 & 2065 & 6.8$\cdot 10^{19}$ & 118 & 1.19 & $>$7200 &  & -- & 0.0 (430) 
 fidap026 & 2163 & 4.7$\cdot 10^{18}$ & 153 & 2.12 & $>$7200 &  & -- & 0.0 (1568) & 0.0 (1530) \\
 mhd3200a & 3200 & 6.5$\cdot 10^{39}$ & 130 & 4.02 & 1290.8 & 321$\times$ & yes & 0.0 (2876) & 0.0 (2768) \\
 fidap014 & 3251 & 2.6$\cdot 10^{16}$ & 124 & 4.74 & $>$7200 &  & -- & 7.6 (0) & 8.0 (0) \\
-lns\_3937 & 3937 & 1.0$\cdot 10^{17}$ & 79 & 4.31 & -- &  & -- & 10.1 (2) & 7.4 (1) \\
-fidap012 & 3973 & 2.2$\cdot 10^{20}$ & 119 & 7.44 & -- &  & -- & 0.0 (483) & 0.0 (482) \\
-mhd4800a & 4800 & 3.2$\cdot 10^{47}$ & 131 & 34.39 & -- &  & -- & 0.0 (3923) & 0.0 (4754) \\
-sherman3 & 5005 & 6.9$\cdot 10^{16}$ & 102 & 14.25 & -- &  & -- & 11.8 (0) & 12.4 (0) \\
+lns\_3937 & 3937 & 1.0$\cdot 10^{17}$ & 79 & 4.31 & 5\,475.3$^{a}$ & 1\,270$\times$ & yes & 10.1 (2) & 7.4 (1) \\
+fidap012 & 3973 & 2.2$\cdot 10^{20}$ & 119 & 7.44 & 10\,422.9$^{b}$ & 1\,401$\times$ & yes & 0.0 (483) & 0.0 (482) \\
+mhd4800a & 4800 & 3.2$\cdot 10^{47}$ & 131 & 34.39 & 4\,341.4$^{b}$ & 126$\times$ & yes & 0.0 (3923) & 0.0 (4754) \\
+sherman3 & 5005 & 6.9$\cdot 10^{16}$ & 102 & 14.25 & 13\,517.7$^{c}$ & 949$\times$ & yes & 11.8 (0) & 12.4 (0) \\
 fidapm15 & 9287 & 1.36$\cdot 10^{20}$ & 63 & 78.66 & -- &  & -- & 0.0 (2251) & 0.0 (5260) \\
 cry10000 & 10000 & 6.9$\cdot 10^{20}$ & 76 & 115.02 & -- &  & -- & 4.2 (66) & 1.6 (923) \\
 \hline
 \end{tabular}
 \caption{Exact solutions of real systems on the laptop (GPU: $A^{-1}$, lifting, reconstruction and all numerators). SPEX
-ran afterwards on the CPU alone, limit 2~h. $yM=c$ held modulo both check primes in every row.}\label{tab:real}
+ran afterwards on the CPU alone, limit 2~h; $^{a}$3~h limit, beside a 290~GB download; $^{b}$3~h limit, at night after the GPU jobs;
+$^{c}$8~h limit, the machine otherwise idle (14\,141.6 and 14\,369.0~s on two earlier nights beside light load); --: not run. Where SPEX finished,
+its digest equals the GPU's. $yM=c$ held modulo both check primes in every row.}\label{tab:real}
 \end{table}
 
 On 7 of the 13 systems FP64 has not one correct digit, LAPACK and SuperLU alike---on mhd3200a and mhd4800a the normwise error
 is $10^8$ and 82--99\,\% of the entries have no correct digit---and NIST's own (FP64) condition estimate does not say which:
 qh1484 at $5.6\cdot10^{17}$ keeps 11 digits. The certified exact solution takes 0.2--34~s; SPEX returns the same $x$, bit for
-bit, where it finishes within the limit, 9 to $\sim$900$\times$ later.
+bit, where it finishes within the limit, 9 to 1\,401$\times$ later.
 
 \section{The largest open model: correctly rounded MXFP4 and BF16 products}\label{sec:llm}
 \sloppy
