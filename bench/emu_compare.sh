@@ -11,13 +11,20 @@ export PATH=/usr/local/cuda-12.8/bin:$PATH
 log() { echo "$(date '+%F %T') $*" >> $L; }
 log "start $(cat .version 2>/dev/null | tr '\n' ' ')"
 P=/opt/ozaki/cu13/lib/python3.12/site-packages/nvidia/cu13
-{ nvcc -O3 -arch=sm_120 -std=c++17 -o out_test bench/ozaki_test.cu &&
-  g++ -O2 -std=c++17 -I$P/include -idirafter /usr/local/cuda-12.8/include bench/cublas_emu.cpp -o out_cublas_emu \
+{ nice -n 19 nvcc -O3 -arch=sm_120 -std=c++17 -o out_test bench/ozaki_test.cu &&
+  nice -n 19 g++ -O2 -std=c++17 -I$P/include -idirafter /usr/local/cuda-12.8/include bench/cublas_emu.cpp -o out_cublas_emu \
       -L$P/lib -l:libcublas.so.13 -l:libcudart.so.13 -Wl,-rpath,$P/lib; } >> $L 2>&1 || { log "build FAILED"; exit 1; }
-G=/opt/ozaki/GEMMul8/test   # built with nvcc 13.4 of /opt/ozaki/cu13 (its cuBLASLt batch modes need cuBLAS 13): gemmul8_build.log
+G=/opt/ozaki/GEMMul8/test   # bench/gemmul8_build.sh (nvcc 13.4 + cuBLAS 13 of /opt/ozaki/cu13; its cuBLASLt batch modes need 13)
+[ -x $G/test ] || { log "GEMMul8 not built: run bench/gemmul8_build.sh first"; exit 1; }
 . llm/hold.sh; hold emu; log "machine held"
 log "== ours (ozaki_test)"; ./out_test >> $L 2>&1; log "rc=$?"
 log "== cuBLAS"; ./out_cublas_emu >> $L 2>&1; log "rc=$?"
-for m in "accuracy_square GEMM D transA=N transB=N" "time_square GEMM D transA=N transB=N"; do
-    log "== GEMMul8: $m"; (cd $G && timeout 1800 make run MODE="$m") >> $L 2>&1; log "rc=$?"; done
+# GEMMul8's own harness (double: moduli 8-20 for accuracy, 9-17 for time; fast and accurate modes; cuBLAS's emulation and native
+# beside): accuracy at n = 8192,
+# timing at n = 1024 ... 65536 (the sizes that do not fit in 12 GB are skipped), >= 30 runs and >= 15 s per point: ~1 h.
+# Its CSV files go to /opt/ozaki/job/gemmul8/.
+mkdir -p /opt/ozaki/job/gemmul8
+for m in "accuracy_square GEMM D transA=N transB=N:3600" "time_square GEMM D transA=N transB=N:7200"; do
+    log "== GEMMul8: ${m%:*}"; (cd $G && timeout ${m##*:} ./test ${m%:*}) >> $L 2>&1; log "rc=$?"
+    mv -f $G/*.csv /opt/ozaki/job/gemmul8/ 2> /dev/null; done
 log "done, machine given back"
