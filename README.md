@@ -223,6 +223,26 @@ Residues split into two int64 limbs instead of fmod on 2^107 values: 211 → 78 
   measurement turned up. That — and the power-bound laptop regime — is where this work can claim something new.
   FP64 alone is **not** new; it is the baseline.
 
+### What this code adds to cuBLAS 13 and GEMMul8 / Çfarë shton ky kod mbi to (03-11-2026)
+For an FP64 GEMM on this laptop, use NVIDIA's own emulation or GEMMul8: both run on the same INT8 tensor cores and both are
+maintained; `bench/emu_compare.sh` measures them beside ours with one harness (results: the paper, "FP64 emulation on one
+laptop"). Both return FP64 at most. What is here and in neither -- the part a library of this code would be for:
+- **GEMM beyond FP64 from the same units:** double-double (~106 bits) 3.81 TFLOPS and triple-double (~159 bits) 2.00 TFLOPS
+  at n = 4096; 212 / 318 / 424 bits 0.50 / 0.37 / 0.25 TFLOPS at n = 2048 (machine held, 03-11).
+- **Linear solves where FP64 has no correct digit:** Ax = b at κ = 10²⁰ in double-double and at κ = 10³⁶ in triple-double,
+  all on the GPU (the CPU baselines of the same arithmetic are being re-measured cache-blocked: `bench/cpudd_blocked.sh`,
+  `bench/cputd_blocked.sh`).
+- **Exact integer arithmetic:** GEMM of 1 015- to 131 063-bit integers 10–19× faster than FLINT on 24 threads; exact
+  determinants and exact rational solutions of real sparse systems, the same x bit for bit as SPEX, 9× to 7 857× sooner.
+- **Correctly rounded BF16 / FP8 products for LLMs:** every product of a 375B model's LoRA training, forward and backward,
+  correctly rounded on the INT8 units, so a step does not depend on how rows are grouped into products, on the thread count,
+  on interruption or on the kernel version.
+
+**SQ** — Për FP64 të thjeshtë, emulimi i vetë NVIDIA-s (cuBLAS 13) ose GEMMul8 janë zgjedhja e duhur në këtë laptop. Ky kod
+shton atë që s'e ka asnjëri: GEMM përtej FP64 (106, 159 deri 424 bit), zgjidhje Ax = b ku FP64 s'ka asnjë shifër të saktë,
+aritmetikë të saktë me numra të plotë (përcaktorë, zgjidhje racionale, 10–19× mbi FLINT) dhe prodhime të rrumbullakuara saktë
+për trajnimin e modeleve të mëdha gjuhësore.
+
 ## A real job: Ax = b at κ = 10²⁰ — Një punë reale: Ax = b me κ = 10²⁰ (18-10-2026, `bench/solve.cu`)
 
 A = Q₁ diag(σ) Q₂ (orthogonal DST-I, the second permuted and sign-flipped; σ from 1 to 10⁻²⁰) — not fixable by scaling.
