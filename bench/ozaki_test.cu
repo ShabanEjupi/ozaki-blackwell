@@ -1,8 +1,12 @@
-// ozaki_test.cu -- how exact, and how fast, FP64 from INT8 is next to the GPU's own FP64.
+// Error is measured componentwise against |A||B|, against an exact-to-2^-80 reference: each product split exactly (TwoProd,
+// fma) and summed as a double-double (TwoSum), kept unrounded as hi + lo (Dot2 of Ogita, Rump and Oishi without the final
+// rounding: off by at most ~(K 2^-53)^2 |A||B|). The 80-bit (long double) sum used before is printed beside it ("ref80"):
+// its own error reaches K 2^-64 |A||B| in the worst case, 2 units of 2^-53 at K = 4096.// ozaki_test.cu -- how exact, and how fast, FP64 from INT8 is next to the GPU's own FP64.
 // Error is measured against an 80-bit (long double) CPU reference, componentwise against |A||B|:
 //   err = max_ij |C - Cref|_ij / (|A||B|)_ij   -- the bound a classic FP64 GEMM is judged by (~K * 2^-53).
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <random>
 #include <vector>
 #include "../src/ozaki2.cuh"
@@ -32,11 +36,14 @@ int main() {
             std::vector<double> A((size_t)M * K), B((size_t)K * N), C((size_t)M * N);
             fill(A, spread, 1 + K); fill(B, spread, 2 + K);
             std::vector<long double> ref((size_t)M * N), abs_((size_t)M * N);
+            std::vector<double> rs((size_t)M * N), rc((size_t)M * N);   // exact products, double-double sum: hi + lo
             for (int i = 0; i < M; i++)
                 for (int k = 0; k < K; k++) {
                     long double a = A[(size_t)i * K + k];
                     for (int j = 0; j < N; j++) {
                         ref[(size_t)i * N + j] += a * B[(size_t)k * N + j];
+                        { double x = (double)a, y = B[(size_t)k * N + j], p = x * y, e = std::fma(x, y, -p), s = rs[(size_t)i * N + j], t = s + p, bp = t - s;
+                          rs[(size_t)i * N + j] = t; rc[(size_t)i * N + j] += ((s - (t - bp)) + (p - bp)) + e; }
                         abs_[(size_t)i * N + j] += fabsl(a * B[(size_t)k * N + j]);
                     }
                 }
@@ -47,9 +54,11 @@ int main() {
             auto err = [&]() {
                 CK(cudaMemcpy(C.data(), dC, C.size() * 8, cudaMemcpyDeviceToHost));
                 long double e = 0;
-                for (size_t t = 0; t < C.size(); t++) e = fmaxl(e, fabsl(C[t] - ref[t]) / abs_[t]);
+                for (size_t t = 0; t < C.size(); t++) e = fmaxl(e, fabsl(((long double)C[t] - rs[t]) - rc[t]) / abs_[t]);
                 return (double)(e / 0x1p-53L);
             };
+            { long double d = 0; for (size_t t = 0; t < ref.size(); t++) d = fmaxl(d, fabsl((ref[t] - rs[t]) - rc[t]) / abs_[t]);
+              printf("(ref80 off by %.3g) ", (double)(d / 0x1p-53L)); }
             dgemm_native<<<dim3((N + 127) / 128, M), 128>>>(dA, dB, dC, M, N, K); CK(cudaGetLastError());
             printf("%dx%d K=%5d spread 2^±%-2.0f  native FP64 %8.2f |", M, N, K, spread, err());
             for (int nm : {8, 10, 12, 14, 16}) {
