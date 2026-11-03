@@ -21,7 +21,11 @@
 #pragma once
 
 namespace tg {
-constexpr int BM = 64, BN = 32, KBMAX = 128;
+constexpr int BM = 64, BN = 32, KBMAX = 128, EGMAX = 16;
+// a group of products with the same shapes in one launch (03-11-2026, the routed experts' dgrad): token tiles t0[z] .. t0[z+1]-1
+// are member z's, its tokens off[z] .. end[z]-1 of the shared input and output, its own weight digits wd[z] and scales tsc[z].
+// n = 0: one product (the grid's tiles as before). A tile computes exactly what it computed alone: only its pointers differ
+struct TGrp { int n, t0[EGMAX + 1], off[EGMAX], end[EGMAX]; const int8_t *wd[EGMAX]; const uint16_t *tsc[EGMAX]; };
 template <int DW, int DX, int BK, int ST> constexpr int smem() { return ST * (DW * BM + DX * BN) * (BK + 16); }
 }
 
@@ -57,7 +61,7 @@ __device__ inline int xf8_exp(const float *xs, size_t i, int &sig) { int x; sig 
 template <int DW, int DX, bool F8, int BK, int ST, bool XF8 = false>
 __global__ void __launch_bounds__(256) tgemm(const int8_t *__restrict__ wd, const uint16_t *__restrict__ tsc, const int16_t *__restrict__ wl,
         const uint8_t *__restrict__ wn, const int8_t *__restrict__ xd, const int16_t *__restrict__ xl, const uint8_t *__restrict__ xn,
-        float *Y, int M, int N, int K, int p, int *nbad, const float *__restrict__ xs) {
+        float *Y, int M, int N, int K, int p, int *nbad, const float *__restrict__ xs, const tg::TGrp Gp) {
     using namespace tg;
     static_assert(!XF8 || (F8 && DW == 3 && DX == 3), "XF8: E4M3 times E4M3, three digits each");
     constexpr int NS = DW + DX - 1, LD = BK + 16, WT = DW * BM * LD, XT = DX * BN * LD, CH = BK / 16;
@@ -65,7 +69,9 @@ __global__ void __launch_bounds__(256) tgemm(const int8_t *__restrict__ wd, cons
     const int C = (XF8 ? 75 : F8 ? 74 : 7 * (DW + DX) + 5) + (K > 128 ? 32 - __clz(K / 128 - 1) : 0);   // |block term| < 2^(C - log2 blocks)
     __shared__ int ses[F8 ? KBMAX : 1], sss[F8 ? KBMAX : 1];   // F8: per block of this block's rows, the scale's exponent - 9 and significand
     int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3, wm = warp & 3, wq = warp >> 2;
-    int n0 = blockIdx.x * BN, m0 = blockIdx.y * BM, KB = K / 128, KT = K / BK;
+    int n0 = blockIdx.x * BN, m0 = blockIdx.y * BM, KB = K / 128, KT = K / BK, NE = N;   // NE: this tile's token bound
+    if (Gp.n) { int z = 0; while (z + 1 < Gp.n && (int)blockIdx.x >= Gp.t0[z + 1]) z++;   // N stays the planes' row count
+        wd = Gp.wd[z]; tsc = Gp.tsc[z]; n0 = Gp.off[z] + ((int)blockIdx.x - Gp.t0[z]) * BN; NE = Gp.end[z]; }
     size_t PW = (size_t)M * K, PX = (size_t)N * K;
     if (F8) for (int b = tid; b < KB; b += 256) { uint16_t u = tsc[(size_t)(m0 / 128) * KB + b]; int x = (u >> 7) & 255;
         sss[b] = x ? 128 + (u & 127) : u & 127; ses[b] = (x ? x - 134 : -133) - 9; }
@@ -74,7 +80,7 @@ __global__ void __launch_bounds__(256) tgemm(const int8_t *__restrict__ wd, cons
     for (int t = 0; t < 2; t++) for (int c = 0; c < 2; c++) tok[t][c] = n0 + wq * 16 + t * 8 + t4 * 2 + c;
     for (int t = 0; t < 2; t++) for (int i = 0; i < 4; i++) {
         int r = row[i >> 1], tk = tok[t][i & 1], hi = -100000;
-        if (tk < N && r < M) for (int b = 0; b < KB; b++) { int sg, l = XF8 ? xf8_exp(xs, (size_t)tk * KB + b, sg) : xl[(size_t)tk * KB + b],
+        if (tk < NE && r < M) for (int b = 0; b < KB; b++) { int sg, l = XF8 ? xf8_exp(xs, (size_t)tk * KB + b, sg) : xl[(size_t)tk * KB + b],
                                                             w = F8 ? ses[b] : wl[(size_t)r * KB + b];
                                                             if (l != -32768 && w != -32768) hi = max(hi, w + l); }
         // |sum| < 2^(hi + C): F8 |s S| < 2^(8 + 18 + 41 + 7) a block, BF16 |S| < 2^(7 (DW + DX) + 5), times the blocks. A 63-bit
@@ -87,7 +93,7 @@ __global__ void __launch_bounds__(256) tgemm(const int8_t *__restrict__ wd, cons
         int k0 = kt * BK; uint32_t sw = sbase + st * (WT + XT), sx = sw + WT;
         for (int c = tid; c < DW * BM * CH; c += 256) { int q = c / (BM * CH), r = (c / CH) % BM, ch = c % CH; bool ok = m0 + r < M;
             cp16(sw + (q * BM + r) * LD + ch * 16, ok ? (const void *)(wd + q * PW + (size_t)(m0 + r) * K + k0 + ch * 16) : (const void *)wd, ok ? 16 : 0); }
-        for (int c = tid; c < DX * BN * CH; c += 256) { int q = c / (BN * CH), r = (c / CH) % BN, ch = c % CH; bool ok = n0 + r < N;
+        for (int c = tid; c < DX * BN * CH; c += 256) { int q = c / (BN * CH), r = (c / CH) % BN, ch = c % CH; bool ok = n0 + r < NE;
             cp16(sx + (q * BN + r) * LD + ch * 16, ok ? (const void *)(xd + q * PX + (size_t)(n0 + r) * K + k0 + ch * 16) : (const void *)xd, ok ? 16 : 0); }
     };
     int P[NS][2][4] = {}; long long acc[2][4] = {}; unsigned long long tail[2][4] = {};
@@ -116,7 +122,7 @@ __global__ void __launch_bounds__(256) tgemm(const int8_t *__restrict__ wd, cons
         if ((kt + 1) * BK % 128) continue;
         int b = (kt + 1) * BK / 128 - 1, ss = F8 ? sss[b] : 1;   // the end of block b: its terms into the windows
         int lx[2][2], nxs[2][2], sxs[2][2], lw[2], nws[2];   // the grids and dropped counts of this block, per token and per row
-        for (int t = 0; t < 2; t++) for (int c = 0; c < 2; c++) { int tk = tok[t][c]; bool ok = tk < N;
+        for (int t = 0; t < 2; t++) for (int c = 0; c < 2; c++) { int tk = tok[t][c]; bool ok = tk < NE;
             lx[t][c] = !ok ? -32768 : XF8 ? xf8_exp(xs, (size_t)tk * KB + b, sxs[t][c]) : xl[(size_t)tk * KB + b];
             nxs[t][c] = ok && !XF8 ? xn[(size_t)tk * KB + b] : 0; }
         for (int h = 0; h < 2; h++) { bool ok = !F8 && row[h] < M;
@@ -149,7 +155,7 @@ __global__ void __launch_bounds__(256) tgemm(const int8_t *__restrict__ wd, cons
     for (int t = 0; t < 2; t++)
 #pragma unroll
         for (int i = 0; i < 4; i++) {
-            int tk = tok[t][i & 1], r = row[i >> 1]; if (tk >= N || r >= M) continue;
+            int tk = tok[t][i & 1], r = row[i >> 1]; if (tk >= NE || r >= M) continue;
             float o; if (!cert_round(acc[t][i], tail[t][i], lsb[t][i], 1, 0, p, o)) { atomicAdd(nbad, 1); o = __int_as_float(0x7FC00000); }
             Y[(size_t)tk * M + r] = o;
         }
@@ -159,7 +165,14 @@ static void tgemm_go(const int8_t *wd, const uint16_t *tsc, const int16_t *wl, c
                      const uint8_t *xn, float *Y, int M, int N, int K, int p, int *nbad, const float *xs = nullptr) {
     constexpr int SM = tg::smem<DW, DX, BK, ST>(); static bool raised = false;
     if (!raised) { CK(cudaFuncSetAttribute(tgemm<DW, DX, F8, BK, ST, XF8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM)); raised = true; }
-    tgemm<DW, DX, F8, BK, ST, XF8><<<dim3((N + tg::BN - 1) / tg::BN, (M + tg::BM - 1) / tg::BM), 256, SM>>>(wd, tsc, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad, xs);
+    tgemm<DW, DX, F8, BK, ST, XF8><<<dim3((N + tg::BN - 1) / tg::BN, (M + tg::BM - 1) / tg::BM), 256, SM>>>(wd, tsc, wl, wn, xd, xl, xn, Y, M, N, K, p, nbad, xs, tg::TGrp{});
+}
+// the group's products in one launch (TGrp above): N = all members' rows (the digit planes' stride), tiles Gp.t0[Gp.n]
+template <int DW, int DX, bool F8, int BK, int ST>
+static void tgemm_go_grp(const tg::TGrp &Gp, const int8_t *xd, const int16_t *xl, const uint8_t *xn, float *Y, int M, int N, int K, int p, int *nbad) {
+    constexpr int SM = tg::smem<DW, DX, BK, ST>(); static bool raised = false;
+    if (!raised) { CK(cudaFuncSetAttribute(tgemm<DW, DX, F8, BK, ST, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM)); raised = true; }
+    tgemm<DW, DX, F8, BK, ST, false><<<dim3(Gp.t0[Gp.n], (M + tg::BM - 1) / tg::BM), 256, SM>>>(Gp.wd[0], Gp.tsc[0], nullptr, nullptr, xd, xl, xn, Y, M, N, K, p, nbad, nullptr, Gp);
 }
 
 // up to two FP8 maps that share their input dimension Ko, stacked along m (an expert's gate and up)
