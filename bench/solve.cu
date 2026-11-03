@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 #include <omp.h>
@@ -630,6 +631,70 @@ static double solve_gpu(int n, int nb, const double *Ah, const double *Al, const
     return t;
 }
 
+// Double-double LU on the CPU with the GPU solver's arithmetic: partial pivoting, every entry updated as sub(a, mul(l, u)) in
+// ascending k, the multipliers dvd(a, d). lu_dd_cpu is the loop campaign v2 timed (rows in parallel, SIMD over columns): it
+// streams the whole trailing matrix once per column -- 1 GB at n = 8192 -- and is memory-bound (kappa 1e20, medians: 0.48 s at
+// n = 2048, 11.1 s at 4096, 115 s at 8192, for 8x and 64x the work). lu_dd_cpu_blocked (03-11-2026) does the same operations
+// in the same order -- a row's multipliers travel with it through the swaps, so each entry sees the same updates with the same
+// operands -- with the trailing update deferred per panel of nb columns and done tile by tile (64 rows past a 256-column strip
+// of U12 that stays in cache): the same bits (OZ_CPUDD_ONLY=<nb> with OZ_CPUDD_CHECK=1 compares the two), compute-bound.
+static inline void dd_axpy_row(double *rh, double *rl, D l, const double *uh, const double *ul, int c0, int c1) {
+#pragma omp simd
+    for (int c = c0; c < c1; c++) { D v = sub({rh[c], rl[c]}, mul(l, {uh[c], ul[c]})); rh[c] = v.hi; rl[c] = v.lo; }
+}
+static void dd_pivot_col(int n, int j, int c1, std::vector<double> &H, std::vector<double> &L, std::vector<int> &pv) {
+    int p = j; for (int i = j + 1; i < n; i++) if (fabs(H[(size_t)i * n + j]) > fabs(H[(size_t)p * n + j])) p = i;
+    pv[j] = p;
+    if (p != j) { std::swap_ranges(H.begin() + (size_t)j * n, H.begin() + (size_t)j * n + n, H.begin() + (size_t)p * n);
+                  std::swap_ranges(L.begin() + (size_t)j * n, L.begin() + (size_t)j * n + n, L.begin() + (size_t)p * n); }
+    const D d{H[(size_t)j * n + j], L[(size_t)j * n + j]};
+    const double *uh = &H[(size_t)j * n], *ul = &L[(size_t)j * n];
+#pragma omp parallel for schedule(static)
+    for (int i = j + 1; i < n; i++) {   // the multipliers, and the update of columns j+1 .. c1-1
+        double *rh = &H[(size_t)i * n], *rl = &L[(size_t)i * n];
+        D l = dvd({rh[j], rl[j]}, d); rh[j] = l.hi; rl[j] = l.lo;
+        dd_axpy_row(rh, rl, l, uh, ul, j + 1, c1);
+    }
+}
+static void lu_dd_cpu(int n, std::vector<double> &H, std::vector<double> &L, std::vector<int> &pv) {
+    for (int j = 0; j < n; j++) dd_pivot_col(n, j, n, H, L, pv);
+}
+static void lu_dd_cpu_blocked(int n, int nb, std::vector<double> &H, std::vector<double> &L, std::vector<int> &pv) {
+    const int RB = 64, CS = 256;
+    for (int k0 = 0; k0 < n; k0 += nb) {
+        const int k1 = std::min(n, k0 + nb);
+        for (int j = k0; j < k1; j++) dd_pivot_col(n, j, k1, H, L, pv);   // the panel: updates inside its own columns only
+        if (k1 == n) break;
+        const int ns = (n - k1 + CS - 1) / CS, nr = (n - k1 + RB - 1) / RB;
+#pragma omp parallel for schedule(dynamic)
+        for (int s = 0; s < ns; s++) {   // U12: the panel rows' updates among themselves, k ascending, strip by strip
+            const int c0 = k1 + s * CS, c1 = std::min(n, c0 + CS);
+            for (int r = k0 + 1; r < k1; r++)
+                for (int k = k0; k < r; k++)
+                    dd_axpy_row(&H[(size_t)r * n], &L[(size_t)r * n], {H[(size_t)r * n + k], L[(size_t)r * n + k]}, &H[(size_t)k * n], &L[(size_t)k * n], c0, c1);
+        }
+#pragma omp parallel for collapse(2) schedule(dynamic)
+        for (int b = 0; b < nr; b++)   // A22 -= L21 U12, tile by tile, every entry k ascending
+            for (int s = 0; s < ns; s++) {
+                const int i0 = k1 + b * RB, i1 = std::min(n, i0 + RB), c0 = k1 + s * CS, c1 = std::min(n, c0 + CS);
+                for (int i = i0; i < i1; i++)
+                    for (int k = k0; k < k1; k++)
+                        dd_axpy_row(&H[(size_t)i * n], &L[(size_t)i * n], {H[(size_t)i * n + k], L[(size_t)i * n + k]}, &H[(size_t)k * n], &L[(size_t)k * n], c0, c1);
+            }
+    }
+}
+static void lu_dd_cpu_solve(int n, const std::vector<double> &H, const std::vector<double> &L, const std::vector<int> &pv,
+                            const std::vector<double> &bh, const std::vector<double> &bl, std::vector<double> &zh, std::vector<double> &zl) {
+    std::vector<D> z(n); for (int i = 0; i < n; i++) z[i] = {bh[i], bl[i]};
+    for (int j = 0; j < n; j++) std::swap(z[j], z[pv[j]]);
+    for (int i = 0; i < n; i++) for (int k = 0; k < i; k++) z[i] = sub(z[i], mul({H[(size_t)i * n + k], L[(size_t)i * n + k]}, z[k]));
+    for (int i = n - 1; i >= 0; i--) {
+        for (int k = i + 1; k < n; k++) z[i] = sub(z[i], mul({H[(size_t)i * n + k], L[(size_t)i * n + k]}, z[k]));
+        z[i] = dvd(z[i], {H[(size_t)i * n + i], L[(size_t)i * n + i]});
+    }
+    zh.resize(n); zl.resize(n); for (int i = 0; i < n; i++) { zh[i] = z[i].hi; zl[i] = z[i].lo; }
+}
+
 int main(int argc, char **argv) {
     int n = argc > 1 ? atoi(argv[1]) : 2048, nb = argc > 2 ? atoi(argv[2]) : 256;
     double ek = argc > 3 ? atof(argv[3]) : 20;
@@ -698,6 +763,37 @@ int main(int argc, char **argv) {
         bh[i] = s.hi; bl[i] = s.lo;
     }
 
+    if (getenv("OZ_CPUDD_ONLY")) {   // OZ_CPUDD_ONLY=<nb>: the GPU solver (after one warm-up solve) and the blocked CPU double-double
+        // LU, no __float128 reference (505 s at n = 8192); OZ_CPUDD_CHECK=1 also runs the unblocked one and compares bit for bit
+        double nt = 0; for (int i = 0; i < n; i++) nt = fmax(nt, fabs(xt[i]));
+        auto err_t = [&](const std::vector<double> &h, const std::vector<double> &l) {
+            double w = 0; for (int i = 0; i < n; i++) w = fmax(w, fabs((h[i] - xt[i]) + l[i])); return w / nt; };
+        std::vector<double> xh(n), xl(n); double tg = 0;
+        solve_gpu(n, nb, Ah.data(), Al.data(), bh.data(), bl.data(), xh.data(), xl.data(), tg);
+        double tgpu = solve_gpu(n, nb, Ah.data(), Al.data(), bh.data(), bl.data(), xh.data(), xl.data(), tg);
+        printf("%-44s %9.3f %15.3g\n", "double-double LU, all on GPU", tgpu, err_t(xh, xl));
+        const int bnb = std::max(16, atoi(getenv("OZ_CPUDD_ONLY")));
+        auto run = [&](bool blocked, std::vector<double> &H, std::vector<double> &L, std::vector<double> &zh, std::vector<double> &zl) {
+            H = Ah; L = Al; std::vector<int> pv(n); double t0 = now();
+            if (blocked) lu_dd_cpu_blocked(n, bnb, H, L, pv); else lu_dd_cpu(n, H, L, pv);
+            lu_dd_cpu_solve(n, H, L, pv, bh, bl, zh, zl);
+            return now() - t0; };
+        std::vector<double> H1, L1, z1h, z1l;
+        double tb = run(true, H1, L1, z1h, z1l);
+        char lab[80]; snprintf(lab, sizeof lab, "double-double LU, CPU, %d threads (AVX, blocked nb=%d)", thr, bnb);
+        printf("%-44s %9.2f %15.3g\n", lab, tb, err_t(z1h, z1l));
+        if (getenv("OZ_CPUDD_CHECK")) {
+            std::vector<double> H2, L2, z2h, z2l;
+            double tu = run(false, H2, L2, z2h, z2l);
+            snprintf(lab, sizeof lab, "double-double LU, CPU, %d threads (AVX)", thr);
+            printf("%-44s %9.2f %15.3g\n", lab, tu, err_t(z2h, z2l));
+            auto ndiff = [](const std::vector<double> &a, const std::vector<double> &b) {   // bit patterns, not ==
+                size_t d = 0; for (size_t t = 0; t < a.size(); t++) d += memcmp(&a[t], &b[t], 8) != 0; return d; };
+            printf("blocked vs unblocked: %zu + %zu of 2 x %zu LU words differ, %zu + %zu of 2 x %d solution words\n",
+                   ndiff(H1, H2), ndiff(L1, L2), H1.size(), ndiff(z1h, z2h), ndiff(z1l, z2l), n);
+        }
+        return 0;
+    }
     if (getenv("OZ_PROF") || getenv("OZ_GPU")) {   // only the GPU solver, twice (the first run pays the module load); OZ_GPU=1: no phase syncs
         std::vector<double> xh(n), xl(n); double tg = 0;
         int reps = getenv("OZ_REPS") ? atoi(getenv("OZ_REPS")) : 2;   // OZ_REPS: back-to-back solves, for energy per solve
@@ -789,33 +885,10 @@ int main(int argc, char **argv) {
     }
     if (!getenv("OZ_NOCPUDD")) {   // double-double LU on the CPU with the same arithmetic, rows in parallel, SIMD over columns:
         // the strong software baseline (__float128 is emulated and far slower)
-        std::vector<double> H(Ah), L(Al), yh(bh), yl(bl); std::vector<int> pv(n);
+        std::vector<double> H(Ah), L(Al), zh, zl; std::vector<int> pv(n);
         double t0 = now();
-        for (int j = 0; j < n; j++) {
-            int p = j; for (int i = j + 1; i < n; i++) if (fabs(H[(size_t)i * n + j]) > fabs(H[(size_t)p * n + j])) p = i;
-            pv[j] = p;
-            if (p != j) { std::swap_ranges(H.begin() + (size_t)j * n, H.begin() + (size_t)j * n + n, H.begin() + (size_t)p * n);
-                          std::swap_ranges(L.begin() + (size_t)j * n, L.begin() + (size_t)j * n + n, L.begin() + (size_t)p * n); }
-            D d{H[(size_t)j * n + j], L[(size_t)j * n + j]};
-            const double *uh = &H[(size_t)j * n], *ul = &L[(size_t)j * n];
-#pragma omp parallel for schedule(static)
-            for (int i = j + 1; i < n; i++) {
-                double *rh_ = &H[(size_t)i * n], *rl_ = &L[(size_t)i * n];
-                D l = dvd({rh_[j], rl_[j]}, d);
-                rh_[j] = l.hi; rl_[j] = l.lo;
-#pragma omp simd
-                for (int c = j + 1; c < n; c++) { D v = sub({rh_[c], rl_[c]}, mul(l, {uh[c], ul[c]})); rh_[c] = v.hi; rl_[c] = v.lo; }
-            }
-        }
-        std::vector<D> z(n); for (int i = 0; i < n; i++) z[i] = {yh[i], yl[i]};
-        for (int j = 0; j < n; j++) std::swap(z[j], z[pv[j]]);
-        for (int i = 0; i < n; i++) for (int k = 0; k < i; k++) z[i] = sub(z[i], mul({H[(size_t)i * n + k], L[(size_t)i * n + k]}, z[k]));
-        for (int i = n - 1; i >= 0; i--) {
-            for (int k = i + 1; k < n; k++) z[i] = sub(z[i], mul({H[(size_t)i * n + k], L[(size_t)i * n + k]}, z[k]));
-            z[i] = dvd(z[i], {H[(size_t)i * n + i], L[(size_t)i * n + i]});
-        }
+        lu_dd_cpu(n, H, L, pv); lu_dd_cpu_solve(n, H, L, pv, bh, bl, zh, zl);
         double tc = now() - t0;
-        std::vector<double> zh(n), zl(n); for (int i = 0; i < n; i++) { zh[i] = z[i].hi; zl[i] = z[i].lo; }
         char lab[64]; snprintf(lab, sizeof lab, "double-double LU, CPU, %d threads (AVX)", thr);
         printf("%-44s %9.2f %15.3g %15.3g\n", lab, tc, err_t(zh.data(), zl.data()), err_q(zh.data(), zl.data()));
     }
