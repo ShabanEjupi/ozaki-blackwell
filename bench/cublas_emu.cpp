@@ -36,6 +36,7 @@ int main() {
                             emu ? CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT : CUBLAS_COMPUTE_64F, CUBLAS_GEMM_DEFAULT));
             return true; }});
     }
+    if (emu_energy(cfg)) return 0;
     emu_accuracy(cfg);
     emu_speed(cfg);
     for (auto h : H) cublasDestroy(h);

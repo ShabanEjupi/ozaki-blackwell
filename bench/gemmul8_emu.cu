@@ -32,6 +32,7 @@ int main() {
                 const double one = 1, zero = 0;
                 gemmul8::gemm<double, gemmul8::Backend::INT8>(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &one, B, N, A, K, &zero, C, N, nm, fast, g_work);
                 return cudaGetLastError() == cudaSuccess; }});
+    if (emu_energy(cfg)) return 0;
     emu_accuracy(cfg);
     emu_speed(cfg);
     if (g_work) cudaFree(g_work);

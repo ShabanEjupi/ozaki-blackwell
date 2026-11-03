@@ -10,6 +10,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -84,4 +85,29 @@ static void emu_speed(const std::vector<EmuCfg> &cfg) {
         printf("\n"); fflush(stdout);
         cudaFree(dA); cudaFree(dB); cudaFree(dC);
     }
+}
+
+// EMU_ENERGY=<name> (03-11-2026): that configuration alone at n = 4096 on bench/energy.cu's inputs, called back to back for EMU_SECS
+// seconds (default 12) after a warm-up, as bench/energy.cu runs ours -- bench/energy_emu.sh samples the board power meanwhile.
+// Returns false when no configuration has that name.
+static bool emu_energy(const std::vector<EmuCfg> &cfg) {
+    const char *want = getenv("EMU_ENERGY"); if (!want) return false;
+    const double secs = getenv("EMU_SECS") ? atof(getenv("EMU_SECS")) : 12.0; const int n = 4096;
+    for (auto &c : cfg) {
+        if (c.name != want) continue;
+        std::vector<double> A((size_t)n * n); unsigned long long s = 88172645463325252ull;   // energy.cu's inputs, A = B
+        for (auto &x : A) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; x = (double)(long long)s / 9.2e18; }
+        double *dA, *dB, *dC;
+        CK(cudaMalloc(&dA, A.size() * 8)); CK(cudaMalloc(&dB, A.size() * 8)); CK(cudaMalloc(&dC, A.size() * 8));
+        CK(cudaMemcpy(dA, A.data(), A.size() * 8, cudaMemcpyHostToDevice)); CK(cudaMemcpy(dB, A.data(), A.size() * 8, cudaMemcpyHostToDevice));
+        if (!c.gemm(n, n, n, dA, dB, dC)) { printf("%s: no workspace\n", want); return true; }
+        CK(cudaDeviceSynchronize());
+        auto t0 = std::chrono::steady_clock::now(); double t = 0; long k = 0;
+        while (t < secs) { c.gemm(n, n, n, dA, dB, dC); CK(cudaDeviceSynchronize()); k++;
+                           t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+        printf("%s: %.1f GFLOPS over %.1f s (%ld calls, n = %d)\n", want, 2.0 * n * n * n * k / t / 1e9, t, k, n);
+        cudaFree(dA); cudaFree(dB); cudaFree(dC);
+        return true;
+    }
+    printf("EMU_ENERGY=%s: no such configuration\n", want); return true;
 }
