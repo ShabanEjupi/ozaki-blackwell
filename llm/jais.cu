@@ -17,6 +17,7 @@
 #pragma once
 #define DENSE_LIB
 #include "dense.cu"
+#include "oz_exp.cuh"   // exp: one sequence of IEEE operations, the bits of glibc 2.39 on every input, the same on the GPU
 
 static int J_MFF, J_E, J_TOPK, J_RHD; static double J_RSF;
 static void rope_part(std::vector<float> &v, int heads, int pos) {   // the pairs (i, i + D_HD/2), i < J_RHD/2
@@ -27,7 +28,7 @@ static void rope_part(std::vector<float> &v, int heads, int pos) {   // the pair
     }
 }
 static std::vector<float> swiglu(const std::vector<float> &g, const std::vector<float> &u) {
-    std::vector<float> a(g.size()); for (size_t i = 0; i < g.size(); i++) { double gv = g[i]; a[i] = bf(gv / (1.0 + exp(-gv)) * u[i]); }
+    std::vector<float> a(g.size()); for (size_t i = 0; i < g.size(); i++) { double gv = g[i]; a[i] = bf(gv / (1.0 + oz_exp(-gv)) * u[i]); }
     return a;
 }
 
@@ -66,7 +67,7 @@ static std::vector<bool> jais_init() {
 // the top J_TOPK of sigmoid + bias (lowest id on a tie), weights BF16(J_RSF sigmoid / sum of the chosen sigmoids)
 static void route(const std::vector<float> &lg, const std::vector<float> &bias, std::vector<int> &ex, std::vector<double> &wt) {
     std::vector<float> sg(J_E); std::vector<std::pair<float, int>> c(J_E);
-    for (int e = 0; e < J_E; e++) { sg[e] = (float)(1.0 / (1.0 + exp(-(double)lg[e]))); c[e] = {sg[e] + bias[e], e}; }
+    for (int e = 0; e < J_E; e++) { sg[e] = (float)(1.0 / (1.0 + oz_exp(-(double)lg[e]))); c[e] = {sg[e] + bias[e], e}; }
     std::partial_sort(c.begin(), c.begin() + J_TOPK, c.end(), [](auto &a, auto &b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
     double sum = 0; for (int k = 0; k < J_TOPK; k++) sum += sg[c[k].second];
     ex.clear(); wt.clear();

@@ -296,13 +296,13 @@ static void norm_back(const std::vector<float> &x, const std::vector<float> &w, 
 static void swiglu_back(const std::vector<float> &gg, const std::vector<float> &uu, const std::vector<double> &da, std::vector<double> &dg, std::vector<double> &du) {
     dg.resize(gg.size()); du.resize(gg.size());
     #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < gg.size(); i++) { double g = gg[i], s = 1.0 / (1.0 + exp(-g)); dg[i] = da[i] * uu[i] * s * (1.0 + g * (1.0 - s)); du[i] = da[i] * g * s; }
+    for (size_t i = 0; i < gg.size(); i++) { double g = gg[i], s = 1.0 / (1.0 + oz_exp(-g)); dg[i] = da[i] * uu[i] * s * (1.0 + g * (1.0 - s)); du[i] = da[i] * g * s; }
 }
 // w_k = c s_k / S over the chosen experts (s the sigmoids of the logits): ds_j = c (dw_j / S - sum_k dw_k s_k / S^2),
 // dlogit_j = ds_j s_j (1 - s_j); the other logits get 0
 static void gate_back(const float *lg, const int *ex, const double *dw, double *dl) {
     double s[64], S = 0, q = 0;
-    for (int k = 0; k < J_TOPK; k++) { s[k] = 1.0 / (1.0 + exp(-(double)lg[ex[k]])); S += s[k]; }
+    for (int k = 0; k < J_TOPK; k++) { s[k] = 1.0 / (1.0 + oz_exp(-(double)lg[ex[k]])); S += s[k]; }
     for (int k = 0; k < J_TOPK; k++) q += dw[k] * s[k];
     for (int k = 0; k < J_TOPK; k++) dl[ex[k]] = J_RSF * (dw[k] / S - q / (S * S)) * s[k] * (1 - s[k]);
 }
@@ -319,7 +319,7 @@ static void attend_back_ref(const std::vector<float> &q, const std::vector<float
         const float *qt = q.data() + t * QD + hq * HD; const double *dot = dO.data() + t * QD + hq * HD; double mx = -1e300;
         for (size_t u = 0; u < T; u++) { const float *ku = k.data() + u * KVD + g * HD; double a = 0; for (int d = 0; d < HD; d++) a += (double)qt[d] * ku[d];
             p[u] = a * sc; mx = std::max(mx, p[u]); }
-        double den = 0; for (size_t u = 0; u < T; u++) { p[u] = exp(p[u] - mx); den += p[u]; }
+        double den = 0; for (size_t u = 0; u < T; u++) { p[u] = oz_exp(p[u] - mx); den += p[u]; }
         double sdp = 0;
         for (size_t u = 0; u < T; u++) { p[u] /= den; const float *vu = v.data() + u * KVD + g * HD; double a = 0; for (int d = 0; d < HD; d++) a += dot[d] * vu[d];
             ds[u] = a; sdp += p[u] * a; }
@@ -358,7 +358,7 @@ static void attend_back(const std::vector<float> &q, const std::vector<float> &k
         };
         dot4(qt, kg, p); double mx = -1e300;
         for (size_t u = 0; u < T; u++) { p[u] = p[u] * sc; mx = std::max(mx, p[u]); }
-        double den = 0; for (size_t u = 0; u < T; u++) { p[u] = exp(p[u] - mx); den += p[u]; }
+        double den = 0; for (size_t u = 0; u < T; u++) { p[u] = oz_exp(p[u] - mx); den += p[u]; }
         for (size_t u = 0; u < T; u++) p[u] /= den;
         dot4(dot, vg, ds); double sdp = 0; for (size_t u = 0; u < T; u++) sdp += p[u] * ds[u];
         double *dqt = dq.data() + t * QD + hq * HD;
@@ -462,7 +462,7 @@ static void attend_back_gpu(const std::vector<float> &q, const std::vector<float
     for (int hq = 0; hq < D_Q; hq++) for (size_t t = 0; t < N; t++) {   // attend_back's softmax on the GPU's scores
         double *p = hP + hq * TRI + t * (t + 1) / 2, mx = -1e300, den = 0; size_t T = t + 1;
         for (size_t u = 0; u < T; u++) mx = std::max(mx, p[u]);
-        for (size_t u = 0; u < T; u++) { p[u] = exp(p[u] - mx); den += p[u]; }
+        for (size_t u = 0; u < T; u++) { p[u] = oz_exp(p[u] - mx); den += p[u]; }
         for (size_t u = 0; u < T; u++) p[u] /= den;
     }
     t_ab_host += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
@@ -583,7 +583,7 @@ static void moe_back(const std::string &P, int L, const std::vector<float> &x2, 
     auto fill_gu = [&](const std::vector<float> &gg, const std::vector<float> &uu, const std::vector<double> &da, size_t n0, size_t m, uint16_t *xb) {
         #pragma omp parallel for schedule(static)   // swiglu_back's two formulas, row by row
         for (size_t i = 0; i < m; i++) { uint16_t *x = xb + i * 2 * (size_t)J_MFF;
-            for (int c = 0; c < J_MFF; c++) { size_t k = (n0 + i) * J_MFF + c; double g = gg[k], s = 1.0 / (1.0 + exp(-g));
+            for (int c = 0; c < J_MFF; c++) { size_t k = (n0 + i) * J_MFF + c; double g = gg[k], s = 1.0 / (1.0 + oz_exp(-g));
                 x[c] = bfb(da[k] * uu[k] * s * (1.0 + g * (1.0 - s))); x[J_MFF + c] = bfb(da[k] * g * s); } } };
     auto add_dx = [&](int e, const std::vector<double> &dxe) {
         #pragma omp parallel for schedule(static)
@@ -737,7 +737,7 @@ static double loss_back(const std::vector<float> &hN, const std::vector<int> &tg
     #pragma omp parallel for schedule(static)
     for (size_t r = 0; r < N; r++) { if (tgt[r] < 0) continue; const float *l = lg.data() + r * D_V; double m = -1e300, s = 0;
         for (int v = 0; v < D_V; v++) m = std::max(m, (double)l[v]);
-        for (int v = 0; v < D_V; v++) s += exp(l[v] - m);
+        for (int v = 0; v < D_V; v++) s += oz_exp(l[v] - m);
         mx[r] = m; den[r] = s; lr[r] = m + log(s) - l[tgt[r]]; }
     double loss = 0; for (size_t r = 0; r < N; r++) loss += lr[r]; loss /= T;
     if (!g) return loss;
@@ -747,7 +747,7 @@ static double loss_back(const std::vector<float> &hN, const std::vector<int> &tg
         std::vector<double> d(N * (size_t)Ls.M, 0.0);
         #pragma omp parallel for schedule(static)
         for (size_t r = 0; r < N; r++) { if (tgt[r] < 0) continue; const float *l = lg.data() + r * D_V + v0; double *dr = d.data() + r * Ls.M;
-            for (int v = 0; v < Ls.M; v++) dr[v] = exp(l[v] - mx[r]) / den[r] / T;
+            for (int v = 0; v < Ls.M; v++) dr[v] = oz_exp(l[v] - mx[r]) / den[r] / T;
             int y = tgt[r] - v0; if (y >= 0 && y < Ls.M) dr[y] -= 1.0 / T; }
         dgrad({Ls}, {&d}, N, dhn);
     }
@@ -800,7 +800,7 @@ static int back_selftest() {
             for (size_t t = 0; t < N; t++) for (int hq = 0; hq < D_Q; hq++) { int g = hq / G; std::vector<double> p(t + 1); double mx = -1e300, den = 0;
                 for (size_t u = 0; u <= t; u++) { double a = 0; for (int d = 0; d < D_HD; d++) a += (double)q[t * QD + hq * D_HD + d] * k[u * KVD + g * D_HD + d];
                     p[u] = a * sc; mx = std::max(mx, p[u]); }
-                for (auto &x : p) { x = exp(x - mx); den += x; }
+                for (auto &x : p) { x = oz_exp(x - mx); den += x; }
                 for (int d = 0; d < D_HD; d++) { double o = 0; for (size_t u = 0; u <= t; u++) o += p[u] / den * v[u * KVD + g * D_HD + d]; s += o * R[t * QD + hq * D_HD + d]; } }
             return s; });
     }
@@ -814,7 +814,7 @@ static int back_selftest() {
         std::vector<float> g(4096), u(4096); std::vector<double> R(4096), dg, du; grid(g); grid(u); for (auto &y : R) y = rnd(sd);
         for (auto &y : g) y *= 8;   // the sigmoid's whole range
         swiglu_back(g, u, R, dg, du);
-        probe("swiglu", {&g, &u}, {&dg, &du}, [&]() { double s = 0; for (size_t i = 0; i < g.size(); i++) s += (double)g[i] / (1.0 + exp(-(double)g[i])) * u[i] * R[i]; return s; });
+        probe("swiglu", {&g, &u}, {&dg, &du}, [&]() { double s = 0; for (size_t i = 0; i < g.size(); i++) s += (double)g[i] / (1.0 + oz_exp(-(double)g[i])) * u[i] * R[i]; return s; });
     }
     {   // RoPE at position 777: L = sum rope(x) . R
         const int pos = 777; std::vector<float> x(QD); std::vector<double> R(QD); grid(x); for (auto &y : R) y = rnd(sd);
@@ -829,8 +829,8 @@ static int back_selftest() {
         std::vector<int> ex; for (int k = 0; (int)ex.size() < J_TOPK; k++) { int c = sm64(sd++) % J_E; if (std::find(ex.begin(), ex.end(), c) == ex.end()) ex.push_back(c); }
         std::vector<double> R(J_TOPK), dl(J_E, 0.0); for (auto &y : R) y = rnd(sd);
         gate_back(lg.data(), ex.data(), R.data(), dl.data());
-        probe("routing", {&lg}, {&dl}, [&]() { double S = 0, s = 0; for (int k = 0; k < J_TOPK; k++) S += 1.0 / (1.0 + exp(-(double)lg[ex[k]]));
-            for (int k = 0; k < J_TOPK; k++) s += J_RSF / (1.0 + exp(-(double)lg[ex[k]])) / S * R[k]; return s; });
+        probe("routing", {&lg}, {&dl}, [&]() { double S = 0, s = 0; for (int k = 0; k < J_TOPK; k++) S += 1.0 / (1.0 + oz_exp(-(double)lg[ex[k]]));
+            for (int k = 0; k < J_TOPK; k++) s += J_RSF / (1.0 + oz_exp(-(double)lg[ex[k]])) / S * R[k]; return s; });
     }
     bool same = true;
     std::vector<size_t> sizes{6, 45, 131}; if (getenv("OZ_ATTBENCH")) sizes.push_back(1024);   // OZ_ATTBENCH: a full sequence, timed

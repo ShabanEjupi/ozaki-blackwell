@@ -176,7 +176,7 @@ static std::vector<float> norm_rows(const std::vector<float> &h, const std::vect
 static std::vector<float> swiglu_rows(const std::vector<float> &g, const std::vector<float> &u) {
     std::vector<float> a(g.size());
     #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < g.size(); i++) { double gv = g[i]; a[i] = bf(gv / (1.0 + exp(-gv)) * u[i]); }   // swiglu() of jais.cu
+    for (size_t i = 0; i < g.size(); i++) { double gv = g[i]; a[i] = bf(gv / (1.0 + oz_exp(-gv)) * u[i]); }   // swiglu() of jais.cu
     return a;
 }
 static void add_rows(std::vector<float> &h, const std::vector<float> &y) {
@@ -250,7 +250,7 @@ static void gatt(std::vector<BSeq> &S, const std::vector<std::pair<int, size_t>>
         for (size_t i = 0; i < n * D_Q; i++) {   // the softmax of attend_p, on its doubles
             size_t j = i / D_Q; double *v = ga_hs + soff[j] + (i % D_Q) * T[j], mx = -1e300, dn = 0;
             for (unsigned u = 0; u < T[j]; u++) mx = std::max(mx, v[u]);
-            for (unsigned u = 0; u < T[j]; u++) { v[u] = exp(v[u] - mx); dn += v[u]; }
+            for (unsigned u = 0; u < T[j]; u++) { v[u] = oz_exp(v[u] - mx); dn += v[u]; }
             den[i] = dn;
         }
         CK(cudaMemcpy(ga_s, ga_hs, ns * 8, cudaMemcpyHostToDevice));
