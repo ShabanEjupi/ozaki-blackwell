@@ -397,7 +397,7 @@ fidap032 & 1159 & 5.2$\cdot 10^{20}$ & 60 & 0.28 & 54.5 & 193$\times$ & yes & 0.
 fidap006 & 1651 & 3.5$\cdot 10^{21}$ & 154 & 1.08 & 963.7 & 895$\times$ & yes & 0.0 (887) & 0.0 (693) \\
 cry2500 & 2500 & 4.4$\cdot 10^{17}$ & 70 & 1.41 & 699.3 & 497$\times$ & yes & 6.4 (0) & 5.1 (0) \\
 fidapm07 & 2065 & 6.8$\cdot 10^{19}$ & 118 & 1.19 & 9\,381.8$^{c}$ & 7\,857$\times$ & yes & 0.0 (430) & 0.0 (290) \\
-fidap026 & 2163 & 4.7$\cdot 10^{18}$ & 153 & 2.12 & $>$7200 &  & -- & 0.0 (1568) & 0.0 (1530) \\
+fidap026 & 2163 & 4.7$\cdot 10^{18}$ & 153 & 2.12 & 9\,833.9$^{c}$ & 4\,643$\times$ & yes & 0.0 (1568) & 0.0 (1530) \\
 mhd3200a & 3200 & 6.5$\cdot 10^{39}$ & 130 & 4.02 & 1290.8 & 321$\times$ & yes & 0.0 (2876) & 0.0 (2768) \\
 fidap014 & 3251 & 2.6$\cdot 10^{16}$ & 124 & 4.74 & $>$7200 &  & -- & 7.6 (0) & 8.0 (0) \\
 lns\_3937 & 3937 & 1.0$\cdot 10^{17}$ & 79 & 4.31 & 5\,475.3$^{a}$ & 1\,272$\times$ & yes & 10.1 (2) & 7.4 (1) \\
@@ -410,7 +410,8 @@ cry10000 & 10000 & 6.9$\cdot 10^{20}$ & 76 & 115.02 & -- &  & -- & 4.2 (66) & 1.
 \end{tabular}
 \caption{Exact solutions of real systems on the laptop (GPU: $A^{-1}$, lifting, reconstruction and all numerators). SPEX
 ran afterwards on the CPU alone, limit 2~h; $^{a}$3~h limit, beside a 290~GB download; $^{b}$3~h limit, at night after the GPU jobs;
-$^{c}$8~h limit, the machine otherwise idle (sherman3: 14\,141.6 and 14\,369.0~s on two earlier nights beside light load); fidap026 and fidap014: 8~h runs pending at the time of writing; --: not run. Where SPEX finished,
+$^{c}$8~h limit, the machine otherwise idle (sherman3: 14\,141.6 and 14\,369.0~s on two earlier nights beside light load; fidap026:
+low-priority compilations, one or two jobs, ran during its last 19 minutes); fidap014: 8~h run pending at the time of writing; --: not run. Where SPEX finished,
 its digest equals the GPU's. $A'x=b'$ held modulo both check primes in every equation.}\label{tab:real}
 \end{table}
 

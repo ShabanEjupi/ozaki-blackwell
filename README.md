@@ -661,7 +661,7 @@ and chemical plants.
 | fidap006 | 1651 | 48968 | 3.5e21 | 154 | 137635 | 1.08 | 963.7 | 895x | yes | ok | 0.0 (887) | 0.0 (693) |
 | cry2500 | 2500 | 12349 | 4.4e17 | 70 | 142772 | 1.41 | 699.3 | 497x | yes | ok | 6.4 (0) | 5.1 (0) |
 | fidapm07 | 2065 | 45184 | 6.8e19 | 118 | 161950 | 1.19 | 9381.8 ᶜ | 7857x | yes | ok | 0.0 (430) | 0.0 (290) |
-| fidap026 | 2163 | 74195 | 4.7e18 | 153 | 194835 | 2.12 | > 7200 |  | -- | ok | 0.0 (1568) | 0.0 (1530) |
+| fidap026 | 2163 | 74195 | 4.7e18 | 153 | 194835 | 2.12 | 9833.9 ᶜ | 4643x | yes | ok | 0.0 (1568) | 0.0 (1530) |
 | mhd3200a | 3200 | 68026 | 6.5e39 | 130 | 186119 | 4.02 | 1290.8 | 321x | yes | ok | 0.0 (2876) | 0.0 (2768) |
 | fidap014 | 3251 | 65747 | 2.6e16 | 124 | 256431 | 4.74 | > 7200 |  | -- | ok | 7.6 (0) | 8.0 (0) |
 | lns_3937 | 3937 | 25407 | 1.0e17 | 79 | 195969 | 4.31 | 5475.3 ᵃ | 1272x | yes | ok | 10.1 (2) | 7.4 (1) |
@@ -674,14 +674,14 @@ and chemical plants.
 GPU s: A⁻¹ + lifting + reconstruction + all numerators (the determinant's det/d step apart; where it needs more than the
 ~78 000 bits the 16-bit primes give, it is reported as not computed — the solution does not depend on it). SPEX ran in the
 night after the GPU pass (CPU alone), limit 2 h each; ᵃ 3 h limit, beside the 290 GB K2-Think-V2 download (27-10);
-ᵇ 3 h limit, the night of 28/29-10 after the GPU jobs; ᶜ 8 h limit, the machine otherwise idle (sherman3 31-10 11:35–15:24, fidapm07 02/03-11 22:35–01:03; 14 141.6 s
+ᵇ 3 h limit, the night of 28/29-10 after the GPU jobs; ᶜ 8 h limit, the machine otherwise idle (sherman3 31-10 11:35–15:24, fidapm07 02/03-11 22:35–01:03, fidap026 03-11 20:55–23:39 with nice'd builds of 1–2 jobs in its last 19 min; 14 141.6 s
 and 14 369.0 s on 29-10 and 30-10 beside light load). Every finished SPEX digest equals the GPU's (`/opt/ozaki/real/*/gpu.log`,
 `spex*.log`). fidapm07, fidap026, fidap014: 8 h on an idle machine, one a night from 02-11 (`llm/night_checks.sh`).
 
 What the table says: on **7 of 13 real systems FP64 has not one correct digit** — LAPACK and SuperLU alike, with the right
 order of magnitude only by accident (mhd3200a / mhd4800a: normwise error 10⁸, 82–99 % of the entries without a correct digit) —
 while NIST's condition estimate (itself FP64) does not tell which ones (qh1484 at 5.6·10¹⁷ keeps 11 digits). The exact
-solution, certified, takes 0.2–34 s on the laptop; SPEX gives the same x bit for bit where it finishes, 9× to 7 857× slower (03-11: fidapm07 in 9 381.8 s on an idle night).
+solution, certified, takes 0.2–34 s on the laptop; SPEX gives the same x bit for bit where it finishes, 9× to 7 857× slower (03-11: fidapm07 in 9 381.8 s, fidap026 in 9 833.9 s with the GPU's digest 074108efb41c06d2, on idle nights).
 
 **SQ** — 13 matricat reale më të këqija të NIST Matrix Market (n 989–5005, κ deri 3·10⁴⁷): zgjidhja e SAKTË, e certifikuar,
 për 0,2–34 s te laptopi; SPEX (vegla e dedikuar për zgjidhje të sakta të rralla) jep të njëjtën x bit për bit, 9–7 857× më ngadalë.
