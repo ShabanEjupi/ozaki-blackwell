@@ -20,17 +20,17 @@ P=/opt/ozaki/cu13/lib/python3.12/site-packages/nvidia/cu13
 . llm/hold.sh; hold energyemu; log "machine held"
 ./out_energy oz16 3 > /dev/null 2>&1   # warm-up: clocks and power settle before the first sampled run
 run() {   # run <label> <command...>: three sampled runs
-    local lab=$1; shift
+    local lab=$1; shift; local cmd=("$@") pw ns clk
     for r in 1 2 3; do
         S=$(mktemp)
         nvidia-smi --query-gpu=power.draw,clocks.sm --format=csv,noheader,nounits -lms 200 > "$S" 2> /dev/null & SP=$!
-        out=$(set -o pipefail; "$@" 2>&1 | tail -n 1); rc=$?
+        out=$(set -o pipefail; "${cmd[@]}" 2>&1 | tail -n 1); rc=$?
         kill $SP 2> /dev/null; wait $SP 2> /dev/null
         g=$(printf '%s\n' "$out" | sed -nE 's/.*: ([0-9.]+) GFLOPS over.*/\1/p')
         m=$(awk -F', *' '$1 ~ /^[0-9.]+$/ {s += $1; c += $2; k++} END {if (k) printf "%.2f %d %.0f", s / k, k, c / k; else print "0 0 0"}' "$S")
-        rm -f "$S"; set -- $m
-        e=$(awk -v g="${g:-0}" -v p="$1" 'BEGIN {if (p > 0 && g > 0) printf "%.2f GFLOPS/W", g / p; else print "NOT MEASURED"}')
-        log "$lab run $r rc=$rc: $out | mean $1 W over $2 samples, SM $3 MHz | $e"
+        rm -f "$S"; read -r pw ns clk <<< "$m"   # not set --: that would replace the command in $@
+        e=$(awk -v g="${g:-0}" -v p="$pw" 'BEGIN {if (p > 0 && g > 0) printf "%.2f GFLOPS/W", g / p; else print "NOT MEASURED"}')
+        log "$lab run $r rc=$rc: $out | mean $pw W over $ns samples, SM $clk MHz | $e"
     done
 }
 for w in native oz16 oz14 oz12; do run "ours $w" ./out_energy $w 12; done
