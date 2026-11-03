@@ -90,7 +90,11 @@ static DevW transposed(const std::vector<DevW> &Ws, int &kpad) {
 // dX += [dY_1 | dY_2] [W_1 ; W_2] for FP8 maps (tgemm.cu): the weights' own E4M3 digits, transposed, and dY once in K (hi|lo
 // needed it twice); the same correctly rounded outputs. OZ_HILO=1: the hi|lo product below for every map.
 static void *dTs; static bool HILO = getenv("OZ_HILO");
-static void dgrad_f8(const std::vector<DevW> &Ws, const std::vector<const std::vector<double> *> &dY, size_t N, std::vector<double> &dX) {
+static inline uint16_t bfb(double v) { float f = bf(v); uint32_t u; memcpy(&u, &f, 4); return u >> 16; }   // BF16 bits
+// fill(n0, n, x) writes rows n0 .. n0+n-1 of [dY_1 | dY_2] as BF16 bits into x (n rows of Kt; the rows after them, up to the
+// next multiple of 8, stay zero). The MoE backward fills them where dY is made (dy = w g, swiglu_back): no FP64 copy of dY and
+// no second pass over it -- the same bits, as each is bfb() of the same FP64 value (03-11-2026).
+template <class F> static void dgrad_f8x(const std::vector<DevW> &Ws, size_t N, std::vector<double> &dX, F fill) {
     auto t0 = std::chrono::steady_clock::now(), tp = t0;
     int Ko = Ws[0].K, Kt = 0; for (auto &W : Ws) Kt += W.M;
     int KB = Kt / 128; size_t PW = (size_t)Ko * Kt;
@@ -109,11 +113,8 @@ static void dgrad_f8(const std::vector<DevW> &Ws, const std::vector<const std::v
     std::vector<uint8_t> hw[2]; std::vector<uint16_t> hs[2];   // the weights on the host, only when an output is left to it
     for (size_t n0 = 0; n0 < N; n0 += G_NB) {
         size_t n = std::min(G_NB, N - n0), np = (n + 7) / 8 * 8;
-        xb.assign(np * Kt, 0);
-        #pragma omp parallel for schedule(static)
-        for (size_t r = 0; r < n; r++) { uint16_t *x = xb.data() + r * Kt;
-            for (int i = 0, off = 0; i < C.n; off += C.Mo[i], i++) { const double *gr = dY[i]->data() + (n0 + r) * C.Mo[i];
-                for (int m = 0; m < C.Mo[i]; m++) { float f = bf(gr[m]); uint32_t u; memcpy(&u, &f, 4); x[off + m] = u >> 16; } } }
+        xb.resize(np * Kt); std::fill(xb.begin() + n * Kt, xb.end(), 0);   // fill() writes every column of rows 0 .. n-1
+        fill(n0, n, xb.data());
         CK(cudaMemcpy(g_xb, xb.data(), np * Kt * 2, cudaMemcpyHostToDevice)); pmark(tp, "dg8 x-host");
         bf16_digits<<<dig_grid(np * KB), 256>>>(g_xb, g_xd, g_xl, g_xn, (int)np, Kt, DX24); pmark(tp, "dg8 x-digits");
         CK(cudaMemset(g_nb, 0, 4));
@@ -144,6 +145,14 @@ static void dgrad_f8(const std::vector<DevW> &Ws, const std::vector<const std::v
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < Y.size(); i++) dX[i] += Y[i];
     pmark(tp, "dg add");
+}
+static void dgrad_f8(const std::vector<DevW> &Ws, const std::vector<const std::vector<double> *> &dY, size_t N, std::vector<double> &dX) {
+    int Kt = 0; for (auto &W : Ws) Kt += W.M;
+    dgrad_f8x(Ws, N, dX, [&](size_t n0, size_t n, uint16_t *xb) {
+        #pragma omp parallel for schedule(static)
+        for (size_t r = 0; r < n; r++) { uint16_t *x = xb + r * Kt;
+            for (size_t i = 0, off = 0; i < Ws.size(); off += Ws[i].M, i++) { const double *gr = dY[i]->data() + (n0 + r) * Ws[i].M;
+                for (int m = 0; m < Ws[i].M; m++) x[off + m] = bfb(gr[m]); } } });
 }
 // dX += [dY_1 | dY_2 | ...] [W_1 ; W_2 ; ...] (the forward was Y_i = X W_i^T): every output one correctly rounded FP32 of
 // the exact sum, added to the FP64 dX
@@ -468,16 +477,32 @@ static void moe_back(const std::string &P, int L, const std::vector<float> &x2, 
         pmark(tm, "moe load");
         auto gg = bmm(Wg, x2, rd, rh, n), uu = bmm(Wu, x2, rd, rh, n), y = bmm(Wd, swiglu_rows(gg, uu));
         pmark(tm, "moe forward");
-        std::vector<double> dy(n * D_H);
+        // FP8 experts (the training's path): dy = w g and swiglu_back's dg, du are rounded to BF16 in the loops that make them,
+        // straight into the products' input (dgrad_f8x); OZ_HILO=1 or other formats: the FP64 vectors and dgrad() as before
+        const bool f8 = !HILO && Wd.fmt == F_E4M3B && Wg.fmt == F_E4M3B && Wu.fmt == F_E4M3B;
+        std::vector<double> dy(f8 ? 0 : n * D_H);
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < n; i++) { size_t r = by[e][i].first; int s = by[e][i].second; double w = wt[r][s], d = 0;
             const double *gr = g.data() + r * D_H; const float *yi = y.data() + i * D_H;
-            for (int c = 0; c < D_H; c++) { dy[i * D_H + c] = w * gr[c]; d += gr[c] * yi[c]; }
+            if (f8) for (int c = 0; c < D_H; c++) d += gr[c] * yi[c];
+            else for (int c = 0; c < D_H; c++) { dy[i * D_H + c] = w * gr[c]; d += gr[c] * yi[c]; }
             dw[r * J_TOPK + s] = d; }
         pmark(tm, "moe dy");
         std::vector<double> da(n * (size_t)J_MFF, 0.0), dg, du, dxe(n * D_H, 0.0);
-        dgrad({Wd}, {&dy}, n, da); pmark(tm, "moe dgrad down"); swiglu_back(gg, uu, da, dg, du); pmark(tm, "moe swiglu_back");
-        dgrad({Wg, Wu}, {&dg, &du}, n, dxe); pmark(tm, "moe dgrad gate+up");
+        if (f8) dgrad_f8x({Wd}, n, da, [&](size_t n0, size_t m, uint16_t *xb) {
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < m; i++) { size_t r = by[e][n0 + i].first; double w = wt[r][by[e][n0 + i].second];
+                const double *gr = g.data() + r * D_H; uint16_t *x = xb + i * D_H;
+                for (int c = 0; c < D_H; c++) x[c] = bfb(w * gr[c]); } });
+        else dgrad({Wd}, {&dy}, n, da);
+        pmark(tm, "moe dgrad down");
+        if (f8) dgrad_f8x({Wg, Wu}, n, dxe, [&](size_t n0, size_t m, uint16_t *xb) {   // swiglu_back's two formulas, row by row
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < m; i++) { uint16_t *x = xb + i * 2 * (size_t)J_MFF;
+                for (int c = 0; c < J_MFF; c++) { size_t k = (n0 + i) * J_MFF + c; double g = gg[k], s = 1.0 / (1.0 + exp(-g));
+                    x[c] = bfb(da[k] * uu[k] * s * (1.0 + g * (1.0 - s))); x[J_MFF + c] = bfb(da[k] * g * s); } } });
+        else { swiglu_back(gg, uu, da, dg, du); pmark(tm, "moe swiglu_back"); dgrad({Wg, Wu}, {&dg, &du}, n, dxe); }
+        pmark(tm, "moe dgrad gate+up");
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < n; i++) { double *d = dx2.data() + by[e][i].first * D_H; const double *s = dxe.data() + i * D_H; for (int c = 0; c < D_H; c++) d[c] += s[c]; }
         pmark(tm, "moe add");
