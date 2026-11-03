@@ -29,6 +29,7 @@ __global__ void k_sw(int set, uint64_t base, size_t n, uint16_t *o) {
         oz_swiglu_bf(fc_f(h, set), fc_f(h2, set), fc_f(h3, set) * (set ? 1.f : 1e-3f), o[2 * i], o[2 * i + 1]); }
 }
 static bool same16(uint16_t a, uint16_t b) { return a == b || (((a & 0x7f80) == 0x7f80 && (a & 0x7f)) && ((b & 0x7f80) == 0x7f80 && (b & 0x7f))); }
+static int fill_kernels();
 int main() {
     const size_t C = (size_t)1 << 24; uint16_t *d; std::vector<uint16_t> h(2 * C);
     if (cudaMalloc(&d, 4 * C) != cudaSuccess) { fprintf(stderr, "cudaMalloc\n"); return 1; }
@@ -66,6 +67,47 @@ int main() {
             sbad[set] += sb;
         }
     printf("oz_swiglu_bf: 2^31 triples realistic, differ: %llu; 2^31 any bits, differ: %llu\n", sbad[0], sbad[1]);
-    printf(bad || sbad[0] || sbad[1] ? "FAILED\n" : "all equal\n");
-    return bad || sbad[0] || sbad[1];
+    int kf = fill_kernels();
+    printf(bad || sbad[0] || sbad[1] || kf ? "FAILED\n" : "all equal\n");
+    return bad || sbad[0] || sbad[1] || kf;
+}
+// (appended 03-11) the two fill kernels of moe_dev.cuh against jais_lora.cu's fill_down and fill_gu loops, written as they
+// are there, on Jais-3's shapes (D = 6144, F = 2048 here as a stand-in multiple of 128): every byte of x and every dw.
+#include "moe_dev.cuh"
+static int fill_kernels() {
+    const int N = 2048, n = 3000, D = 6144, F = 2048; std::mt19937_64 R(7); std::normal_distribution<double> nd;
+    std::vector<double> g((size_t)N * D), w(n); std::vector<int> rows(n); std::vector<float> y((size_t)n * D), gg((size_t)n * F), uu(gg.size()), yd(gg.size());
+    for (auto &v : g) v = nd(R) * 1e-3; for (auto &v : y) v = (float)nd(R); for (int i = 0; i < n; i++) { rows[i] = (int)(R() % N); w[i] = std::abs(nd(R)) * 0.3; }
+    for (size_t k = 0; k < gg.size(); k++) { gg[k] = (float)(nd(R) * 3); uu[k] = (float)(nd(R) * 2); yd[k] = (float)(nd(R) * 1e-2); }
+    g[5] = 0; g[6] = -0.0; y[7] = -0.0f; gg[3] = 0; yd[4] = -0.0f; gg[9] = 90; gg[10] = -90; g[11] = 1e-320;   // edges
+    std::vector<uint16_t> hx((size_t)n * D), hgu((size_t)n * 2 * F); std::vector<double> hdw(n);
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; i++) {   // fill_down, verbatim
+        size_t r = rows[i]; double wi = w[i], d = 0; const double *gr = g.data() + r * D; const float *yi = y.data() + (size_t)i * D; uint16_t *x = hx.data() + (size_t)i * D;
+        for (int c = 0; c < D; c++) { float f = bf(wi * gr[c]); uint32_t u; memcpy(&u, &f, 4); x[c] = u >> 16; d += gr[c] * yi[c]; }
+        hdw[i] = d; }
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; i++) { uint16_t *x = hgu.data() + (size_t)i * 2 * F;   // fill_gu, verbatim (da from the dgrad add)
+        for (int c = 0; c < F; c++) { size_t k = (size_t)i * F + c; double da = 0.0; da += yd[k]; double gv = gg[k], s = 1.0 / (1.0 + oz_exp(-gv));
+            float f1 = bf(da * uu[k] * s * (1.0 + gv * (1.0 - s))), f2 = bf(da * gv * s); uint32_t u1, u2; memcpy(&u1, &f1, 4); memcpy(&u2, &f2, 4);
+            x[c] = u1 >> 16; x[F + c] = u2 >> 16; } }
+    double *dg, *dw_, *dwo; int *dr; float *dy, *dgg, *duu, *dyd; uint16_t *dx, *dgu;
+    cudaMalloc(&dg, g.size() * 8); cudaMalloc(&dw_, n * 8); cudaMalloc(&dwo, n * 8); cudaMalloc(&dr, n * 4); cudaMalloc(&dy, y.size() * 4);
+    cudaMalloc(&dgg, gg.size() * 4); cudaMalloc(&duu, gg.size() * 4); cudaMalloc(&dyd, gg.size() * 4); cudaMalloc(&dx, hx.size() * 2); cudaMalloc(&dgu, hgu.size() * 2);
+    cudaMemcpy(dg, g.data(), g.size() * 8, cudaMemcpyHostToDevice); cudaMemcpy(dw_, w.data(), n * 8, cudaMemcpyHostToDevice); cudaMemcpy(dr, rows.data(), n * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dy, y.data(), y.size() * 4, cudaMemcpyHostToDevice); cudaMemcpy(dgg, gg.data(), gg.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(duu, uu.data(), gg.size() * 4, cudaMemcpyHostToDevice); cudaMemcpy(dyd, yd.data(), gg.size() * 4, cudaMemcpyHostToDevice);
+    cudaEvent_t e0, e1, e2; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
+    cudaEventRecord(e0); k_fill_down<<<2048, 256>>>(dg, dr, dw_, dy, n, D, dx, dwo); cudaEventRecord(e1);
+    k_fill_gu<<<2048, 256>>>(dgg, duu, dyd, n, F, dgu); cudaEventRecord(e2); cudaEventSynchronize(e2);
+    if (cudaGetLastError()) { printf("kernel error\n"); return 1; }
+    float t1, t2; cudaEventElapsedTime(&t1, e0, e1); cudaEventElapsedTime(&t2, e1, e2);
+    std::vector<uint16_t> gx(hx.size()), ggu(hgu.size()); std::vector<double> gdw(n);
+    cudaMemcpy(gx.data(), dx, gx.size() * 2, cudaMemcpyDeviceToHost); cudaMemcpy(ggu.data(), dgu, ggu.size() * 2, cudaMemcpyDeviceToHost); cudaMemcpy(gdw.data(), dwo, n * 8, cudaMemcpyDeviceToHost);
+    size_t bx = 0, bg = 0, bd = 0;
+    for (size_t k = 0; k < hx.size(); k++) bx += hx[k] != gx[k];
+    for (size_t k = 0; k < hgu.size(); k++) bg += !same16(hgu[k], ggu[k]);
+    for (int i = 0; i < n; i++) bd += memcmp(&hdw[i], &gdw[i], 8) != 0;
+    printf("k_fill_down: %zu of %zu x differ, %zu of %d dw differ (%.2f ms); k_fill_gu: %zu of %zu x differ (%.2f ms)\n", bx, hx.size(), bd, n, t1, bg, hgu.size(), t2);
+    return (bx || bd || bg) ? 1 : 0;
 }
