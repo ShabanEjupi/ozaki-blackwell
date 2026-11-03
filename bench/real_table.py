@@ -12,7 +12,9 @@ for N in K:
     lg = f"{d}/gpu.log" if os.path.exists(f"{d}/gpu.log") else f"{d}/gpu_dixon.log"   # Dixon above the HOL buffers (bench/real_dixon.sh)
     if not os.path.exists(lg) or "digest" not in open(lg).read(): continue
     c, g = open(f"{d}/conv.log").read(), open(lg).read()
-    s = open(f"{d}/spex.log").read() if os.path.exists(f"{d}/spex.log") else ""
+    # the clean night run (night_checks.sh / ozaki-spex-idle: the machine otherwise idle) where there is one, else the first run
+    sl = [f"{d}/{x}" for x in ("spex_idle.log", "spex.log") if os.path.exists(f"{d}/{x}")]
+    s = next((open(x).read() for x in sl if "SPEX Left LU" in open(x).read()), open(sl[-1]).read() if sl else "")
     m = re.search(r"n (\d+) \(padded \d+\) nnz (\d+) entry bits (\d+)", c)
     t = lambda k: float(re.search(k + r" ([0-9.]+)", g).group(1))
     if "[A^-1" in g: tg = t(r"\[A\^-1") + t(r"steps") + t(r"ratrec") + float(re.search(r"digest [0-9a-f]+; ([0-9.]+) s", g).group(1))

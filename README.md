@@ -173,7 +173,7 @@ xhauleve: 9,4× më pak; ajo statike (~17 W bordi): 23,7× më pak, sepse mbaron
 ## Next / Më tej (27-10-2026)
 - Kimi K3 end to end on this laptop needs 1.56 TB of storage (669 GB free; the office link gave 2.9 MB/s): an external NVMe
   and the K3 attention (KDA linear attention + MLA) on the exact products; then the whole model streams at ~27 s per token.
-- Real systems above n ≈ 6000 run by Dixon (bench/real_dixon.sh); HOL by column blocks would be 2.6–4.3× faster there.
+- Real systems above n ≈ 6000 run by Dixon (bench/real_dixon.sh); HOL by column blocks would be 1.4–4.3× faster there.
 - cry10000 (n = 10 000) solved exactly in 122 s (D 574 553 bits); the SPEX column for the larger systems fills in the night
   runs (`/opt/ozaki/real/batch.log`; `bench/real_table.py [--tex]`).
 - ✅ 27-10: Nemotron 3 Ultra (560 B, open weights; its main pre-training data gated, internal training only) runs whole and
@@ -183,7 +183,7 @@ xhauleve: 9,4× më pak; ajo statike (~17 W bordi): 23,7× më pak, sepse mbaron
 - An 8-bit X for HOL was measured and dropped (below); the proved bound with row scaling and n = 32768 remain as before.
 
 **SQ** — Radha: K3 i plotë kërkon 1,56 TB disk (SSD i jashtëm) dhe vëmendjen e K3; n > 6000 me Dixon (HOL në blloqe do
-ishte 2,6–4,3× më shpejt); kolona SPEX plotësohet natën.
+ishte 1,4–4,3× më shpejt); kolona SPEX plotësohet natën.
 
 ## Double-double (~106-bit) GEMM from INT8 — a precision no GPU has in hardware (`bench/dd_test.cu`)
 
@@ -371,8 +371,8 @@ del i saktë bit për bit kundrejt GMP-së.
 | 4 087 | 1024 | 640 | **341 ms** | 125 s (368×) | 6.10 s | **18×** |
 | 16 375 | 512 | 2 112 | **363 ms** (residues fused, below) | 104 s (287×) | 6.33 s | **17×** |
 
-Doubling n at fixed bits does not raise the ratio (16 375 bits: 19× at n = 256, 15× at n = 512): even there the two
-conversion GEMMs (~1.9·10¹³ INT8 ops at 16 375 bits, n = 512) dwarf the 8 704 product GEMMs (~2.3·10¹² ops). With the residue reduction fused into the GEMM epilogue (a prime's two weight rows are rows g and g + 8 of one m16 tile, so
+Doubling n at fixed bits does not raise the ratio (16 375 bits: 19× at n = 256, 17× at n = 512 — 15× before the fused epilogue below): even there the two
+conversion GEMMs (~1.9·10¹³ INT8 ops at 16 375 bits, n = 512) dwarf the 8 448 product GEMMs (2 112 primes × 4) (~2.3·10¹² ops). With the residue reduction fused into the GEMM epilogue (a prime's two weight rows are rows g and g + 8 of one m16 tile, so
 one thread holds both sums and no int32 matrix goes to memory; `OZ_UNFUSED=1` turns it off): 16 375 bits, n = 512
 403 → 363 ms; 1 015 bits, n = 1024 83 → 73 ms (the GPU is power-bound; runs vary by ~5 %). The conversions
 are the whole remaining cost; a two-level residue system (subquadratic in P) is the next step.
@@ -571,7 +571,7 @@ table above. FLINT: `fmpz_mat_det`, 24 threads; the 512 × 256-bit, 2048 × 128-
 (247 modular GEMMs of n³, ~8 ms each: power-bound), the vector chain 0.44 s.
 
 What changed: the ratio to FLINT now **rises** with the entry size (63× at 512 × 256-bit, 306× at 2048 × 128-bit) where
-digit-by-digit lifting made it fall — the lifting is 2.6–4.3× faster than S-prime Dixon and grows like the bits, not their
+digit-by-digit lifting made it fall — the lifting is 1.4–4.3× faster than S-prime Dixon (at n = 2048: 1.4×, 3.0×, 4.3× for 32-, 64-, 128-bit entries) and grows like the bits, not their
 square.
 
 Checked: bit-exact against FLINT `fmpz_mat_det` in every row; a zero leading minor (preconditioned) and a singular matrix
@@ -644,12 +644,12 @@ and chemical plants.
 | fidap032 | 1159 | 11047 | 5.2e20 | 60 | 58651 | 0.28 | 54.5 | 193x | yes | ok | 0.0 (568) | 0.0 (572) |
 | fidap006 | 1651 | 48968 | 3.5e21 | 154 | 137635 | 1.08 | 963.7 | 895x | yes | ok | 0.0 (887) | 0.0 (693) |
 | cry2500 | 2500 | 12349 | 4.4e17 | 70 | 142772 | 1.41 | 699.3 | 497x | yes | ok | 6.4 (0) | 5.1 (0) |
-| fidapm07 | 2065 | 45184 | 6.8e19 | 118 | 161950 | 1.19 | > 7200 |  | -- | ok | 0.0 (430) | 0.0 (290) |
+| fidapm07 | 2065 | 45184 | 6.8e19 | 118 | 161950 | 1.19 | 9381.8 ᶜ | 7857x | yes | ok | 0.0 (430) | 0.0 (290) |
 | fidap026 | 2163 | 74195 | 4.7e18 | 153 | 194835 | 2.12 | > 7200 |  | -- | ok | 0.0 (1568) | 0.0 (1530) |
 | mhd3200a | 3200 | 68026 | 6.5e39 | 130 | 186119 | 4.02 | 1290.8 | 321x | yes | ok | 0.0 (2876) | 0.0 (2768) |
 | fidap014 | 3251 | 65747 | 2.6e16 | 124 | 256431 | 4.74 | > 7200 |  | -- | ok | 7.6 (0) | 8.0 (0) |
-| lns_3937 | 3937 | 25407 | 1.0e17 | 79 | 195969 | 4.31 | 5475.3 ᵃ | 1270x | yes | ok | 10.1 (2) | 7.4 (1) |
-| fidap012 | 3973 | 79017 | 2.2e20 | 119 | 271165 | 7.44 | 10422.9 ᵇ | 1401x | yes | ok | 0.0 (483) | 0.0 (482) |
+| lns_3937 | 3937 | 25407 | 1.0e17 | 79 | 195969 | 4.31 | 5475.3 ᵃ | 1272x | yes | ok | 10.1 (2) | 7.4 (1) |
+| fidap012 | 3973 | 79017 | 2.2e20 | 119 | 271165 | 7.44 | 10422.9 ᵇ | 1400x | yes | ok | 0.0 (483) | 0.0 (482) |
 | mhd4800a | 4800 | 102252 | 3.2e47 | 131 | 281770 | 34.39 | 4341.4 ᵇ | 126x | yes | ok | 0.0 (3923) | 0.0 (4754) |
 | sherman3 | 5005 | 20033 | 6.9e16 | 102 | 170131 | 14.25 | 13517.7 ᶜ | 949x | yes | ok | 11.8 (0) | 12.4 (0) |
 | fidapm15 | 9287 | 96099 | 1.36e20 | 63 | 510845 | 78.66 | -- |  | -- | ok | 0.0 (2251) | 0.0 (5260) |
@@ -658,17 +658,17 @@ and chemical plants.
 GPU s: A⁻¹ + lifting + reconstruction + all numerators (the determinant's det/d step apart; where it needs more than the
 ~78 000 bits the 16-bit primes give, it is reported as not computed — the solution does not depend on it). SPEX ran in the
 night after the GPU pass (CPU alone), limit 2 h each; ᵃ 3 h limit, beside the 290 GB K2-Think-V2 download (27-10);
-ᵇ 3 h limit, the night of 28/29-10 after the GPU jobs; ᶜ 8 h limit, the machine otherwise idle (31-10 11:35–15:24; 14 141.6 s
+ᵇ 3 h limit, the night of 28/29-10 after the GPU jobs; ᶜ 8 h limit, the machine otherwise idle (sherman3 31-10 11:35–15:24, fidapm07 02/03-11 22:35–01:03; 14 141.6 s
 and 14 369.0 s on 29-10 and 30-10 beside light load). Every finished SPEX digest equals the GPU's (`/opt/ozaki/real/*/gpu.log`,
 `spex*.log`). fidapm07, fidap026, fidap014: 8 h on an idle machine, one a night from 02-11 (`llm/night_checks.sh`).
 
 What the table says: on **7 of 13 real systems FP64 has not one correct digit** — LAPACK and SuperLU alike, with the right
 order of magnitude only by accident (mhd3200a / mhd4800a: normwise error 10⁸, 82–99 % of the entries without a correct digit) —
 while NIST's condition estimate (itself FP64) does not tell which ones (qh1484 at 5.6·10¹⁷ keeps 11 digits). The exact
-solution, certified, takes 0.2–34 s on the laptop; SPEX gives the same x bit for bit where it finishes, 23× to ~900× slower.
+solution, certified, takes 0.2–34 s on the laptop; SPEX gives the same x bit for bit where it finishes, 9× to 7 857× slower (03-11: fidapm07 in 9 381.8 s on an idle night).
 
 **SQ** — 13 matricat reale më të këqija të NIST Matrix Market (n 989–5005, κ deri 3·10⁴⁷): zgjidhja e SAKTË, e certifikuar,
-për 0,2–34 s te laptopi; SPEX (vegla e dedikuar për zgjidhje të sakta të rralla) jep të njëjtën x bit për bit, 23–900× më ngadalë.
+për 0,2–34 s te laptopi; SPEX (vegla e dedikuar për zgjidhje të sakta të rralla) jep të njëjtën x bit për bit, 9–7 857× më ngadalë.
 Te 7 nga 13 sisteme FP64 (LAPACK dhe SuperLU) s'ka asnjë shifër të saktë.
 
 ## Exact arithmetic for the largest open model / Aritmetikë e saktë për modelin më të madh të hapur (27-10-2026, `llm/`)
@@ -939,7 +939,7 @@ one. The product prompt is still reasoning after 30 generated tokens, identicall
 **SQ** — Nemotron 3 Ultra i tërë (560 miliardë parametra) punon në laptop nga disku, token pas tokeni, me çdo prodhim
 matricë-vektor të rrumbullakosur saktë (një rrumbullakim i certifikuar, i provuar kundër një akumuluesi 2 560-bit; prova e
 barazimeve gjeti dhe ndreqi një defekt). 19,6 s për token me lexim përpara — aq sa motori FP32: saktësia s'kushton asgjë.
-Motori me akumulim FP32 ndryshon 42–49 % të logit-ëve të ruterit (projeksionet BF16 vetëm 0,01 %), logit-i largohet deri në
+Motori me akumulim FP32 ndryshon 41–47 % të logit-ëve të ruterit (projeksionet BF16 vetëm 0,01 %), logit-i largohet deri në
 1,22, dhe teksti ndahet: shqip pas tokenit të 5-të / 13-të, anglisht pas të 29-tit. Te OLMo 2 rruga e saktë shkruan «10,908»
 vendbanime, motori «2,994» — asnjëri s'ndodhet te 4,6T tokenat e trajnimit: të dy të shpikur, ndryshe. 123456789 × 987654321 = 121932631112635269 — saktë në të tri rrugët. Te K2-Think-V2 (72,6 B, nga disku, 0 të pacertifikuara) të dy motorët bien dakord mes tyre dhe ndahen nga rruga e saktë: shqip pas tokenit të 8-të (e sakta «qyteti më i madh në vend», motorët «qytet i vendosur në pjesën qendrore të vendit»), anglisht pas të 27-tit — të dyja të vërteta, rrumbullakimi zgjedh cilën. Për qasje të plotë te të
 dhënat: OLMo 2 32B (të gjitha të dhënat e trajnimit të kërkueshme), K2-Think-V2 (më i forti plotësisht i hapur); asnjë model
