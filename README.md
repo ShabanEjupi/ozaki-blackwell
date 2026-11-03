@@ -67,6 +67,13 @@ per INT8 operation (fewer moduli, fewer bit flips), not in latency hiding.
 | native FP64, peak kernel | 423 | 56.8 | 7.4 |
 | **Ozaki-II, 16 moduli** | **5 068** | 94.6 | **53.6 (7.2×)** |
 | Ozaki-II, 12 moduli | 6 580 | 94.6 | 69.5 |
+| **3 November, current code** (`bench/energy_all.sh`, three runs each) | | | |
+| native FP64, peak kernel | 401–403 | 54.8–59.0 | 6.82–7.32 |
+| Ozaki-II, 16 moduli | 5 795–5 870 | 113.2–116.8 | 50.2–51.3 |
+| Ozaki-II, 12 moduli | 7 555–7 606 | 116.2–117.3 | 64.4–65.1 |
+
+The rows above the 3 November line are the code of 15 October. The current code is 14–16 % faster at 16 moduli and draws
+20–24 % more power (the laptop held ~95 W that day, 113–117 W on 3 November), so the joules per product barely moved.
 
 Under load the laptop holds ~95 W and the SM clock drops to ~1.8 GHz (2.76 GHz on the FP64 units alone).
 
