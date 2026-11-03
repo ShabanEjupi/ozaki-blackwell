@@ -22,6 +22,8 @@ nvcc -O3 -arch=sm_120a -std=c++17 -Xcompiler -fopenmp -o out_jlora_new llm/jais_
 log "built; waiting for the machine (spex.want, then the end of the running training run, AC)"
 hold $LB
 log "machine held"
+# BC_PRE: the new binary's own checks first (e.g. its --mdtest), while the machine is held; one failing deploys nothing
+if [ -n "$BC_PRE" ]; then log "pre-check: $BC_PRE"; bash -c "$BC_PRE" >> $L 2>&1 || { log "pre-check FAILED: NOT deployed"; exit 1; }; log "pre-check passed"; fi
 bad=0
 # jlora_test.sh runs ./out_jlora_t: first the training's binary, then the new one; digests and losses (not times) must agree
 keep() { sed 's/ sync=.*//' "$1"; }

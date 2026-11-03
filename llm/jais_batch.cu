@@ -38,7 +38,8 @@ static void prof_dump(const char *head) {
 // ---- the batched product: Y[n][M] = X[n][K] W^T to p bits, every output certified ------------------------------------------
 static int8_t *g_wd, *g_xd; static int16_t *g_wl, *g_xl; static uint8_t *g_wn, *g_xn, *g_xq; static uint16_t *g_xb;
 static float *g_x, *g_xs, *g_Y; static unsigned *g_list, *g_lcnt; static int *g_nb; static size_t G_NB;
-static const unsigned G_CAP = 1u << 22;
+// OZ_GCAP: a shorter fixup list (tests: the outputs beyond it go to the host GEMV / f8_host, on every path)
+static const unsigned G_CAP = getenv("OZ_GCAP") ? (unsigned)atol(getenv("OZ_GCAP")) : 1u << 22;
 static long long st_rows, st_outs, st_outs24, st_fix, st_fix24, st_host, st_fixopen;   // rows, outputs (p 8; p 24), left to the CUDA-core fixup, rows to the host GEMV, fixup outputs it left open
 static long long st_fix8;   // FP8 outputs the XF8 tiles left to f8x_fixup
 static double t_gemm; static const bool OLDK8 = getenv("OZ_OLDK8");
