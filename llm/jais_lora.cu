@@ -91,6 +91,7 @@ static DevW transposed(const std::vector<DevW> &Ws, int &kpad) {
 // needed it twice); the same correctly rounded outputs. OZ_HILO=1: the hi|lo product below for every map.
 static void *dTs; static bool HILO = getenv("OZ_HILO");
 static inline uint16_t bfb(double v) { float f = bf(v); uint32_t u; memcpy(&u, &f, 4); return u >> 16; }   // BF16 bits
+static std::vector<uint16_t> g_hxb; static std::vector<float> g_hy;   // one chunk's input bits and outputs on the host
 // fill(n0, n, x) writes rows n0 .. n0+n-1 of [dY_1 | dY_2] as BF16 bits into x (n rows of Kt; the rows after them, up to the
 // next multiple of 8, stay zero). The MoE backward fills them where dY is made (dy = w g, swiglu_back): no FP64 copy of dY and
 // no second pass over it -- the same bits, as each is bfb() of the same FP64 value (03-11-2026).
@@ -109,7 +110,7 @@ template <class F> static void dgrad_f8x(const std::vector<DevW> &Ws, size_t N, 
         tr_f8_scales<<<64, 256>>>(C.sc[i], (uint16_t *)dTs, C.Mo[i], Ko, KB, off);
     }
     CK(cudaGetLastError()); pmark(tp, "dg8 w-digits");
-    std::vector<float> Y(N * (size_t)Ko); std::vector<uint16_t> xb;
+    std::vector<uint16_t> xb;
     std::vector<uint8_t> hw[2]; std::vector<uint16_t> hs[2];   // the weights on the host, only when an output is left to it
     for (size_t n0 = 0; n0 < N; n0 += G_NB) {
         size_t n = std::min(G_NB, N - n0), np = (n + 7) / 8 * 8;
@@ -126,7 +127,7 @@ template <class F> static void dgrad_f8x(const std::vector<DevW> &Ws, size_t N, 
         unsigned lc; CK(cudaMemcpy(&lc, g_lcnt, 4, cudaMemcpyDeviceToHost)); st_fix24 += lc;
         int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_fixopen += nb;
         size_t left = (lc > G_CAP ? lc - G_CAP : 0) + nb; pmark(tp, "dg8 fixup");
-        float *y = Y.data() + n0 * Ko; CK(cudaMemcpy(y, g_Y, n * Ko * 4, cudaMemcpyDeviceToHost)); pmark(tp, "dg8 y-d2h");
+        g_hy.resize(n * Ko); float *y = g_hy.data(); CK(cudaMemcpy(y, g_Y, n * Ko * 4, cudaMemcpyDeviceToHost)); pmark(tp, "dg8 y-d2h");
         if (left) {   // what is still NaN: every product into the host superaccumulator
             if (hw[0].empty()) for (int i = 0; i < C.n; i++) {
                 hw[i].resize((size_t)C.Mo[i] * Ko); hs[i].resize((size_t)C.Mo[i] / 128 * (Ko / 128));
@@ -140,11 +141,12 @@ template <class F> static void dgrad_f8x(const std::vector<DevW> &Ws, size_t N, 
                 st_host += any; }
             pmark(tp, "dg8 host");
         }
+        double *d = dX.data() + n0 * Ko;   // each output's one addition, as before, but while the chunk is in cache
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n * Ko; i++) d[i] += y[i];
+        pmark(tp, "dg add");
     }
     st_rows += N; st_outs24 += (long long)N * Ko; t_gemm += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < Y.size(); i++) dX[i] += Y[i];
-    pmark(tp, "dg add");
 }
 static void dgrad_f8(const std::vector<DevW> &Ws, const std::vector<const std::vector<double> *> &dY, size_t N, std::vector<double> &dX) {
     int Kt = 0; for (auto &W : Ws) Kt += W.M;
@@ -154,21 +156,57 @@ static void dgrad_f8(const std::vector<DevW> &Ws, const std::vector<const std::v
             for (size_t i = 0, off = 0; i < Ws.size(); off += Ws[i].M, i++) { const double *gr = dY[i]->data() + (n0 + r) * Ws[i].M;
                 for (int m = 0; m < Ws[i].M; m++) x[off + m] = bfb(gr[m]); } } });
 }
+// dX += X W^T for a BF16 map, X given only as BF16 bits by fill(n0, n, xb) (rows n0 .. n0+n-1, n rows of W.K; the rows after
+// them, up to the next multiple of 8, stay zero), each chunk's outputs added to dX as they come back. Otherwise bmm's BF16
+// path -- the same kernels, fixup and host GEMV (its row rebuilt from the bits: the FP32 values bmm had) -- so the same bits
+// in dX. 03-11-2026: dgrad's FP32 X (N x kpad) and Y (N x M), allocated and zeroed in every call, were most of its host time.
+template <class F> static void bmm_bfx(const DevW &W, size_t N, int p, std::vector<double> &dX, F fill) {
+    auto t0 = std::chrono::steady_clock::now(), tp = t0;
+    int M = W.M, K = W.K, KB = K / 128, dw = W.wd ? W.wd : wdig(p);
+    bf16_digits<<<dig_grid((size_t)M * KB), 256>>>((const uint16_t *)W.w, g_wd, g_wl, g_wn, M, K, dw); pmark(tp, "b24 w-digits");
+    for (size_t n0 = 0; n0 < N; n0 += G_NB) {
+        size_t n = std::min(G_NB, N - n0), np = (n + 7) / 8 * 8;
+        g_hxb.resize(np * K); std::fill(g_hxb.begin() + n * K, g_hxb.begin() + np * K, (uint16_t)0);
+        fill(n0, n, g_hxb.data());
+        CK(cudaMemcpy(g_xb, g_hxb.data(), np * K * 2, cudaMemcpyHostToDevice)); pmark(tp, "dg x-host");
+        bf16_digits<<<dig_grid(np * KB), 256>>>(g_xb, g_xd, g_xl, g_xn, np, K, xdig(p)); pmark(tp, "b24 x-digits");
+        bf16_gemm_p(p, dw, g_wd, g_wl, g_wn, g_xd, g_xl, g_xn, g_Y, M, np, K, g_nb); pmark(tp, "b24 gemm");
+        CK(cudaMemset(g_lcnt, 0, 4)); CK(cudaMemset(g_nb, 0, 4));
+        nan_list<<<1024, 256>>>(g_Y, np * M, g_list, g_lcnt, G_CAP);
+        bf16_fixup<<<1024, 256>>>((const uint16_t *)W.w, g_xb, g_list, g_lcnt, G_CAP, g_Y, M, K, p, g_nb);
+        unsigned lc; CK(cudaMemcpy(&lc, g_lcnt, 4, cudaMemcpyDeviceToHost)); (p == 24 ? st_fix24 : st_fix) += lc;
+        int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_fixopen += nb;
+        size_t left = (lc > G_CAP ? lc - G_CAP : 0) + nb; pmark(tp, "b24 fixup");
+        g_hy.resize(n * M); float *y = g_hy.data(); CK(cudaMemcpy(y, g_Y, n * M * 4, cudaMemcpyDeviceToHost)); pmark(tp, "b24 y-d2h");
+        if (left) {   // what is still NaN: bmm's GEMV
+            std::vector<char> open(n);
+            #pragma omp parallel for schedule(static)
+            for (size_t r = 0; r < n; r++) { const float *yr = y + r * M; for (int m = 0; m < M && !open[r]; m++) open[r] = yr[m] != yr[m]; }
+            for (size_t r = 0; r < n; r++) { if (!open[r]) continue; st_host++; float *yr = y + r * M; std::vector<float> xv(K);
+                for (int k = 0; k < K; k++) { uint32_t u = (uint32_t)g_hxb[r * K + k] << 16; memcpy(&xv[k], &u, 4); }
+                auto g = gemv(W, act_plain(xv), p, 0); for (int m = 0; m < M; m++) if (yr[m] != yr[m]) yr[m] = g[m]; }
+            pmark(tp, "b24 gemv");
+        }
+        double *d = dX.data() + n0 * M;
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n * M; i++) d[i] += y[i];
+        pmark(tp, "dg add");
+    }
+    st_rows += N; (p == 24 ? st_outs24 : st_outs) += (long long)N * M;
+    t_gemm += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
 // dX += [dY_1 | dY_2 | ...] [W_1 ; W_2 ; ...] (the forward was Y_i = X W_i^T): every output one correctly rounded FP32 of
-// the exact sum, added to the FP64 dX
+// the exact sum, added to the FP64 dX. dY reaches the product as the BF16 bits bf() gave it (an FP8 map's twice: hi | lo).
 static void dgrad(const std::vector<DevW> &Ws, const std::vector<const std::vector<double> *> &dY, size_t N, std::vector<double> &dX) {
     if (!HILO && std::all_of(Ws.begin(), Ws.end(), [](const DevW &W) { return W.fmt == F_E4M3B; })) { dgrad_f8(Ws, dY, N, dX); return; }
     auto tp = std::chrono::steady_clock::now();
     int kpad; DevW Wt = transposed(Ws, kpad); pmark(tp, "dg transpose");
-    std::vector<float> X(N * (size_t)kpad, 0.f), Y(N * (size_t)Wt.M);
-    #pragma omp parallel for schedule(static)
-    for (size_t r = 0; r < N; r++) { size_t off = 0; float *x = X.data() + r * kpad;
-        for (size_t i = 0; i < Ws.size(); i++) { int M = Ws[i].M; const double *g = dY[i]->data() + r * M;
-            for (int rep = 0; rep < (Ws[i].fmt == F_E4M3B ? 2 : 1); rep++, off += M) for (int m = 0; m < M; m++) x[off + m] = bf(g[m]); } }
-    pmark(tp, "dg x-host"); bmm(Wt, X.data(), N, 24, Y.data()); tp = std::chrono::steady_clock::now();
-    #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < Y.size(); i++) dX[i] += Y[i];
-    pmark(tp, "dg add");
+    bmm_bfx(Wt, N, 24, dX, [&](size_t n0, size_t n, uint16_t *xb) {
+        #pragma omp parallel for schedule(static)
+        for (size_t r = 0; r < n; r++) { size_t off = 0; uint16_t *x = xb + r * kpad;
+            for (size_t i = 0; i < Ws.size(); i++) { int M = Ws[i].M; const double *g = dY[i]->data() + (n0 + r) * M;
+                for (int rep = 0; rep < (Ws[i].fmt == F_E4M3B ? 2 : 1); rep++, off += M) for (int m = 0; m < M; m++) x[off + m] = bfb(g[m]); }
+            std::fill(x + off, x + kpad, (uint16_t)0); } });
 }
 static DevW up(const std::vector<float> &m, int M, int K, void *buf = nullptr) {   // a host matrix, rounded to BF16, as a BF16 map
     if (!buf && (size_t)M * K * 2 > SM_MAX) { fprintf(stderr, "%d x %d exceeds the small buffer\n", M, K); exit(1); }
