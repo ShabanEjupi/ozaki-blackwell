@@ -92,6 +92,34 @@ static size_t bf16_chunk(const DevW &W, size_t np, int p, int dw, std::chrono::s
     pmark(tp, b24 ? "b24 fixup" : "b8 fixup");
     return (lc > G_CAP ? lc - G_CAP : 0) + nb;   // beyond the fixup's list, and what it left open
 }
+// one chunk of an FP8 map's product into g_Y (np rows, n of them real): the input quantized from rows_up's rows (rdev) or
+// from n rows of FP32 at x (host or device: kind), its digits, the tiled product and the fixup (OZ_OLDK8=1: fp8b_gemm); returns
+// the outputs still NaN, the host GEMV's. bmm and bmm8d (jais_lora.cu) both call it: one copy of these kernels, the same bytes.
+static size_t f8_chunk(const DevW &W, size_t n, size_t np, int p, const int *rdev, const float *x, cudaMemcpyKind kind,
+                       std::chrono::steady_clock::time_point &tp) {
+    int M = W.M, K = W.K, KB = K / 128;
+    if (rdev) gather_q<<<(unsigned)std::min<size_t>(np, 4096), 128>>>(g_rq, g_rs, rdev, n, np, K, g_xq, g_xs);
+    else {
+        CK(cudaMemcpy(g_x, x, n * K * 4, kind));
+        if (np > n) CK(cudaMemset(g_x + n * K, 0, (np - n) * K * 4));
+        quant_fp8g<<<1024, 256>>>(g_x, g_xq, g_xs, np * KB);
+    }
+    fp8_digits<<<1024, 256>>>(g_xq, g_xd, np * K); pmark(tp, "f8 x");
+    CK(cudaMemset(g_nb, 0, 4));
+    if (OLDK8) {   // OZ_OLDK8=1: fp8b_gemm, the kernel before tgemm.cu's XF8 (the same outputs)
+        fp8b_gemm<<<dim3(M / 128, np / 8), 256>>>(g_wd, (const uint16_t *)W.sw, g_xd, g_xs, g_Y, M, np, K, p, g_nb); pmark(tp, "f8 gemm");
+        int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); return nb;   // fp8b_gemm counts every NaN it writes
+    }
+    tgemm_go<3, 3, true, 64, 3, true>(g_wd, (const uint16_t *)W.sw, nullptr, nullptr, g_xd, nullptr, nullptr, g_Y, M, (int)np, K, p, g_nb, g_xs);
+    pmark(tp, "f8 gemm");
+    CK(cudaMemset(g_lcnt, 0, 4)); CK(cudaMemset(g_nb, 0, 4));
+    nan_list<<<1024, 256>>>(g_Y, np * M, g_list, g_lcnt, G_CAP);
+    f8x_fixup<<<1024, 256>>>((const uint8_t *)W.w, (const uint16_t *)W.sw, g_xq, g_xs, K, g_list, g_lcnt, G_CAP, g_Y, M, p, g_nb);
+    unsigned lc; CK(cudaMemcpy(&lc, g_lcnt, 4, cudaMemcpyDeviceToHost)); st_fix8 += lc;
+    int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_fixopen += nb;
+    pmark(tp, "f8 fixup");
+    return (lc > G_CAP ? lc - G_CAP : 0) + nb;   // beyond the list, and what fp8b_gemm would leave open too
+}
 static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y, const int *rdev = nullptr, const size_t *rhost = nullptr) {
     auto t0 = std::chrono::steady_clock::now(), tp = t0;
     int M = W.M, K = W.K, KB = K / 128; bool fp8 = W.fmt == F_E4M3B;
@@ -105,29 +133,8 @@ static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y, const 
     for (size_t n0 = 0; n0 < N; n0 += G_NB) {
         size_t n = std::min(G_NB, N - n0), np = (n + 7) / 8 * 8; const float *x = X + n0 * K;
         size_t left;   // NaNs still in Y after the GPU: the host GEMV's rows (none, as a rule: then no scan)
-        if (fp8) {
-            if (rdev) gather_q<<<(unsigned)std::min<size_t>(np, 4096), 128>>>(g_rq, g_rs, rdev + n0, n, np, K, g_xq, g_xs);
-            else {
-                CK(cudaMemcpy(g_x, x, n * K * 4, cudaMemcpyHostToDevice));
-                if (np > n) CK(cudaMemset(g_x + n * K, 0, (np - n) * K * 4));
-                quant_fp8g<<<1024, 256>>>(g_x, g_xq, g_xs, np * KB);
-            }
-            fp8_digits<<<1024, 256>>>(g_xq, g_xd, np * K); ph("f8 x", "", "");
-            CK(cudaMemset(g_nb, 0, 4));
-            if (OLDK8) {   // OZ_OLDK8=1: fp8b_gemm, the kernel before tgemm.cu's XF8 (the same outputs)
-                fp8b_gemm<<<dim3(M / 128, np / 8), 256>>>(g_wd, (const uint16_t *)W.sw, g_xd, g_xs, g_Y, M, np, K, p, g_nb); ph("f8 gemm", "", "");
-                int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); left = nb;   // fp8b_gemm counts every NaN it writes
-            } else {
-                tgemm_go<3, 3, true, 64, 3, true>(g_wd, (const uint16_t *)W.sw, nullptr, nullptr, g_xd, nullptr, nullptr, g_Y, M, (int)np, K, p, g_nb, g_xs);
-                ph("f8 gemm", "", "");
-                CK(cudaMemset(g_lcnt, 0, 4)); CK(cudaMemset(g_nb, 0, 4));
-                nan_list<<<1024, 256>>>(g_Y, np * M, g_list, g_lcnt, G_CAP);
-                f8x_fixup<<<1024, 256>>>((const uint8_t *)W.w, (const uint16_t *)W.sw, g_xq, g_xs, K, g_list, g_lcnt, G_CAP, g_Y, M, p, g_nb);
-                unsigned lc; CK(cudaMemcpy(&lc, g_lcnt, 4, cudaMemcpyDeviceToHost)); st_fix8 += lc;
-                int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_fixopen += nb;
-                left = (lc > G_CAP ? lc - G_CAP : 0) + nb; ph("f8 fixup", "", "");   // beyond the list, and what fp8b_gemm would leave open too
-            }
-        } else {
+        if (fp8) left = f8_chunk(W, n, np, p, rdev ? rdev + n0 : nullptr, x, cudaMemcpyHostToDevice, tp);
+        else {
             xb.assign(np * K, 0);
             #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < n * K; i++) { uint32_t u; memcpy(&u, &x[i], 4); xb[i] = u >> 16; }   // BF16 values: exact

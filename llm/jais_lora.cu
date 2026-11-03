@@ -255,31 +255,16 @@ template <class F> static void dgrad_f8g_dev(const std::vector<std::vector<DevW>
     t_gemm += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 // bmm's FP8 branch with its output left on the GPU (Yd: N rows of M) and its input there too: rdev (rows_up's rows, as bmm
-// takes them) or Xd (N rows of K, FP32); the same kernels on the same bytes, so the same outputs. The rows the GPU leaves open
+// takes them) or Xd (N rows of K, FP32); bmm's own chunk (f8_chunk, jais_batch.cu), so the same outputs. The rows the GPU leaves open
 // go to bmm's host GEMV on a host copy of their chunk, xrow(i, v) giving input row i (03-11-2026, the GPU-resident MoE backward)
 static void bmm8d(const DevW &W, size_t N, float *Yd, const int *rdev, const float *Xd, const std::function<void(size_t, std::vector<float> &)> &xrow) {
     auto t0 = std::chrono::steady_clock::now(), tp = t0;
-    int M = W.M, K = W.K, KB = K / 128, p = 8;
+    int M = W.M, K = W.K, p = 8;
     if (W.fmt != F_E4M3B || (!rdev == !Xd)) { fprintf(stderr, "bmm8d: FP8 maps, one input\n"); exit(1); }
     fp8_digits<<<1024, 256>>>((const uint8_t *)W.w, g_wd, (size_t)M * K); pmark(tp, "f8 w-digits");
     for (size_t n0 = 0; n0 < N; n0 += G_NB) {
         size_t n = std::min(G_NB, N - n0), np = (n + 7) / 8 * 8;
-        if (rdev) gather_q<<<(unsigned)std::min<size_t>(np, 4096), 128>>>(g_rq, g_rs, rdev + n0, n, np, K, g_xq, g_xs);
-        else {
-            CK(cudaMemcpy(g_x, Xd + n0 * K, n * K * 4, cudaMemcpyDeviceToDevice));
-            if (np > n) CK(cudaMemset(g_x + n * K, 0, (np - n) * K * 4));
-            quant_fp8g<<<1024, 256>>>(g_x, g_xq, g_xs, np * KB);
-        }
-        fp8_digits<<<1024, 256>>>(g_xq, g_xd, np * K); pmark(tp, "f8 x");
-        CK(cudaMemset(g_nb, 0, 4));
-        tgemm_go<3, 3, true, 64, 3, true>(g_wd, (const uint16_t *)W.sw, nullptr, nullptr, g_xd, nullptr, nullptr, g_Y, M, (int)np, K, p, g_nb, g_xs);
-        pmark(tp, "f8 gemm");
-        CK(cudaMemset(g_lcnt, 0, 4)); CK(cudaMemset(g_nb, 0, 4));
-        nan_list<<<1024, 256>>>(g_Y, np * M, g_list, g_lcnt, G_CAP);
-        f8x_fixup<<<1024, 256>>>((const uint8_t *)W.w, (const uint16_t *)W.sw, g_xq, g_xs, K, g_list, g_lcnt, G_CAP, g_Y, M, p, g_nb);
-        unsigned lc; CK(cudaMemcpy(&lc, g_lcnt, 4, cudaMemcpyDeviceToHost)); st_fix8 += lc;
-        int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_fixopen += nb;
-        size_t left = (lc > G_CAP ? lc - G_CAP : 0) + nb; pmark(tp, "f8 fixup");
+        size_t left = f8_chunk(W, n, np, p, rdev ? rdev + n0 : nullptr, Xd ? Xd + n0 * K : nullptr, cudaMemcpyDeviceToDevice, tp);
         float *yd = Yd + n0 * M; CK(cudaMemcpy(yd, g_Y, n * M * 4, cudaMemcpyDeviceToDevice)); pmark(tp, "f8 y-d2d");
         if (left) {   // what is still NaN: bmm's GEMV
             std::vector<float> y(n * M); CK(cudaMemcpy(y.data(), yd, n * M * 4, cudaMemcpyDeviceToHost));
