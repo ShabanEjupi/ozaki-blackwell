@@ -1047,7 +1047,9 @@ gradient once up, the forward recompute's gg, uu, y kept there, `fill_down` (bfb
 da = 0 + Y_down, `fill_gu`, and dx2 += Y_gu per expert in ascending id, one copy down at the end -- about 2 s per MoE layer,
 ~110 s a step. Its numerics are proved first: `oz_exp` (above) and `llm/oz_bf.cuh` (BF16 rounding and swiglu_back's two
 BF16 outputs for host and GPU from one source; `llm/fill_check.cu`: 0 of 2³² doubles and 0 of 2³² (g, u, y) triples differ
-from the host's bf() and fill_gu).
+from the host's bf() and fill_gu). The two fills as GPU kernels (`llm/moe_dev.cuh`: `k_fill_down` with dw in ascending c, `k_fill_gu`) give
+the host loops' bits as well: 0 of 18 432 000 and 0 of 12 288 000 bytes, 0 of 3 000 dw differ (2.4 and 1.2 ms for 3 000 rows).
+What is left is the wiring: `bmm` and `dgrad_f8g` variants whose outputs stay on the device.
 
 **SQ** — 03-11: tri ndryshime të tjera të vendosura vetë pas kontrollit të digest-eve (hapi 135,6 → 118,5 s). `exp` i përbashkët
 host/GPU: sekuenca IEEE e glibc 2.39, e lexuar nga kodi makinë; 0 ndryshime në 12,9 miliardë hyrje (të 2³² FP32, 2³² double,
