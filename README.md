@@ -55,7 +55,7 @@ Shpejtësia, n = 4096 (TFLOPS FP64-ekuivalentë; piku vendas FP64 i matur 0,449)
 | TFLOPS | 7.55 | 6.46 | **5.56 — 12.4× the native peak, and more accurate** |
 
 Time split at 16 moduli / ndarja e kohës: scales 1.0 ms · residues 3.0 ms · 16 INT8 GEMMs 16.8 ms · CRT 3.6 ms.
-The INT8 GEMM runs at 67 % of the measured tensor-core peak (157 TOPS, three-stage cp.async). With real data the laptop is
+The INT8 GEMM runs at 68 % of the measured tensor-core peak (157 of 232 TOPS, three-stage cp.async). With real data the laptop is
 **power-bound** (~95 W, SM 1.8 GHz): a faster kernel did not move the end-to-end numbers, so the next gains are in energy
 per INT8 operation (fewer moduli, fewer bit flips), not in latency hiding.
 
@@ -260,7 +260,7 @@ Në n = 8192 përgjigjja double-double është më afër x_true se ajo `__float1
 
 What changed / çfarë ndryshoi:
 - **CRT by direct sum** (`crt_dd`): x = Σ rₗWₗ − qM over eight 32-bit limbs on the integer units, q from 40-bit fixed-point
-  fractions, then five limbs → double-double. Garner + a double-double Horner was 41.5 of the 47 ms of a 4096² dd GEMM:
+  fractions, then five limbs → double-double. Garner + a double-double Horner was 41.5 of the 47 ms that reconstructing 4096² dd outputs took (2.8 ns each):
   31 dd steps of FP64, which runs at 1/64 rate here. **dd GEMM 2.8 → 0.68 ns per output element (4.1×)**; the cost is per
   output, nearly independent of K. Checked on the host (`bench/crt_check.cpp`, 10⁵ random 200-bit integers, 0 wrong) and
   against a long-double sum (`OZ_MMBENCH=2`).

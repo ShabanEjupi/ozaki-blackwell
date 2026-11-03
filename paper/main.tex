@@ -1,4 +1,4 @@
-% Draft 23-10-2026; re-checked 03-11-2026 afternoon: claims against their sources (novelty scoped to GPU tensor cores after Kouya's CPU Ozaki-II to 2048 bits; K3 config.json: 92 MoE layers of 93), accuracy references made exact (FP64 Dot2, dd 600-bit MPFR; acc_fp64.log/acc_dd.log), 7 primary references added via Crossref. Speeds of the precision table are the 15-10/22-10 code: bench/speed_all.sh re-measures them. Earlier: checked number by number 03-11-2026 against the raw logs (out_det*.txt, /opt/ozaki/real, /opt/ozaki/b) where they exist and the README tables written at measurement time elsewhere; references verified at their source 03-11-2026.
+% Draft 23-10-2026; third check 03-11-2026 14:30 (read as a referee would): every accuracy and speed number of Sections 3-4 against /opt/ozaki/job/speed.log (3 November, machine held); the CRT sentence of Section 2 made consistent with Section 4 (47 ms = 2.8 ns x 4096^2 outputs); 157/232 = 68 %; HOL vs Dixon split into the lifting step (out_det_hol.txt) and whole determinants (the table); the GPU-attention timing was a run computing it both ways (gatt.log) and is no longer a speed claim; contributions, conclusion and the Albanian summary cover every section. Re-checked 03-11-2026 afternoon: claims against their sources (novelty scoped to GPU tensor cores after Kouya's CPU Ozaki-II to 2048 bits; K3 config.json: 92 MoE layers of 93), accuracy references made exact (FP64 Dot2, dd 600-bit MPFR; acc_fp64.log/acc_dd.log), 7 primary references added via Crossref. Speeds of the precision table re-measured with the current code on 3 November (bench/speed_all.sh). Earlier: checked number by number 03-11-2026 against the raw logs (out_det*.txt, /opt/ozaki/real, /opt/ozaki/b) where they exist and the README tables written at measurement time elsewhere; references verified at their source 03-11-2026.
 % Build: docker run --rm -v "$PWD":/w -w /w texlive/texlive:latest-small latexmk -pdf main.tex
 \documentclass[11pt]{article}
 \usepackage[T1]{fontenc}
@@ -39,7 +39,7 @@ tensor core-t INT8 janë qindra herë më të shpejtë. Mbi një GPU Blackwell l
 FP64 ($517\times$). Me skemën Ozaki~II (prodhime të sakta të mbetjeve dhe teorema kineze e mbetjeve) ndërtuam shumëzim
 matricash me saktësi FP64, double-double, triple-double dhe arbitrare (deri 424 bit) nga të njëjtat njësi INT8. Te një punë
 reale---$Ax=b$ me $\kappa=10^{20}$---zgjidhja double-double mbaron $499\times$ më shpejt se LU \texttt{\_\_float128} mbi 24 fije
-CPU ($n=8192$), me gabim po aq të vogël, dhe me $\sim$270$\times$ më pak energji ($n=4096$). Me prime nën $2^{16}$ e $2^{23}$ të ndara në bajte, shumëzimi i \emph{saktë} i matricave me numra të plotë 1\,015--131\,063 bitësh del bit për bit i saktë, $10$--$19\times$ më shpejt se FLINT dhe me $15$--$18\times$ më pak energji. Përcaktori i saktë i një matrice int8 del $224\times$ më shpejt se FLINT te $n=4096$ dhe $355\times$ te $n=8192$, me një kufi të provuar që bie brenda një biti te këto madhësi; te $n=32\,768$ (425\,348 bit) mbaron për 594--615~s brenda 12~GB të GPU-së. Për hyrje 32--256 bit, ngritja e rendit të lartë mbi të njëjtat GEMM modulare dhe një kufi i provuar për hyrje me plane bajtesh e japin përcaktorin $291\times$ më shpejt se FLINT te $n=2048$ me hyrje 64-bit, $359\times$ me 128-bit dhe $404\times$ te $n=4096$; raporti rritet me madhësinë e hyrjeve.
+CPU ($n=8192$), me gabim po aq të vogël, dhe me $\sim$270$\times$ më pak energji ($n=4096$). Me prime nën $2^{16}$ e $2^{23}$ të ndara në bajte, shumëzimi i \emph{saktë} i matricave me numra të plotë 1\,015--131\,063 bitësh del bit për bit i saktë, $10$--$19\times$ më shpejt se FLINT dhe me $15$--$18\times$ më pak energji. Përcaktori i saktë i një matrice int8 del $224\times$ më shpejt se FLINT te $n=4096$ dhe $355\times$ te $n=8192$, me një kufi të provuar që bie brenda një biti te këto madhësi; te $n=32\,768$ (425\,348 bit) mbaron për 594--615~s brenda 12~GB të GPU-së. Për hyrje 32--256 bit, ngritja e rendit të lartë mbi të njëjtat GEMM modulare dhe një kufi i provuar për hyrje me plane bajtesh e japin përcaktorin $291\times$ më shpejt se FLINT te $n=2048$ me hyrje 64-bit, $359\times$ me 128-bit dhe $404\times$ te $n=4096$; raporti rritet me madhësinë e hyrjeve. Te 15 nga sistemet reale më të keqkushtëzuara të NIST Matrix Market zgjidhja e saktë e certifikuar del për 0,17--115~s, 9--7\,857$\times$ më shpejt se SPEX aty ku SPEX mbaron, ndërsa FP64 s'ka asnjë shifër të saktë te 8 prej tyre. Algoritmi i Strassen-it modulo $m$, i saktë për çdo modul, arrin 91\,\% të shpejtësisë INT8 që laptopi mban, dhe një DGEMM me saktësi FP64 te $n=16\,384$ kushton 73,6~J, 13,9$\times$ më pak se FP64-ja e vetë GPU-së në pikën e saj më të mirë. Të njëjtat njësi japin prodhime MXFP4, NVFP4, FP8 dhe BF16 të rrumbullakuara saktë mbi peshat reale të modeleve gjuhësore të hapura deri 2,78 mijë miliardë parametra, të njëjta për çdo madhësi grupi; Nemotron~3 Ultra (560 miliardë parametra) xhiron i tëri nga disku i laptopit, pa kosto në dekodim.
 
 \section{Introduction}
 The FP64 units of consumer and laptop GPUs are a small fraction of the chip: on our laptop Blackwell part a peak kernel
@@ -61,7 +61,16 @@ no wide floating-point unit at all. We build and measure:
 8-bit modulus can join---at 2.00~TFLOPS;
 \item arbitrary precision beyond that from balanced 160-bit slices: 212, 318 and 424 bits;
 \item dense linear solves at condition numbers where FP64 and double-double fail, all on the GPU;
-\item exact determinants of int8 matrices up to $n=32\,768$ ($40$--$355\times$ faster than FLINT), and of matrices with 32--256-bit entries by high-order lifting on tensor cores ($17$--$404\times$).
+\item exact products of integer matrices with 1\,015- to 131\,063-bit entries, the GEMM work linear in the bits
+($10$--$19\times$ faster than FLINT, Section~\ref{sec:big});
+\item exact determinants of int8 matrices up to $n=32\,768$ ($40$--$355\times$ faster than FLINT), and of matrices with 32--256-bit entries by high-order lifting on tensor cores ($17$--$404\times$);
+\item certified exact solutions of 15 of the most ill-conditioned real systems of NIST Matrix Market in 0.17--115~s,
+$9$--$7\,857\times$ sooner than SPEX where it finishes (Section~\ref{sec:real});
+\item Strassen's algorithm over $\mathbb{Z}/m$ inside the emulation: an FP64-accurate DGEMM for 73.6~J at $n=16\,384$,
+$13.9\times$ fewer joules than the GPU's own FP64 at its best clock (Section~\ref{sec:strassen});
+\item correctly rounded MXFP4, NVFP4, FP8 and BF16 products on the real weights of open models of up to 2.78 trillion
+parameters, and the whole of Nemotron~3 Ultra run from the laptop's disk that way, batch-invariant by construction
+(Section~\ref{sec:llm}).
 \end{itemize}
 Everything runs on one laptop, and all competitors were measured on the same machine.
 
@@ -91,8 +100,9 @@ so the residue of a wide integer costs 32-bit multiply-adds per modulus instead 
 evaluated as a direct sum $x=\sum_\ell r_\ell W_\ell - qM$ over 32-bit limbs on the integer units, with $q$ from 40-bit
 fixed-point fractions, and the result is peeled off the integer as two or three doubles (round down, round down, round to
 nearest, each exact from the integer), then normalized. This replaced a Garner reconstruction followed by a double-double
-Horner evaluation, which took 41.5 of 47~ms of a $4096^2$ double-double GEMM because FP64 runs at 1/64 rate on this chip;
-the direct sum costs 0.68~ns per output element instead of 2.8 and is nearly independent of $K$. It was checked on the host
+Horner evaluation, which cost 2.8~ns per output element (47~ms for $4096^2$ outputs, 41.5~ms of it in those two steps)
+because FP64 runs at 1/64 rate on this chip; the direct sum costs 0.68~ns per output element (11~ms) and is nearly
+independent of $K$. It was checked on the host
 against $10^5$ random 200-bit integers with no error.
 
 \paragraph{Moduli.} FP64 uses 16 moduli, double-double 32, triple-double 49 (the 32 plus the 17 primes 103\ldots 29 that are
@@ -156,8 +166,8 @@ bits & $n$ & GPU time & GPU TFLOPS & best CPU code, 24 threads & MPFR, 24 thread
 \end{table}
 At 16 moduli a $4096^3$ FP64 GEMM now takes 20.3~ms. In the code of 15 October (24.7~ms, 5.56~TFLOPS) it split into scales
 1.0~ms, residues 3.0~ms, the 16 INT8 GEMMs 16.8~ms (131~TOPS) and the CRT 3.6~ms. For double-double the direct-sum CRT of
-Section~\ref{sec:method} (2.8 to 0.68~ns per output, $\sim$36~ms of the 78) accounts for the doubling, 1.76 to 3.81~TFLOPS.
-On its own the INT8 GEMM reaches 157~TOPS, 67\% of the measured peak, with a three-stage \texttt{cp.async} pipeline; with
+Section~\ref{sec:method} (2.8 to 0.68~ns per output, $\sim$36~ms) accounts for most of the doubling from 1.76 to
+3.81~TFLOPS: 36 of the 42~ms saved out of 78. On its own the INT8 GEMM reaches 157~TOPS, 68\% of the measured peak, with a three-stage \texttt{cp.async} pipeline; with
 real data the laptop is power-bound (Section~\ref{sec:energy}), so kernel speed and end-to-end time do not move together.
 
 \section{A real task: ill-conditioned linear systems}
@@ -290,7 +300,8 @@ Energy per determinant at $n=2048$, both chips counted: $\sim$40~J on the GPU pa
 computation alone) against $\sim$2\,030~J for FLINT, $\sim$50$\times$ less. At $n=8192$ the lifting is the cost: 13\,013 steps,
 each reading $A^{-1}$ (16 bits per entry) and $A$, at $\sim$100\% of the read bandwidth we measure on this GPU ($\sim$410~GB/s).
 That limit is physical for digit-by-digit lifting; moving past it needs lifting built on matrix products (high-order lifting,
-the DoublePlusOneLift of Pauderis and Storjohann~\cite{ps}), the next step.
+cf.\ the DoublePlusOneLift of Pauderis and Storjohann~\cite{ps}), which the paragraphs below build for entries of 32 bits
+and more; for int8 entries at these sizes it is the next step.
 
 \paragraph{$n=32\,768$ in 12~GB.} One modular product packs $(2n+128)\cdot 2n$ bytes three times (13~GB), and the bound holds
 three float and two int64 $n\times n$ matrices (30~GB). Products deeper than 2048 now run in $K$-chunks (a third epilogue
@@ -328,8 +339,9 @@ positions one thread per entry. Around it, the proved bound now takes byte plane
 tightness; $B=X_L\,PA\,X_U$ is exact from the planes, Garner over up to 16 primes with $|B_{ij}|$ rounded up from the
 mixed-radix digits): at $n=2048$ with 64-bit entries it is 1 bit above $|\det A|$, and $\det A/d$ needs 6 primes instead of
 128. The rational reconstruction is FLINT's half-gcd \texttt{\_fmpq\_reconstruct\_fmpz\_2} (0.49~s $\to$ 0.047~s there).
-Bit-exact against FLINT in every case of Table~\ref{tab:hol}: the lifting is 1.4--4.3$\times$ faster than $S$-prime Dixon (at
-$n=2048$: $1.4$, $3.0$ and $4.3\times$ for 32-, 64- and 128-bit entries) and grows like the bits, not their square, so the ratio to FLINT now rises with the entry size---$63\times$ at $n=512$ with
+Bit-exact against FLINT in every case of Table~\ref{tab:hol}: the lifting step is 1.4--4.3$\times$ faster than $S$-prime
+Dixon's (at $n=2048$: $1.4$, $3.0$ and $4.3\times$ for 32-, 64- and 128-bit entries; whole determinants, as in the table,
+$1.2$--$3.5\times$) and grows like the bits, not their square, so the ratio to FLINT now rises with the entry size---$63\times$ at $n=512$ with
 256-bit entries, $291\times$ at $n=2048$ with 64-bit and $359\times$ with 128-bit entries, $404\times$ at $n=4096$ with
 64-bit entries (a 276\,398-bit determinant in 2.15~s against 868~s, with the residue chain over 8-bit moduli below). In a
 3.27~s run with 16-bit primes, the residue chain was 2.08~s of the 2.71~s lifting at that size (247 modular GEMMs of $n^3$,
@@ -461,7 +473,7 @@ integer-loop path, 32 tokens alone, Python rationals from the raw bytes (sampled
 an exact epilogue shows that the FP32 sum alone accounts for 0--0.9\% and the rest is $\alpha=\mathrm{fp32}(g_Wg_A)$. The
 native instruction runs at 49--55~TOPS with a plain tiling and the exact path at 20.5--23.2~TOPS with shared-memory tiles
 (25.6 without its \texttt{int64} epilogue: the epilogue costs $\sim$20\%, the rest is four \texttt{k16} INT8 MMAs per
-\texttt{k64} FP4 one); sustained at $\sim$94~W they give 447--473 and 194--204~GOP per joule. The ceiling is the instruction peak: measured in
+\texttt{k64} FP4 one); sustained for 10~s each at $\sim$94~W they give 447--473 and 194--204~GOP per joule. The ceiling is the instruction peak: measured in
 registers, \texttt{m16n8k16} INT8 reaches 116~TOPS and the block-scaled FP4 instruction 465~TOPS, so with both kernels tuned
 to peak a correctly rounded prefill costs $4\times$; in decode both read the same packed bytes. The exact decode runs at
 405--487~GB/s of packed weights for one token and 136--184~GB/s for eight (one matrix 100 times in a row, so partly from the
@@ -542,8 +554,8 @@ first chunk. Reading the letter logits right after the empty thinking scores 45.
 reported protocol appends ``The answer is'' and reads the logits of `` A''\ldots`` D'': the greedy token is then a letter in
 every prompt, and Jais-3 answers 1\,836 of the 2\,500 questions (73.4\%; always answering the commonest letter gives 37.1\%).
 A chunk of $\sim$24\,000 rows takes 992--1\,060~s (the first 1\,396~s), 663--709~s of them in exact products, none uncertified. Moving the attention to the GPU's FP64 units, in the host's order of
-operations with the softmax left on the host, changes none of its outputs on a whole chunk and takes the chunk from 1\,378 to
-1\,301~s. On the root-cause set
+operations with the softmax left on the host, changes none of its outputs on a whole chunk of 23\,995 rows (a run that
+computes it both ways and compares them); on the GPU the attention takes 41~s of such a chunk. On the root-cause set
 (CTI-RCM, 1\,000 CVE descriptions to be mapped to a CWE) the prompt ends with ``CWE-'' and five greedy tokens give the number:
 738 are right (73.8\%; the commonest class, CWE-79, is 22.9\%). Neither protocol is the benchmark's
 official one, which lets the model reason before it answers; the numbers are reproducible to the bit, not comparable to
@@ -658,8 +670,13 @@ quad precision finishes $499\times$ sooner than on the laptop's own CPU ($n=8192
 of NIST Matrix Market the certified exact solution comes 9--7\,857$\times$ sooner than SPEX, where FP64 often has no correct
 digit; and the same units give correctly rounded MXFP4, NVFP4, FP8 and BF16 products on the real weights of open models of
 up to 2.78 trillion parameters, identical for any batch, and run the whole 560-billion-parameter Nemotron~3 Ultra from disk
-that way at no cost in decode, where the disk sets the pace. The next steps are the panel (now the
-bound of the triple-double solve), CUDA graphs for its launches, and out-of-core sizes beyond the GPU's 12~GB.
+that way at no cost in decode, where the disk sets the pace; batched over many tokens, Jais-3-375B gives its
+token-by-token run bit for bit. Under the laptop's power cap only fewer joules help: Strassen's algorithm over
+$\mathbb{Z}/m$, exact for every modulus, reaches 91\% of the sustained INT8 rate, and with a 2-norm scaling that saves a
+modulus, at the GPU's most efficient clock, it gives an FP64-accurate DGEMM for 73.6~J at $n=16\,384$, $13.9\times$ fewer
+joules than the GPU's own FP64 at its best clock. The next steps are the panel (now the bound of the triple-double solve), CUDA graphs for its launches, a
+subquadratic residue conversion for wide integers, the operand sums of Strassen fused into the products' loads, and
+out-of-core sizes beyond the GPU's 12~GB.
 
 \begin{thebibliography}{99}
 \bibitem{he25} H.~He and Thinking Machines Lab. Defeating nondeterminism in LLM inference. Blog post, 10 September 2025, \url{https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference}.
@@ -709,7 +726,7 @@ in floating-point arithmetic. arXiv:2601.07508, 2026.
 Safety 6(1/2/3) (2012) 242. doi:10.1504/IJRS.2012.044287.
 \bibitem{urbanska07} A.~Urba\'nska. Towards an exact adaptive algorithm for the determinant of a rational matrix.
 arXiv:0706.0014, 2007.
-\bibitem{stor05} A.~Storjohann. The shifted number system for fast linear algebra on integer matrices. J.\ Complexity 21(4):609--650, 2005. doi:10.1016/j.jco.2005.04.002
+\bibitem{stor05} A.~Storjohann. The shifted number system for fast linear algebra on integer matrices. J.\ Complexity 21(4):609--650, 2005. doi:10.1016/j.jco.2005.04.002.
 \bibitem{ps} C.~Pauderis, A.~Storjohann. Deterministic unimodularity certification. Proc.\ ISSAC 2012, 281--288.
 doi:10.1145/2442829.2442870.
 \bibitem{nemotron3} NVIDIA. NVIDIA-Nemotron-3-Ultra-550B-A55B (model card; BF16 and NVFP4 checkpoints). Hugging Face, 3 June 2026,
