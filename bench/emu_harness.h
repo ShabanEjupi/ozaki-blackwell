@@ -1,6 +1,7 @@
 // emu_harness.h -- one harness for every other FP64 emulation measured beside ours (cublas_emu.cpp: NVIDIA's, gemmul8_emu.cu:
 // RIKEN's GEMMul8), so that they see ozaki_test.cu's inputs, its reference and its timing and nothing else differs:
-//  * accuracy: M = N = 256, K = 512 / 4096 at exponent spreads 2^0 and 2^8, and 200 x 300 x 500 (ozaki_test.cu's cases and
+//  * accuracy: M = N = 256, K = 512 / 4096 at exponent spreads 2^0, 2^8, 2^16 and 2^32 (the wide ones: the hard case of
+//    integer-sliced emulation), and 200 x 300 x 500 (ozaki_test.cu's cases and
 //    seeds); componentwise error against |A||B| in units of 2^-53; the reference sums the exact products (TwoProd) as an
 //    unrounded double-double, as ozaki_test.cu does;
 //  * speed: n = 2048, 4096, 8192 (ozaki_test.cu's inputs), one warm-up and five timed calls, the median.
@@ -31,7 +32,7 @@ static void emu_accuracy(const std::vector<EmuCfg> &cfg) {
     int M = 256, N = 256;
     printf("accuracy, M=N=%d (componentwise err / unit roundoff 2^-53)\n", M);
     for (int K : {512, 4096, 500})
-        for (double spread : {0.0, 8.0}) {
+        for (double spread : {0.0, 8.0, 16.0, 32.0}) {
             if (K == 500) { M = 200; N = 300; if (spread) continue; }
             std::vector<double> A((size_t)M * K), B((size_t)K * N), C((size_t)M * N);
             emu_fill(A, spread, 1 + K); emu_fill(B, spread, 2 + K);

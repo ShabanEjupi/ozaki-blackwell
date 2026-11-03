@@ -31,7 +31,7 @@ int main() {
     int M = 256, N = 256;
     printf("accuracy, M=N=%d (componentwise err / unit roundoff 2^-53)\n", M);
     for (int K : {512, 4096, 500})
-        for (double spread : {0.0, 8.0}) {
+        for (double spread : {0.0, 8.0, 16.0, 32.0}) {   // 16, 32 (03-11-2026): wide exponent ranges, the hard case of integer-sliced emulation
             if (K == 500) { M = 200; N = 300; if (spread) continue; }   // nothing a multiple of the 128x128x64 tile
             std::vector<double> A((size_t)M * K), B((size_t)K * N), C((size_t)M * N);
             fill(A, spread, 1 + K); fill(B, spread, 2 + K);
