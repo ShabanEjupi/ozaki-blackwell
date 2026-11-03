@@ -6,7 +6,8 @@
 #  1. n = 2048 and 4096 (kappa 1e20, seed 1): blocked and unblocked, the LU and the solution compared bit for bit;
 #  2. nb = 64 / 128 / 256 at n = 4096: the fastest is the CPU's, used below;
 #  3. n = 1024 ... 8192, seeds 1-3 (the campaign's matrices, so its GPU and unblocked times pair with these): GPU solver
-#     (after a warm-up solve) and the blocked CPU LU, kappa 1e20.
+#     (after a warm-up solve) and the blocked CPU LU, kappa 1e20;
+#  4. energy per solve at n = 4096 (bench/energy_cpudd.sh: RAPL package + nvidia-smi), blocked CPU vs GPU.
 #   OZ_DEST=/opt/ozaki/src-cpudd ./wsl.sh "setsid -f bash bench/cpudd_blocked.sh > /dev/null 2>&1 < /dev/null"
 # Log: /opt/ozaki/job/cpudd.log
 L=/opt/ozaki/job/cpudd.log; cd "$(dirname "$0")/.." || exit 1
@@ -27,4 +28,5 @@ log "nb = $best"
 for n in 1024 2048 4096 6144 8192; do
     for seed in 1 2 3; do
         log "== n=$n seed=$seed"; OZ_CPUDD_ONLY=$best timeout 3600 ./out_solve $n $((n >= 4096 ? 1024 : n / 4)) 20 $seed >> $L 2>&1; log "rc=$?"; done; done
+log "== energy per solve, n=4096 (bench/energy_cpudd.sh)"; bash bench/energy_cpudd.sh 4096 $best 8 >> $L 2>&1; log "rc=$?"
 log "done, machine given back"

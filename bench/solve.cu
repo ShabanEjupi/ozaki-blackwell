@@ -768,18 +768,24 @@ int main(int argc, char **argv) {
         double nt = 0; for (int i = 0; i < n; i++) nt = fmax(nt, fabs(xt[i]));
         auto err_t = [&](const std::vector<double> &h, const std::vector<double> &l) {
             double w = 0; for (int i = 0; i < n; i++) w = fmax(w, fabs((h[i] - xt[i]) + l[i])); return w / nt; };
-        std::vector<double> xh(n), xl(n); double tg = 0;
-        solve_gpu(n, nb, Ah.data(), Al.data(), bh.data(), bl.data(), xh.data(), xl.data(), tg);
-        double tgpu = solve_gpu(n, nb, Ah.data(), Al.data(), bh.data(), bl.data(), xh.data(), xl.data(), tg);
-        printf("%-44s %9.3f %15.3g\n", "double-double LU, all on GPU", tgpu, err_t(xh, xl));
-        const int bnb = std::max(16, atoi(getenv("OZ_CPUDD_ONLY")));
+        // OZ_CPUDD_NOGPU=1: the CPU part alone; OZ_CPUDD_REPS=<r>: r blocked solves back to back between epoch marks (energy)
+        if (!getenv("OZ_CPUDD_NOGPU")) {
+            std::vector<double> xh(n), xl(n); double tg = 0;
+            solve_gpu(n, nb, Ah.data(), Al.data(), bh.data(), bl.data(), xh.data(), xl.data(), tg);
+            double tgpu = solve_gpu(n, nb, Ah.data(), Al.data(), bh.data(), bl.data(), xh.data(), xl.data(), tg);
+            printf("%-44s %9.3f %15.3g\n", "double-double LU, all on GPU", tgpu, err_t(xh, xl));
+        }
+        const int bnb = std::max(16, atoi(getenv("OZ_CPUDD_ONLY"))), reps = getenv("OZ_CPUDD_REPS") ? atoi(getenv("OZ_CPUDD_REPS")) : 1;
         auto run = [&](bool blocked, std::vector<double> &H, std::vector<double> &L, std::vector<double> &zh, std::vector<double> &zl) {
             H = Ah; L = Al; std::vector<int> pv(n); double t0 = now();
             if (blocked) lu_dd_cpu_blocked(n, bnb, H, L, pv); else lu_dd_cpu(n, H, L, pv);
             lu_dd_cpu_solve(n, H, L, pv, bh, bl, zh, zl);
             return now() - t0; };
         std::vector<double> H1, L1, z1h, z1l;
-        double tb = run(true, H1, L1, z1h, z1l);
+        if (reps > 1) printf("MARK cpudd-start %.3f\n", epoch());
+        double tb = 0; for (int r = 0; r < reps; r++) tb += run(true, H1, L1, z1h, z1l);
+        if (reps > 1) printf("MARK cpudd-end %.3f\n", epoch());
+        tb /= reps;
         char lab[80]; snprintf(lab, sizeof lab, "double-double LU, CPU, %d threads (AVX, blocked nb=%d)", thr, bnb);
         printf("%-44s %9.2f %15.3g\n", lab, tb, err_t(z1h, z1l));
         if (getenv("OZ_CPUDD_CHECK")) {
