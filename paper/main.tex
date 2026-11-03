@@ -25,14 +25,14 @@ double-double (3.81~TFLOPS), triple-double (2.00~TFLOPS) and up to 424 bits from
 first such GEMMs beyond FP64 on GPU tensor cores. Solving $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.956~s at
 $n=8192$, $499\times$ sooner than a \texttt{\_\_float128} LU on 24 CPU threads; at $\kappa=10^{36}$, where double-double has
 no correct digit, a triple-double LU is $145\times$ faster than MPFR. Exact integer matrix products with 1\,015- to
-131\,063-bit entries run $10$--$19\times$ faster than FLINT on 24 CPU threads; exact determinants (int8 to 128-bit entries)
-come $224$--$404\times$ sooner than FLINT at $n=2048$--$8192$; on 15 of NIST Matrix Market's most ill-conditioned real
+131\,063-bit entries run $10$--$19\times$ faster than FLINT on 24 CPU threads; exact determinants come up to $355\times$
+(int8, $n=8192$) and $404\times$ (64-bit entries, $n=4096$) sooner than FLINT; on 15 of NIST Matrix Market's most ill-conditioned real
 matrices the certified exact solution is $9$--$7\,857\times$ faster than SPEX where SPEX finished. Power-bound at
 94--117~W, the GPU reaches 91\% of its sustained INT8 rate with Strassen over $\mathbb{Z}/m$ (in classical operations), and
 an FP64-accurate DGEMM costs $13.9\times$ less energy than its native FP64, each at its most efficient clock. The same units
 give correctly rounded MXFP4, NVFP4, FP8 and BF16 products: every output of 48 expert matrices of Kimi K3 (2.78 trillion
 parameters) is certified, where BF16 tensor cores with FP32 accumulation round 51--83\% of them differently; Nemotron~3
-Ultra (560 billion parameters) runs from the laptop's disk with every linear map correctly rounded at 19.6~s per token, as
+Ultra (560 billion parameters) runs from the laptop's disk with every linear map correctly rounded at 19.5--19.7~s per token, as
 fast as FP32 accumulation; and batched inference of Jais-3-375B reproduces its token-by-token run bit for bit.
 \end{abstract}
 

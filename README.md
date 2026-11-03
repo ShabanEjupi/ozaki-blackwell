@@ -185,7 +185,7 @@ xhauleve: 9,4× më pak; ajo statike (~17 W bordi): 23,7× më pak, sepse mbaron
 - cry10000 (n = 10 000) solved exactly in 122 s (D 574 553 bits); the SPEX column for the larger systems fills in the night
   runs (`/opt/ozaki/real/batch.log`; `bench/real_table.py [--tex]`).
 - ✅ 27-10: Nemotron 3 Ultra (560 B, open weights; its main pre-training data gated, internal training only) runs whole and
-  exact from disk (`llm/ultra.cu`, below), 19.6 s per token with read-ahead. Next: the NVFP4 prefill tiled
+  exact from disk (`llm/ultra.cu`, below), 19.5-19.7 s per token with read-ahead. Next: the NVFP4 prefill tiled
   through shared memory, and the fully open models — OLMo 2 32B traced into its whole training data, K2-Think-V2 (`llm/dense.cu`).
 - The decode kernel reads 94 GB/s of packed weights, below what the GPU memory gives (irrelevant while the weights stream from disk).
 - An 8-bit X for HOL was measured and dropped (below); the proved bound with row scaling and n = 32768 remain as before.
@@ -954,7 +954,7 @@ one. The product prompt is still reasoning after 30 generated tokens, identicall
 
 **SQ** — Nemotron 3 Ultra i tërë (560 miliardë parametra) punon në laptop nga disku, token pas tokeni, me çdo prodhim
 matricë-vektor të rrumbullakosur saktë (një rrumbullakim i certifikuar, i provuar kundër një akumuluesi 2 560-bit; prova e
-barazimeve gjeti dhe ndreqi një defekt). 19,6 s për token me lexim përpara — aq sa motori FP32: saktësia s'kushton asgjë.
+barazimeve gjeti dhe ndreqi një defekt). 19,5–19,7 s për token me lexim përpara — aq sa motori FP32: saktësia s'kushton asgjë.
 Motori me akumulim FP32 ndryshon 41–47 % të logit-ëve të ruterit (projeksionet BF16 vetëm 0,01 %), logit-i largohet deri në
 1,22, dhe teksti ndahet: shqip pas tokenit të 5-të / 13-të, anglisht pas të 29-tit. Te OLMo 2 rruga e saktë shkruan «10,908»
 vendbanime, motori «2,994» — asnjëri s'ndodhet te 4,6T tokenat e trajnimit: të dy të shpikur, ndryshe. 123456789 × 987654321 = 121932631112635269 — saktë në të tri rrugët. Te K2-Think-V2 (72,6 B, nga disku, 0 të pacertifikuara) të dy motorët bien dakord mes tyre dhe ndahen nga rruga e saktë: shqip pas tokenit të 8-të (e sakta «qyteti më i madh në vend», motorët «qytet i vendosur në pjesën qendrore të vendit»), anglisht pas të 27-tit — të dyja të vërteta, rrumbullakimi zgjedh cilën. Për qasje të plotë te të
