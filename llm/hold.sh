@@ -5,7 +5,8 @@
 PS=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
 ac() { [ "$($PS -NoProfile -Command "(Get-CimInstance Win32_Battery).BatteryStatus" 2>/dev/null | tr -d "\r ")" != 1 ]; }
 hold() {   # hold <tag>: returns once the machine is ours; spex.want goes when the calling shell exits
-    while [ -e /opt/ozaki/spex.want ]; do sleep 60; done; echo "$1 <$$>" > /opt/ozaki/spex.want; trap 'rm -f /opt/ozaki/spex.want' EXIT
+    # noclobber: of two holders that see the marker gone in the same minute, one creates it and the other waits on
+    until ( set -C; echo "$1 <$$>" > /opt/ozaki/spex.want ) 2> /dev/null; do sleep 60; done; trap 'rm -f /opt/ozaki/spex.want' EXIT
     while ! ac || pgrep -x out_jlora > /dev/null || pgrep -x out_spex > /dev/null || [ -e /opt/ozaki/chain.busy ]; do sleep 60; done
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
