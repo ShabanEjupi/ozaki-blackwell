@@ -39,8 +39,8 @@ of $8\times1024$ tokens takes 27--29 minutes (1\,603--1\,716~s over steps 22--12
 grouped into products (4\,096 or 40 rows), on the number of threads (24 or 7), on interruption (a resumed run is
 byte-identical), on where an expert's rows are gathered, or on which of three generations of our product kernels computes it;
 since step~5 no output has been used uncertified. Five hand-written backward formulas agree with central differences of their
-FP64 forward to $5.05\times10^{-7}$; finite differences through four layers (slopes 0.93--0.97) and the loss change of real
-updates through all 61 layers agree with the backward. On a corpus of 191.9 million tokens from 21 public institutions of
+FP64 forward to $5.05\times10^{-7}$; finite differences through four layers (slopes 0.93--0.97), through all 61 layers along the gradient's sign pattern (ratio
+0.91 as $\epsilon\to0$) and the loss change of real updates through all 61 layers agree with the backward. On a corpus of 191.9 million tokens from 21 public institutions of
 Kosovo, the held-out loss falls from 1.5102 before the first update to 1.4066 after 100 updates and stays within
 1.4066--1.4165 through step~125.
 \end{abstract}
@@ -217,9 +217,16 @@ $1.4\times10^{-7}$, the others $\le8\times10^{-9}$), and a deliberately wrong fo
 dense layers and one MoE layer, 128 tokens), moving the embeddings along five random $\pm1$ directions by $\epsilon=0.001$,
 $0.002$ and $0.004$ changes the loss with least-squares slopes of 0.964, 0.969 and 0.931 against the first-order prediction
 $\langle g_0, \Delta\rangle$ (with the moves as rounded to BF16); the largest residual, $1.6$, $2.0$ and
-$5.4\times10^{-3}$, grows with $\epsilon$. Through all 61 layers this test does not resolve the gradient: at $\epsilon=0.004$
-two random directions predicted $-8.5\times10^{-4}$ and $1.2\times10^{-3}$ and measured $5.4\times10^{-3}$ and
-$-3.0\times10^{-3}$, below the BF16 rounding noise of a 61-layer forward. A real update is a direction the gradient chooses,
+$5.4\times10^{-3}$, grows with $\epsilon$. Through all 61 layers random directions do not resolve the gradient: at $\epsilon=10^{-4}$ two of them, with first-order
+changes of $9.2\times10^{-5}$ and $-1.6\times10^{-5}$, moved the loss by $5.5\times10^{-4}$ and $-9.7\times10^{-3}$ (at
+$\epsilon=0.004$: $-2.7\times10^{-3}$ and $-4.3\times10^{-3}$ against $3.5\times10^{-3}$ and $-7.9\times10^{-4}$) -- a floor
+that does not grow with $\epsilon$, the mark of discrete expert routing and BF16 rounding in a 61-layer forward. Along the
+gradient's own sign pattern, $\Delta=\pm\epsilon\,\mathrm{sign}(g_0)$, the prediction is 5--88 times that floor at
+$\epsilon=10^{-4}$ ($4.84\times10^{-2}$), and the test resolves it: for $\epsilon$ from $3.5\times10^{-5}$ to $4\times10^{-4}$
+(eight values) the measured change is 0.65--1.02 times the prediction, and the least-squares line ratio
+$=0.909-743\,\epsilon$ (largest residual 0.14, at most $9.2\times10^{-3}$ in the loss: the floor) reaches 0.91 as
+$\epsilon\to0$, against 0.93--0.97 through four layers. At $\epsilon=2.5\times10^{-5}$ the prediction ($8.1\times10^{-3}$) is
+at the floor and the ratio is 1.58. A real update is a direction the gradient chooses,
 and there the signal is large: on 1\,024 tokens through all 61 layers, the loss changed by $-0.04588$ and $-0.02731$ where the
 first-order prediction was $-0.04135$ and $-0.03288$.
 
@@ -316,8 +323,9 @@ about the adapted model's quality.
 \item \emph{Speed.} Twenty-seven to twenty-nine minutes per 8\,192 training tokens is slow; the step is a feasibility and
 reproducibility result on a laptop, not a throughput result. The MoE backward (707--758~s a step) and the FP64 attention
 backward (417--443~s) are the next targets.
-\item \emph{Gradient checks at full depth.} Through all 61 layers the backward is checked by the loss change of real updates;
-finite differences along random directions are below the forward's rounding noise there and decide nothing.
+\item \emph{Gradient checks at full depth.} Through all 61 layers finite differences resolve the gradient only along its
+own sign pattern (0.91 as $\epsilon\to0$, a scatter of $\pm0.14$ from a floor of $5.5\times10^{-4}$--$9.7\times10^{-3}$ that
+routing and rounding put under any move); along random directions they decide nothing, and real updates remain the check.
 \item \emph{What is fixed, and what is unique.} The products are unique; attention, norms and SwiGLU are reproducible
 because their FP64 operations run in a fixed order, and their transcendental functions come from the host's C library.
 Bit identity across machines therefore assumes the same \texttt{exp}; a correctly rounded library (e.g.\ CORE-MATH) would
