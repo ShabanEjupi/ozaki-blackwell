@@ -1,4 +1,6 @@
-% Draft, 03-11-2026. Steps 126-170 traced on 03-11 14:50 to train.log (per-step time, forward, MoE and attention backward,
+% Draft, 03-11-2026. 23:5x: steps 171-189 traced to train.log (the MoE backward resident on the GPU from step 176, bin_check
+% moedev 16:34: dx2 0 of 62.9 M differ, old/new step digests equal; uncertified 0; host-finished 18 in step 182 and 1 in 183, per
+% step since 091d7a4; GB 372.0-379.3; VmHWM 25 953-27 056 MiB; held-out below 1.40183 from step 183). Steps 126-170 traced on 03-11 14:50 to train.log (per-step time, forward, MoE and attention backward,
 % held-out loss, uncertified 0 in every step, host-finished 1 in steps 159 and 169, backward GB 371.6-377.9, VmHWM
 % 25 204-27 140 MiB); "375B" replaced by the counted 379B; "a step now takes" follows the 3-November kernels.
 % Every number below was traced on 02-11 to its raw line: /opt/ozaki/jlora/train/train.log (steps 1-125),
@@ -38,15 +40,15 @@ output the certificate leaves open is recomputed exactly on the CUDA cores or, a
 superaccumulator. Gradients through FP8 expert weights are exact, never quantized. Applied to rank-16 LoRA ($\alpha=32$) on the
 query and value projections of all 61 layers of Jais-3-375B-A23B-FP8 (379 billion parameters, 192 FP8 experts per MoE layer,
 a 391~GB checkpoint) streamed from the NVMe disk of a laptop with a 12~GB GPU once per forward and once per backward, a step
-of $8\times1024$ tokens took 27--29 minutes (1\,603--1\,716~s over steps 22--125) and, after four bit-exact kernel changes,
-takes 21--22 minutes (1\,260--1\,291~s over steps 163--170). The step does not depend on how rows are
+of $8\times1024$ tokens took 27--29 minutes (1\,603--1\,716~s over steps 22--125) and, after the bit-exact kernel changes of
+3 November, takes 18.5--19.2 minutes (1\,110--1\,152~s over steps 176--189). The step does not depend on how rows are
 grouped into products (4\,096 or 40 rows), on the number of threads (24 or 7), on interruption (a resumed run is
 byte-identical), on where an expert's rows are gathered, or on which of three generations of our product kernels computes it;
 since step~5 no output has been used uncertified. Five hand-written backward formulas agree with central differences of their
 FP64 forward to $5.05\times10^{-7}$; finite differences through four layers (slopes 0.93--0.97), through all 61 layers along the gradient's sign pattern (ratio
 0.91 as $\epsilon\to0$) and the loss change of real updates through all 61 layers agree with the backward. On a corpus of 191.9 million tokens from 21 public institutions of
 Kosovo, the held-out loss falls from 1.5102 before the first update to 1.4066 after 100 updates and 1.4018 after 147,
-and stays within 1.4018--1.4103 through step~170.
+stays within 1.4018--1.4103 through step~182 and then falls to 1.3958 after 186 updates (1.3966 at step~189).
 \end{abstract}
 
 \noindent\textbf{Përmbledhje (shqip).} Trajnimi me numra me presje lëvizëse nuk është funksion i hyrjeve të tij: e njëjta
@@ -54,11 +56,11 @@ e dhënë në një grup tjetër, në një GPU tjetër ose me një librari tjetë
 trajnimit, përpara dhe prapa, jep vlerën e \emph{rrumbullakosur saktë} të shumës së saktë---një numër i përcaktuar vetëm nga
 matematika---i llogaritur mbi tensor core-t INT8, i certifikuar, dhe i rillogaritur saktë kur certifikata s'mjafton. Me këtë
 trajnuam LoRA me rang 16 mbi projeksionet q dhe v të të 61 shtresave të Jais-3-375B-A23B-FP8 (379 miliardë parametra, 192
-ekspertë FP8, 391~GB) nga disku NVMe i një laptopi me GPU 12~GB: një hap me $8\times1024$ tokena zgjat 21--22 minuta
-(27--29 deri te hapi 125, para katër ndryshimeve të 3 nëntorit që s'e lëvizin asnjë bit), dhe nuk varet nga grupimi i rreshtave, numri i fijeve, ndërprerja apo versioni i kernel-ave; që nga hapi 5 asnjë dalje e
+ekspertë FP8, 391~GB) nga disku NVMe i një laptopi me GPU 12~GB: një hap me $8\times1024$ tokena zgjat 18,5--19,2 minuta
+(27--29 deri te hapi 125, para ndryshimeve të 3 nëntorit që s'e lëvizin asnjë bit), dhe nuk varet nga grupimi i rreshtave, numri i fijeve, ndërprerja apo versioni i kernel-ave; që nga hapi 5 asnjë dalje e
 pacertifikuar nuk përdoret. Mbi 191,9 milionë tokena nga 21 institucione publike të Kosovës, humbja e mbajtur jashtë bie nga
-1,5102 para përditësimit të parë në 1,4066 pas 100 përditësimeve dhe 1,4018 pas 147, dhe mbetet brenda
-1,4018--1,4103 deri te hapi 170.
+1,5102 para përditësimit të parë në 1,4066 pas 100 përditësimeve dhe 1,4018 pas 147, mbetet brenda
+1,4018--1,4103 deri te hapi 182 dhe pastaj bie në 1,3958 pas 186 përditësimeve (1,3966 te hapi 189).
 
 \section{Introduction}
 
@@ -173,11 +175,11 @@ GPU's FP64 units with \texttt{\_\_dmul\_rn}/\texttt{\_\_dadd\_rn} in exactly the
 \texttt{exp}. RoPE's inverse rotation, RMSNorm and SwiGLU are FP64 on the host. The routing weights $w_e = 2.5\,s_e/\sum s$
 (sigmoids of the eight chosen experts) pass their gradient through the sigmoid to the router logits and its transposed product;
 the top-8 choice is a constant, as in every MoE backward. The backward reads only the experts the training rows were routed
-to: 371.0--379.9~GB per step over steps 1--170.
+to: 371.0--379.9~GB per step over steps 1--189.
 
 \paragraph{Streaming.} A reader thread fetches the tensors in the order they will be used into a pinned ring; the time spent
 waiting for it counts as disk time, and in the backward it is 0.0~s in every step: the disk keeps ahead of the computation.
-The host's peak resident memory is 24.6--26.6~GiB (steps 1--170).
+The host's peak resident memory is 24.6--26.6~GiB (steps 1--189).
 
 \paragraph{Adapters, optimizer and checkpoints.} Rank 16 and $\alpha=32$ ($s=2$) on \texttt{q\_proj} ($6144\to6144$) and
 \texttt{v\_proj} ($6144\to1024$) of all 61 layers: 122 adapted maps, 18\,989\,056 trainable parameters (0.005\% of the
@@ -203,8 +205,8 @@ an expert's rows gathered on the host vs on the GPU, 4 layers, one and two steps
 experts' $dX$, old vs new kernel (layer 3, expert 0, 341 tokens) & 0 outputs differ; 4\,096 checked against the
 superaccumulator agree \\
 attention backward, GPU vs host (6, 45, 131, 1\,024 tokens) & bit for bit \\
-outputs used uncertified in the training & 0 since step 5 (through step 170); 2, 5, 6 and 9 in steps 1--4, before the host
-superaccumulator (which has since finished 0--17 outputs a step, 62 in 166 steps) \\\bottomrule
+outputs used uncertified in the training & 0 since step 5 (through step 189); 2, 5, 6 and 9 in steps 1--4, before the host
+superaccumulator (which has since finished 0--18 outputs a step, 81 in 185 steps) \\\bottomrule
 \multicolumn{2}{p{14.8cm}}{\footnotesize $^{*}$the same test on 29--30 October, before the host superaccumulator, used 3 outputs uncertified in
 each run: its $dB$ digest (\texttt{f0865bb95f43be2d}) is the exact run's, its $g_0$ digest is not.}
 \end{tabular}
@@ -249,7 +251,8 @@ same kernels (15--16) & 1\,806--1\,982 & 554--717 & 817--822 & 423--430 \\
 + tiled FP8 expert forward (17--20) & 1\,771--1\,799 & 524--569 & 778--809 & 421--427 \\
 + an expert's rows gathered on the GPU (22--74) & 1\,603--1\,647 & 465--490 & 707--730 & 417--428 \\
 same binary (75--125) & 1\,626--1\,716 & 471--508 & 720--758 & 422--443 \\
-+ BF16 rounding inside the products' input fills, the experts' $dX$ products in groups of 8, \texttt{oz\_exp} (163--170) & 1\,260--1\,291 & 459--492 & 403--471 & 348--387 \\\bottomrule
++ BF16 rounding inside the products' input fills, the experts' $dX$ products in groups of 8, \texttt{oz\_exp} (163--175) & 1\,234--1\,347 & 459--523 & 403--471 & 343--398 \\
++ the routed experts' backward resident on the GPU (176--189) & 1\,110--1\,152 & 475--504 & 235--238 & 377--409 \\\bottomrule
 \end{tabular}\\[2pt]
 {\footnotesize $^{*}$ kernel tests shared the GPU with these steps (and with steps 6, 8 and 21, left out). Steps 126--162
 (1\,217--2\,019~s), during which the changes of 3 November were deployed one at a time, are left out as well.}
@@ -269,15 +272,23 @@ attention backward, 1\,024 tokens, host FP64 $\rightarrow$ GPU FP64 & 2.06 $\rig
 {\footnotesize $^{\dagger}$a step routes $10\,240\times8/192\approx427$ rows to an expert on average.}
 \end{table}
 
-Through step 125 a step took 27--29 minutes, and since the changes of 3 November it takes 21--22 (Table~\ref{tab:steps};
+Through step 125 a step took 27--29 minutes; the changes of 3 November brought it to 20.6--22.4 (steps 163--175) and,
+with the routed experts' backward resident on the GPU, to 18.5--19.2 (steps 176--189; Table~\ref{tab:steps};
 each change replaced the training's binary only after giving the same digests). Table~\ref{tab:kernels} lists the kernel
 changes behind the fall from 3\,508~s to 1\,603--1\,716~s. One of them was not about arithmetic at all: digit planes written one byte per thread to scattered sectors took
-27.5 of the 28~s of an MoE layer's backward until one warp per block wrote 4-byte words. The last change moved the gathering
+27.5 of the 28~s of an MoE layer's backward until one warp per block wrote 4-byte words. The change of steps 22--74 moved the gathering
 of an expert's rows to the GPU: the layer's input goes up and through the FP8 quantization once, instead of the host copying
 each expert's rows out and the product uploading and quantizing them twice; steps fell from 1\,771--1\,799 to 1\,603--1\,647~s.
 With the same binary, steps 75--125 drifted up by about 5\% in every part of the step; the attention backward, whose work
 does not depend on the data (1\,024 tokens a sequence), slowed as much as the rest, so the drift is the laptop's (clock or
 background work), which we have not separated.
+
+From step 176 the routed experts' backward stays on the GPU: the layer's gradient and the routing weights go up once, each
+expert's forward is recomputed there, and its two fills write straight into the inputs of the products. It gives the host
+path's bits: on a real layer at 10\,240 rows none of the 62.9 million outputs of the input gradient differs, and the old and
+new binaries gave the same digests of a step before the training took the new one. The MoE backward fell from 403--471 to
+235--238~s a step while the attention and LoRA backward rose from 343--398 to 377--409~s, so the median step fell by 145.5~s,
+from 1\,268.8~s (steps 164--175) to 1\,123.3~s (176--189).
 
 \paragraph{What exactness costs.} An exact output needs 12 INT8 products per term for a BF16 result and 30 for an FP32 one. At
 69--93~TOPS of digit products that is roughly 15--29 times slower than cuBLAS BF16 on the same GPU (84--91~TFLOPS, measured on
@@ -316,24 +327,25 @@ Ministry of Regional Development & 5.40 & \textbf{total} & \textbf{191.94} \\\bo
 
 \begin{table}[t]\centering\small
 \caption{Held-out loss (2 sequences, 2\,046 predictions), measured in each step's forward, i.e.\ after step$-1$ updates.}\label{tab:loss}
-\footnotesize\setlength{\tabcolsep}{3.5pt}
-\begin{tabular}{lccccccccccc}\toprule
-step & 1 & 2 & 4 & 16 & 25 & 50 & 75 & 101 & 125 & 148 & 170 \\\midrule
-loss & 1.51019 & 1.50738 & 1.50056 & 1.46337 & 1.46096 & 1.43865 & 1.42055 & 1.40664 & 1.41036 & 1.40183 & 1.40689 \\\bottomrule
+\footnotesize\setlength{\tabcolsep}{2.9pt}
+\begin{tabular}{lcccccccccccc}\toprule
+step & 1 & 2 & 4 & 16 & 25 & 50 & 75 & 101 & 125 & 148 & 170 & 187 \\\midrule
+loss & 1.51019 & 1.50738 & 1.50056 & 1.46337 & 1.46096 & 1.43865 & 1.42055 & 1.40664 & 1.41036 & 1.40183 & 1.40689 & 1.39583 \\\bottomrule
 \end{tabular}
 \end{table}
 
-The held-out loss falls by 0.104 in 100 updates and by 0.108 in 147 (Table~\ref{tab:loss}; the lowest, 1.40183, at step
-148) and then holds within 1.4018--1.4103 through step 170, the variation of single 8-sequence batches. After 170 steps
-the model has seen 1\,392\,640 training tokens, 0.73\% of the corpus. We report this run to show that the exact step trains, not as a claim
+The held-out loss falls by 0.104 in 100 updates and by 0.108 in 147 (Table~\ref{tab:loss}; 1.40183 at step 148), holds
+within 1.4018--1.4103 through step 182, the variation of single 8-sequence batches, and then falls below that band for the
+first time: 1.40123 at step 183, the lowest 1.39583 at 187 (0.114 below step 1), 1.39663 at 189. After 189 steps the model
+has seen 1\,548\,288 training tokens, 0.81\% of the corpus. We report this run to show that the exact step trains, not as a claim
 about the adapted model's quality.
 
 \section{Limitations}
 \begin{itemize}
-\item \emph{Speed.} Twenty-one to twenty-two minutes per 8\,192 training tokens is slow; the step is a feasibility and
-reproducibility result on a laptop, not a throughput result. The MoE backward (403--471~s a step over steps 163--170,
-707--758~s over 22--125) and the attention backward (348--387~s) are the next targets; the next change keeps an MoE
-layer's backward resident on the GPU, its two fill kernels already equal to the host's on every output tested.
+\item \emph{Speed.} Eighteen and a half to nineteen minutes per 8\,192 training tokens is slow; the step is a feasibility
+and reproducibility result on a laptop, not a throughput result. The forward (475--504~s over steps 176--189) and the
+attention and LoRA backward (377--409~s) are now the larger parts, the MoE backward (235--238~s, from 707--758~s over
+steps 22--125) the smaller.
 \item \emph{Gradient checks at full depth.} Through all 61 layers finite differences resolve the gradient only along its
 own sign pattern (0.91 as $\epsilon\to0$, a scatter of $\pm0.14$ from a floor of $5.5\times10^{-4}$--$9.7\times10^{-3}$ that
 routing and rounding put under any move); along random directions they decide nothing, and real updates remain the check.
@@ -347,7 +359,7 @@ so bit identity across machines assumes the same results for those four; a corre
 would remove that assumption.
 \item \emph{Modelling choices.} $dY$ is rounded once to BF16 before each transposed product, as BF16 training does; the
 top-8 routing is treated as a constant.
-\item \emph{Scale of the evaluation.} One model, one adapter configuration, 170 steps; no comparison of downstream quality.
+\item \emph{Scale of the evaluation.} One model, one adapter configuration, 189 steps; no comparison of downstream quality.
 \end{itemize}
 
 \section{Conclusion}

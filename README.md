@@ -1057,16 +1057,28 @@ inputs (x = −(double)f), for 2³² hashed doubles with |x| < 2¹⁰ and for 2�
 ozexp` decides): the host no longer depends on its libm for `exp`, and the softmax, `swiglu_back`, the fill and the add can move
 to the GPU with the host's bits.
 
-**Next: the MoE backward resident on the GPU.** Moving `fill_gu` alone would not cut the traffic (gg and uu would go up
-instead of xb, 1.17 GB either way per layer); the whole expert pipeline has to stay on the device for a layer: the incoming
-gradient once up, the forward recompute's gg, uu, y kept there, `fill_down` (bfb(w g), dw = Σ g y in ascending c),
-da = 0 + Y_down, `fill_gu`, and dx2 += Y_gu per expert in ascending id, one copy down at the end -- about 2 s per MoE layer,
-~110 s a step. Its numerics are proved first: `oz_exp` (above) and `llm/oz_bf.cuh` (BF16 rounding and swiglu_back's two
-BF16 outputs for host and GPU from one source; `llm/fill_check.cu`: 0 of 2³² doubles and 0 of 2³² (g, u, y) triples differ
-from the host's bf() and fill_gu). The two fills as GPU kernels (`llm/moe_dev.cuh`: `k_fill_down` with dw in ascending c, `k_fill_gu`) give
-the host loops' bits as well: 0 of 18 432 000 and 0 of 12 288 000 bytes, 0 of 3 000 dw differ (2.4 and 1.2 ms for 3 000 rows).
-What is left is the wiring: `bmm` and `dgrad_f8g` variants whose outputs stay on the device.
+**The MoE backward resident on the GPU** (`moe_back_dev`, 05f1b05; `OZ_MOEDEV=0` keeps the host path; deployed 03-11 16:34
+by `llm/bin_check.sh moedev`). Moving `fill_gu` alone would not have cut the traffic (gg and uu would go up instead of xb,
+1.17 GB either way per layer), so the whole expert pipeline stays on the device for a layer: g, dx2 and the routing weights go
+up once; each expert's forward is recomputed there (`bmm8d`: `bmm`'s FP8 tile kernels with device inputs and outputs, then
+`k_swiglu_rows`); `k_fill_down` (bfb(w g), dw = Σ g y in ascending c) and `k_fill_gu` write straight into the products' inputs;
+da = 0 + Y_down is read in place and dx2 += 0 + Y_gu expert by expert in ascending id (`k_add_dx`). Experts beyond G_NB go in
+chunks, the fixup's leftovers finish on the host over a copy, and with less than 1.5 GB to spare it takes the host path, with
+the same bits. Its numerics were proved first: `oz_exp` (above), `llm/oz_bf.cuh` (BF16 rounding and swiglu_back's two BF16
+outputs for host and GPU from one source; `llm/fill_check.cu`: 0 of 2³² doubles and 0 of 2³² (g, u, y) triples differ from the
+host's bf() and fill_gu) and the two fills as kernels (`llm/moe_dev.cuh`: 0 of 18 432 000 and 0 of 12 288 000 bytes, 0 of 3 000
+dw differ). The wiring was checked the same way (`llm/md_checks.sh`): dx2 of both paths on a real layer, 0 of 62 914 560
+outputs differ at 10 240 rows (host path 8.5–9.0 s, GPU 5.1–5.2 s), 0 at 2 048 and 512 rows; the grouped dgrad 0 of 2 937 088
+and 0 of 10 070 016; the 4-layer step gave the training binary's dB, dA and g₀ digests (123.7 → 117.6 s).
+
+In the training (steps 164–175 the old binary, 176–189 the new one; medians, ranges in brackets): step **1 268.8 → 1 123.3 s**
+(1 234–1 347 → 1 110–1 152), MoE backward **415.3 → 236.7 s** (403–451 → 235–238), forward 486.9 → 490.6 s, attention and LoRA
+backward 360.1 → 385.9 s (343–398 → 377–409). The step is 145.5 s (11.5 %) shorter, less than the 178.6 s the MoE line lost
+(estimated beforehand: ~2 s per MoE layer, ~110 s a step). The held-out loss then left the 1.4018–1.4103 band it had kept
+since step 148: 1.40123 at step 183, 1.39583 at 187 (the lowest), 1.39663 at 189.
 
 **SQ** — 03-11: tri ndryshime të tjera të vendosura vetë pas kontrollit të digest-eve (hapi 135,6 → 118,5 s). `exp` i përbashkët
 host/GPU: sekuenca IEEE e glibc 2.39, e lexuar nga kodi makinë; 0 ndryshime në 12,9 miliardë hyrje (të 2³² FP32, 2³² double,
 2³² modele bitesh); trajnimi s'varet më nga libm-ja për `exp`, dhe pjesa e mbetur e MoE backward mund të kalojë te GPU-ja.
+MoE backward rezident te GPU-ja (05f1b05, vendosur 16:34, të njëjtat bite: dx2 0 nga 62,9 milionë): hapi 1 268,8 → 1 123,3 s
+(mediana e hapave 164–175 kundrejt 176–189), MoE backward 415,3 → 236,7 s; humbja e mbajtur jashtë 1,39583 te hapi 187.
