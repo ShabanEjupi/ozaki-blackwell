@@ -519,19 +519,21 @@ static void moe_back(const std::string &P, int L, const std::vector<float> &x2, 
         // straight into the products' input (dgrad_f8x); OZ_HILO=1 or other formats: the FP64 vectors and dgrad() as before
         const bool f8 = !HILO && Wd.fmt == F_E4M3B && Wg.fmt == F_E4M3B && Wu.fmt == F_E4M3B;
         std::vector<double> dy(f8 ? 0 : n * D_H);
-        #pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < n; i++) { size_t r = by[e][i].first; int s = by[e][i].second; double w = wt[r][s], d = 0;
-            const double *gr = g.data() + r * D_H; const float *yi = y.data() + i * D_H;
-            if (f8) for (int c = 0; c < D_H; c++) d += gr[c] * yi[c];
-            else for (int c = 0; c < D_H; c++) { dy[i * D_H + c] = w * gr[c]; d += gr[c] * yi[c]; }
-            dw[r * J_TOPK + s] = d; }
+        if (!f8) {
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < n; i++) { size_t r = by[e][i].first; int s = by[e][i].second; double w = wt[r][s], d = 0;
+                const double *gr = g.data() + r * D_H; const float *yi = y.data() + i * D_H;
+                for (int c = 0; c < D_H; c++) { dy[i * D_H + c] = w * gr[c]; d += gr[c] * yi[c]; }
+                dw[r * J_TOPK + s] = d; }
+        }
         pmark(tm, "moe dy");
         std::vector<double> da(n * (size_t)J_MFF, 0.0), dg, du, dxe(n * D_H, 0.0);
-        if (f8) dgrad_f8x({Wd}, n, da, [&](size_t n0, size_t m, uint16_t *xb) {
+        if (f8) dgrad_f8x({Wd}, n, da, [&](size_t n0, size_t m, uint16_t *xb) {   // and dw = g . y in the same pass over g's rows
             #pragma omp parallel for schedule(static)
-            for (size_t i = 0; i < m; i++) { size_t r = by[e][n0 + i].first; double w = wt[r][by[e][n0 + i].second];
-                const double *gr = g.data() + r * D_H; uint16_t *x = xb + i * D_H;
-                for (int c = 0; c < D_H; c++) x[c] = bfb(w * gr[c]); } });
+            for (size_t i = 0; i < m; i++) { size_t r = by[e][n0 + i].first; int s = by[e][n0 + i].second; double w = wt[r][s], d = 0;
+                const double *gr = g.data() + r * D_H; const float *yi = y.data() + (n0 + i) * D_H; uint16_t *x = xb + i * D_H;
+                for (int c = 0; c < D_H; c++) { x[c] = bfb(w * gr[c]); d += gr[c] * yi[c]; }
+                dw[r * J_TOPK + s] = d; } });
         else dgrad({Wd}, {&dy}, n, da);
         pmark(tm, "moe dgrad down");
         if (f8) dgrad_f8x({Wg, Wu}, n, dxe, [&](size_t n0, size_t m, uint16_t *xb) {   // swiglu_back's two formulas, row by row
