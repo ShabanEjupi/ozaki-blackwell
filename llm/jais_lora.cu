@@ -231,14 +231,7 @@ template <class F> static void bmm_bfx(const DevW &W, size_t N, int p, std::vect
         g_hxb.resize(np * K); std::fill(g_hxb.begin() + n * K, g_hxb.begin() + np * K, (uint16_t)0);
         fill(n0, n, g_hxb.data());
         CK(cudaMemcpy(g_xb, g_hxb.data(), np * K * 2, cudaMemcpyHostToDevice)); pmark(tp, "dg x-host");
-        bf16_digits<<<dig_grid(np * KB), 256>>>(g_xb, g_xd, g_xl, g_xn, np, K, xdig(p)); pmark(tp, "b24 x-digits");
-        bf16_gemm_p(p, dw, g_wd, g_wl, g_wn, g_xd, g_xl, g_xn, g_Y, M, np, K, g_nb); pmark(tp, "b24 gemm");
-        CK(cudaMemset(g_lcnt, 0, 4)); CK(cudaMemset(g_nb, 0, 4));
-        nan_list<<<1024, 256>>>(g_Y, np * M, g_list, g_lcnt, G_CAP);
-        bf16_fixup<<<1024, 256>>>((const uint16_t *)W.w, g_xb, g_list, g_lcnt, G_CAP, g_Y, M, K, p, g_nb);
-        unsigned lc; CK(cudaMemcpy(&lc, g_lcnt, 4, cudaMemcpyDeviceToHost)); (p == 24 ? st_fix24 : st_fix) += lc;
-        int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_fixopen += nb;
-        size_t left = (lc > G_CAP ? lc - G_CAP : 0) + nb; pmark(tp, "b24 fixup");
+        size_t left = bf16_chunk(W, np, p, dw, tp);   // jais_batch.cu: digits, product, fixup
         g_hy.resize(n * M); float *y = g_hy.data(); CK(cudaMemcpy(y, g_Y, n * M * 4, cudaMemcpyDeviceToHost)); pmark(tp, "b24 y-d2h");
         if (left) {   // what is still NaN: bmm's GEMV
             std::vector<char> open(n);

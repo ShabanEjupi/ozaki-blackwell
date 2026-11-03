@@ -77,6 +77,20 @@ __global__ void gather_q(const uint8_t *rq, const float *rs, const int *rows, si
     }
 }
 // rdev, rhost: the rows of X (all rows of the layer, already on the GPU by rows_up) this product takes -- FP8 maps only
+// One chunk of a BF16 product on the GPU, shared by bmm and jais_lora.cu's bmm_bfx: g_xb holds np rows of X as BF16 bits;
+// Y = X W^T lands in g_Y, every output correctly rounded or NaN. Returns how many are still NaN (the host GEMV's work).
+static size_t bf16_chunk(const DevW &W, size_t np, int p, int dw, std::chrono::steady_clock::time_point &tp) {
+    int M = W.M, K = W.K, KB = K / 128; const bool b24 = p == 24;
+    bf16_digits<<<dig_grid(np * KB), 256>>>(g_xb, g_xd, g_xl, g_xn, np, K, xdig(p)); pmark(tp, b24 ? "b24 x-digits" : "b8 x-digits");
+    bf16_gemm_p(p, dw, g_wd, g_wl, g_wn, g_xd, g_xl, g_xn, g_Y, M, np, K, g_nb); pmark(tp, b24 ? "b24 gemm" : "b8 gemm");
+    CK(cudaMemset(g_lcnt, 0, 4)); CK(cudaMemset(g_nb, 0, 4));
+    nan_list<<<1024, 256>>>(g_Y, np * M, g_list, g_lcnt, G_CAP);
+    bf16_fixup<<<1024, 256>>>((const uint16_t *)W.w, g_xb, g_list, g_lcnt, G_CAP, g_Y, M, K, p, g_nb);
+    unsigned lc; CK(cudaMemcpy(&lc, g_lcnt, 4, cudaMemcpyDeviceToHost)); (b24 ? st_fix24 : st_fix) += lc;
+    int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_fixopen += nb;   // the fixup left them NaN: the GEMV
+    pmark(tp, b24 ? "b24 fixup" : "b8 fixup");
+    return (lc > G_CAP ? lc - G_CAP : 0) + nb;   // beyond the fixup's list, and what it left open
+}
 static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y, const int *rdev = nullptr, const size_t *rhost = nullptr) {
     auto t0 = std::chrono::steady_clock::now(), tp = t0;
     int M = W.M, K = W.K, KB = K / 128; bool fp8 = W.fmt == F_E4M3B;
@@ -117,15 +131,7 @@ static void bmm(const DevW &W, const float *X, size_t N, int p, float *Y, const 
             #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < n * K; i++) { uint32_t u; memcpy(&u, &x[i], 4); xb[i] = u >> 16; }   // BF16 values: exact
             CK(cudaMemcpy(g_xb, xb.data(), np * K * 2, cudaMemcpyHostToDevice)); ph("", "b8 x-host", "b24 x-host");
-            bf16_digits<<<dig_grid(np * KB), 256>>>(g_xb, g_xd, g_xl, g_xn, np, K, xdig(p)); ph("", "b8 x-digits", "b24 x-digits");
-            bf16_gemm_p(p, dw, g_wd, g_wl, g_wn, g_xd, g_xl, g_xn, g_Y, M, np, K, g_nb); ph("", "b8 gemm", "b24 gemm");
-            CK(cudaMemset(g_lcnt, 0, 4)); CK(cudaMemset(g_nb, 0, 4));
-            nan_list<<<1024, 256>>>(g_Y, np * M, g_list, g_lcnt, G_CAP);
-            bf16_fixup<<<1024, 256>>>((const uint16_t *)W.w, g_xb, g_list, g_lcnt, G_CAP, g_Y, M, K, p, g_nb);
-            unsigned lc; CK(cudaMemcpy(&lc, g_lcnt, 4, cudaMemcpyDeviceToHost)); (p == 24 ? st_fix24 : st_fix) += lc;
-            int nb; CK(cudaMemcpy(&nb, g_nb, 4, cudaMemcpyDeviceToHost)); st_fixopen += nb;   // the fixup left them NaN: the GEMV below
-            left = (lc > G_CAP ? lc - G_CAP : 0) + nb;   // beyond the fixup's list, and what it left open
-            ph("", "b8 fixup", "b24 fixup");
+            left = bf16_chunk(W, np, p, dw, tp);
         }
         float *y = Y + n0 * M; CK(cudaMemcpy(y, g_Y, n * M * 4, cudaMemcpyDeviceToHost)); ph("f8 y-d2h", "b8 y-d2h", "b24 y-d2h");
         std::vector<char> open(n);   // rows with a NaN left, found in parallel (one thread scanned n x M floats per product)
