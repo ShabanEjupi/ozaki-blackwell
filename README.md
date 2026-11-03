@@ -1041,6 +1041,14 @@ inputs (x = −(double)f), for 2³² hashed doubles with |x| < 2¹⁰ and for 2�
 ozexp` decides): the host no longer depends on its libm for `exp`, and the softmax, `swiglu_back`, the fill and the add can move
 to the GPU with the host's bits.
 
+**Next: the MoE backward resident on the GPU.** Moving `fill_gu` alone would not cut the traffic (gg and uu would go up
+instead of xb, 1.17 GB either way per layer); the whole expert pipeline has to stay on the device for a layer: the incoming
+gradient once up, the forward recompute's gg, uu, y kept there, `fill_down` (bfb(w g), dw = Σ g y in ascending c),
+da = 0 + Y_down, `fill_gu`, and dx2 += Y_gu per expert in ascending id, one copy down at the end -- about 2 s per MoE layer,
+~110 s a step. Its numerics are proved first: `oz_exp` (above) and `llm/oz_bf.cuh` (BF16 rounding and swiglu_back's two
+BF16 outputs for host and GPU from one source; `llm/fill_check.cu`: 0 of 2³² doubles and 0 of 2³² (g, u, y) triples differ
+from the host's bf() and fill_gu).
+
 **SQ** — 03-11: tri ndryshime të tjera të vendosura vetë pas kontrollit të digest-eve (hapi 135,6 → 118,5 s). `exp` i përbashkët
 host/GPU: sekuenca IEEE e glibc 2.39, e lexuar nga kodi makinë; 0 ndryshime në 12,9 miliardë hyrje (të 2³² FP32, 2³² double,
 2³² modele bitesh); trajnimi s'varet më nga libm-ja për `exp`, dhe pjesa e mbetur e MoE backward mund të kalojë te GPU-ja.
