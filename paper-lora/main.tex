@@ -219,6 +219,7 @@ $0.002$ and $0.004$ changes the loss with least-squares slopes of 0.964, 0.969 a
 $\langle g_0, \Delta\rangle$ (with the moves as rounded to BF16); the largest residual, $1.6$, $2.0$ and
 $5.4\times10^{-3}$, grows with $\epsilon$. Through all 61 layers random directions do not resolve the gradient: at $\epsilon=10^{-4}$ two of them, with first-order
 changes of $9.2\times10^{-5}$ and $-1.6\times10^{-5}$, moved the loss by $5.5\times10^{-4}$ and $-9.7\times10^{-3}$ (at
+$\epsilon=2\times10^{-4}$: $-9.5\times10^{-4}$ and $-2.4\times10^{-3}$ against $1.8\times10^{-4}$ and $-2.1\times10^{-5}$; at
 $\epsilon=0.004$: $-2.7\times10^{-3}$ and $-4.3\times10^{-3}$ against $3.5\times10^{-3}$ and $-7.9\times10^{-4}$) -- a floor
 that does not grow with $\epsilon$, the mark of discrete expert routing and BF16 rounding in a 61-layer forward. Along the
 gradient's own sign pattern, $\Delta=\pm\epsilon\,\mathrm{sign}(g_0)$, the prediction is 5--88 times that floor at
@@ -322,14 +323,18 @@ about the adapted model's quality.
 \begin{itemize}
 \item \emph{Speed.} Twenty-seven to twenty-nine minutes per 8\,192 training tokens is slow; the step is a feasibility and
 reproducibility result on a laptop, not a throughput result. The MoE backward (707--758~s a step) and the FP64 attention
-backward (417--443~s) are the next targets.
+backward (417--443~s) are the next targets. (After four bit-exact changes deployed on 3 November, each checked digest
+for digest before it took the training's place, steps 163--164 take 1\,257--1\,291~s, the MoE backward 427--471~s.)
 \item \emph{Gradient checks at full depth.} Through all 61 layers finite differences resolve the gradient only along its
 own sign pattern (0.91 as $\epsilon\to0$, a scatter of $\pm0.14$ from a floor of $5.5\times10^{-4}$--$9.7\times10^{-3}$ that
 routing and rounding put under any move); along random directions they decide nothing, and real updates remain the check.
 \item \emph{What is fixed, and what is unique.} The products are unique; attention, norms and SwiGLU are reproducible
-because their FP64 operations run in a fixed order, and their transcendental functions come from the host's C library.
-Bit identity across machines therefore assumes the same \texttt{exp}; a correctly rounded library (e.g.\ CORE-MATH) would
-remove that assumption.
+because their FP64 operations run in a fixed order. Their \texttt{exp} (SwiGLU, the router's sigmoid, the softmax) is,
+from 3 November, our own fixed sequence of IEEE operations (\texttt{llm/oz\_exp.cuh}: glibc 2.39's x86-64 FMA path, equal to
+the host's \texttt{exp} on all $2^{32}$ FP32 inputs and $2^{33}$ hashed doubles, and the same bits on the GPU), deployed
+without moving a digest; RoPE's sine and cosine, the loss's logarithm and Adam's power still come from the host's C library,
+so bit identity across machines assumes the same results for those four; a correctly rounded library (e.g.\ CORE-MATH)
+would remove that assumption.
 \item \emph{Modelling choices.} $dY$ is rounded once to BF16 before each transposed product, as BF16 training does; the
 top-8 routing is treated as a constant.
 \item \emph{Scale of the evaluation.} One model, one adapter configuration, 125 steps; no comparison of downstream quality.
