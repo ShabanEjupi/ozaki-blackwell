@@ -1,6 +1,6 @@
 #!/bin/bash
 # wsl.sh "<command>" -- runs <command> (default: make) on the GPU machine with this folder as it is. With a .hosts file (not in
-# git; see .hosts.example) the folder goes there as a tar on stdin and runs in /opt/ozaki/src, the command inside it as .run.sh
+# git; see .hosts.example) the folder goes there as a tar on stdin and runs in $OZ_DEST (default /opt/ozaki/src, the training's tree), the command inside it as .run.sh
 # (no quoting through several shells); without one, here.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -11,7 +11,7 @@ printf 'export PATH=/usr/local/cuda-12.8/bin:$PATH\nset -e\ntrap '"'"'echo "[wsl
 trap 'rm -f .run.sh .version' EXIT
 if [ -f .hosts ]; then
     . ./.hosts
-    tar czf - --exclude=.git --exclude=.hosts --exclude='out_*' . | oz_gpu "mkdir -p /opt/ozaki/src && cd /opt/ozaki/src && tar xzf - && bash .run.sh" 2>&1 | tr -d '\r'
+    tar czf - --exclude=.git --exclude=.hosts --exclude='out_*' . | oz_gpu "mkdir -p ${OZ_DEST:-/opt/ozaki/src} && cd ${OZ_DEST:-/opt/ozaki/src} && tar xzf - && bash .run.sh" 2>&1 | tr -d '\r'
 else
     bash .run.sh
 fi
