@@ -10,7 +10,7 @@ log() { echo "$(date '+%F %T') $*" >> $L; }
 log "start $(cat .version 2>/dev/null | tr '\n' ' ')"
 { nvcc -O3 -arch=sm_120 -std=c++17 -o out_test bench/ozaki_test.cu &&
   g++ -O3 -c bench/ref_quad.cpp -o out_rq.o && nvcc -O3 -arch=sm_120 -std=c++17 -Xcompiler -fopenmp -o out_dd bench/dd_test.cu out_rq.o -lquadmath -lmpfr -lgmp -lgomp &&
-  nvcc -O3 -arch=sm_120 -std=c++17 -Xcompiler -fopenmp -o out_td bench/td_test.cu -lmpfr -lgmp -lgomp &&
+  nvcc -O3 -arch=sm_120 -std=c++17 -Xcompiler -fopenmp,-march=native,-ffp-contract=off -o out_td bench/td_test.cu -lmpfr -lgmp -lgomp &&
   nvcc -O3 -arch=sm_120 -std=c++17 -Xcompiler -fopenmp,-march=native -o out_mp bench/mp_test.cu -lqd -lmpfr -lgmp -lgomp; } >> $L 2>&1 || { log "build FAILED"; exit 1; }
 . llm/hold.sh; hold speed; log "machine held"
 for b in out_test out_dd out_td out_mp; do log "== $b"; ./$b >> $L 2>&1; log "$b rc=$?"; done
