@@ -52,9 +52,10 @@ Shpejtësia, n = 4096 (TFLOPS FP64-ekuivalentë; piku vendas FP64 i matur 0,449)
 
 | | 12 moduli | 14 moduli | **16 moduli** |
 |---|---|---|---|
-| TFLOPS | 7.55 | 6.46 | **5.56 — 12.4× the native peak, and more accurate** |
+| TFLOPS, 3 November (current code, `bench/speed_all.sh`, machine held) | 8.44 | 7.70 | **6.76 — 15.1× the native peak, and more accurate** |
+| TFLOPS, 15 October | 7.55 | 6.46 | 5.56 |
 
-Time split at 16 moduli / ndarja e kohës: scales 1.0 ms · residues 3.0 ms · 16 INT8 GEMMs 16.8 ms · CRT 3.6 ms.
+Time split at 16 moduli, code of 15 October / ndarja e kohës, kodi i 15 tetorit: scales 1.0 ms · residues 3.0 ms · 16 INT8 GEMMs 16.8 ms · CRT 3.6 ms.
 The INT8 GEMM runs at 68 % of the measured tensor-core peak (157 of 232 TOPS, three-stage cp.async). With real data the laptop is
 **power-bound** (~95 W, SM 1.8 GHz): a faster kernel did not move the end-to-end numbers, so the next gains are in energy
 per INT8 operation (fewer moduli, fewer bit flips), not in latency hiding.
@@ -196,7 +197,7 @@ Error: max componentwise |C − C_ref| / (|A||B|), in units of **2⁻¹⁰⁶**,
 | 1024 | 2^±0 | 4.7e5 | 31 | **0.49** |
 | 1024 | 2^±8 | 1.1e7 | 713 | **12.4** |
 
-Speed at n = 4096: **1.76 TFLOPS of double-double with 32 moduli (2.34 with 24) — 3.9× this GPU's own plain FP64 (0.449), with twice
+Speed at n = 4096 (3 November, current code): **3.81 TFLOPS of double-double with 32 moduli (4.80 with 24) — 8.5× this GPU’s own FP64 peak (0.449), with twice
 the significand bits.** Ndërtohet nga të njëjtat tensor core INT8; asnjë GPU s'ka double-double/FP128 në harduer.
 Residues split into two int64 limbs instead of fmod on 2^107 values: 211 → 78 ms. The 32 INT8 GEMMs are ~35 of those 78.
 
