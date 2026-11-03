@@ -6,11 +6,13 @@
 //   U12 through the assembled inverse of L11, trailing updates as td GEMMs subtracting in place; left-looking solves
 //   with inverted 32 x 32 diagonal blocks; one refinement step with the original A in triple-double.
 //   Reference: LU with partial pivoting in MPFR at 160 bits on every CPU core (what one would run today), and FP64 LU.
-// Build: nvcc -O3 -arch=sm_120 -std=c++17 --fmad=false -Xcompiler -fopenmp,-ffp-contract=off -o out_soltd bench/solve_td.cu -lmpfr -lgmp -lgomp
+// Build: nvcc -O3 -arch=sm_120 -std=c++17 --fmad=false -Xcompiler -fopenmp,-ffp-contract=off,-march=native -o out_soltd bench/solve_td.cu -lmpfr -lgmp -lgomp
+//   (-march=native since 03-11-2026: without it the CPU baselines' fma is a libm call and their SIMD loops stay scalar)
 // Run:   ./out_soltd n [nb [kappa_exponent [seed]]]
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 #include <mpfr.h>
@@ -372,6 +374,65 @@ static void split(mpfr_t v, double &a, double &b, double &c, mpfr_t t) {   // v 
 }
 static void set3(mpfr_t v, double a, double b, double c) { mpfr_set_d(v, a, MPFR_RNDN); mpfr_add_d(v, v, b, MPFR_RNDN); mpfr_add_d(v, v, c, MPFR_RNDN); }
 
+// Triple-double LU on the CPU with the GPU kernels' arithmetic (partial pivoting, every entry updated as tsub(a, tmul(l, u)) in
+// ascending k). lu_td_cpu is the loop of 22-10 (rows in parallel, SIMD over columns): it streams the trailing matrix once per
+// column and is memory-bound beyond n = 2048 (1.04 s there, 18.0 s at 4096 for 8x the work). lu_td_cpu_blocked (03-11-2026):
+// the same operations in the same order (a row's multipliers travel with it through the swaps), the trailing update deferred
+// per panel of nb columns and done tile by tile -- the same bits (OZ_CPUTD_NB=<nb> runs it after the unblocked one and
+// compares), compute-bound. F[0..2]: the three parts, row-major.
+static inline void td_axpy_row(double *rx, double *ry, double *rz, T l, const double *ux, const double *uy, const double *uz, int c0, int c1) {
+#pragma omp simd
+    for (int c = c0; c < c1; c++) { T v = tsub({rx[c], ry[c], rz[c]}, tmul(l, {ux[c], uy[c], uz[c]})); rx[c] = v.x; ry[c] = v.y; rz[c] = v.z; }
+}
+static void td_pivot_col(int n, int j, int c1, std::vector<double> *F, std::vector<int> &pv) {
+    int p = j; for (int i = j + 1; i < n; i++) if (fabs(F[0][(size_t)i * n + j]) > fabs(F[0][(size_t)p * n + j])) p = i;
+    pv[j] = p;
+    if (p != j) for (int c = 0; c < 3; c++) std::swap_ranges(F[c].begin() + (size_t)j * n, F[c].begin() + (size_t)j * n + n, F[c].begin() + (size_t)p * n);
+    const T d{F[0][(size_t)j * n + j], F[1][(size_t)j * n + j], F[2][(size_t)j * n + j]};
+    const double *ux = &F[0][(size_t)j * n], *uy = &F[1][(size_t)j * n], *uz = &F[2][(size_t)j * n];
+#pragma omp parallel for schedule(static)
+    for (int i = j + 1; i < n; i++) {   // the multipliers, and the update of columns j+1 .. c1-1
+        double *rx = &F[0][(size_t)i * n], *ry = &F[1][(size_t)i * n], *rz = &F[2][(size_t)i * n];
+        T l = tdiv({rx[j], ry[j], rz[j]}, d); rx[j] = l.x; ry[j] = l.y; rz[j] = l.z;
+        td_axpy_row(rx, ry, rz, l, ux, uy, uz, j + 1, c1);
+    }
+}
+static void lu_td_cpu(int n, std::vector<double> *F, std::vector<int> &pv) { for (int j = 0; j < n; j++) td_pivot_col(n, j, n, F, pv); }
+static void lu_td_cpu_blocked(int n, int nb, std::vector<double> *F, std::vector<int> &pv) {
+    const int RB = 64, CS = 256;
+    auto row = [&](int c, int i) { return &F[c][(size_t)i * n]; };
+    for (int k0 = 0; k0 < n; k0 += nb) {
+        const int k1 = std::min(n, k0 + nb);
+        for (int j = k0; j < k1; j++) td_pivot_col(n, j, k1, F, pv);   // the panel: updates inside its own columns only
+        if (k1 == n) break;
+        const int ns = (n - k1 + CS - 1) / CS, nr = (n - k1 + RB - 1) / RB;
+#pragma omp parallel for schedule(dynamic)
+        for (int s = 0; s < ns; s++) {   // U12: the panel rows' updates among themselves, k ascending, strip by strip
+            const int c0 = k1 + s * CS, c1 = std::min(n, c0 + CS);
+            for (int r = k0 + 1; r < k1; r++)
+                for (int k = k0; k < r; k++)
+                    td_axpy_row(row(0, r), row(1, r), row(2, r), {row(0, r)[k], row(1, r)[k], row(2, r)[k]}, row(0, k), row(1, k), row(2, k), c0, c1);
+        }
+#pragma omp parallel for collapse(2) schedule(dynamic)
+        for (int b = 0; b < nr; b++)   // A22 -= L21 U12, tile by tile, every entry k ascending
+            for (int s = 0; s < ns; s++) {
+                const int i0 = k1 + b * RB, i1 = std::min(n, i0 + RB), c0 = k1 + s * CS, c1 = std::min(n, c0 + CS);
+                for (int i = i0; i < i1; i++)
+                    for (int k = k0; k < k1; k++)
+                        td_axpy_row(row(0, i), row(1, i), row(2, i), {row(0, i)[k], row(1, i)[k], row(2, i)[k]}, row(0, k), row(1, k), row(2, k), c0, c1);
+            }
+    }
+}
+static void lu_td_cpu_solve(int n, const std::vector<double> *F, const std::vector<int> &pv, const std::vector<double> *y, std::vector<double> *zz) {
+    auto at = [&](int i, int k) { size_t q = (size_t)i * n + k; return T{F[0][q], F[1][q], F[2][q]}; };
+    std::vector<T> z(n); for (int i = 0; i < n; i++) z[i] = {y[0][i], y[1][i], y[2][i]};
+    for (int j = 0; j < n; j++) std::swap(z[j], z[pv[j]]);
+    for (int i = 0; i < n; i++) for (int k = 0; k < i; k++) z[i] = tsub(z[i], tmul(at(i, k), z[k]));
+    for (int i = n - 1; i >= 0; i--) { for (int k = i + 1; k < n; k++) z[i] = tsub(z[i], tmul(at(i, k), z[k])); z[i] = tdiv(z[i], at(i, i)); }
+    for (int c = 0; c < 3; c++) zz[c].resize(n);
+    for (int i = 0; i < n; i++) { zz[0][i] = z[i].x; zz[1][i] = z[i].y; zz[2][i] = z[i].z; }
+}
+
 int main(int argc, char **argv) {
     int n = argc > 1 ? atoi(argv[1]) : 1024, nb = argc > 2 ? atoi(argv[2]) : 256;
     double ek = argc > 3 ? atof(argv[3]) : 36;
@@ -470,34 +531,33 @@ int main(int argc, char **argv) {
         printf("%-46s %9.2f %15.3g\n", "FP64 LU (CPU)", now() - t0, err(z));
     }
     if (!getenv("OZ_NOCPUTD")) {   // triple-double LU on the CPU (the same arithmetic as the GPU kernels), rows in parallel, SIMD over columns
-        std::vector<double> F[3] = {A[0], A[1], A[2]}, y[3] = {b[0], b[1], b[2]}; std::vector<int> pv(n);
-        double t0 = now();
-        for (int j = 0; j < n; j++) {
-            int p = j; for (int i = j + 1; i < n; i++) if (fabs(F[0][(size_t)i * n + j]) > fabs(F[0][(size_t)p * n + j])) p = i;
-            pv[j] = p;
-            if (p != j) for (int c = 0; c < 3; c++) std::swap_ranges(F[c].begin() + (size_t)j * n, F[c].begin() + (size_t)j * n + n, F[c].begin() + (size_t)p * n);
-            T d{F[0][(size_t)j * n + j], F[1][(size_t)j * n + j], F[2][(size_t)j * n + j]};
-            const double *ux = &F[0][(size_t)j * n], *uy = &F[1][(size_t)j * n], *uz = &F[2][(size_t)j * n];
-#pragma omp parallel for schedule(static)
-            for (int i = j + 1; i < n; i++) {
-                double *rx = &F[0][(size_t)i * n], *ry = &F[1][(size_t)i * n], *rz = &F[2][(size_t)i * n];
-                T l = tdiv({rx[j], ry[j], rz[j]}, d);
-                rx[j] = l.x; ry[j] = l.y; rz[j] = l.z;
-#pragma omp simd
-                for (int c = j + 1; c < n; c++) { T v = tsub({rx[c], ry[c], rz[c]}, tmul(l, {ux[c], uy[c], uz[c]})); rx[c] = v.x; ry[c] = v.y; rz[c] = v.z; }
+        // OZ_CPUTD_NB=<nb>: the blocked one too (OZ_CPUTD_NOUB=1: the blocked one alone), the two compared bit for bit
+        const int bnb = getenv("OZ_CPUTD_NB") ? std::max(16, atoi(getenv("OZ_CPUTD_NB"))) : 0;
+        std::vector<double> F[3], Fb[3], zz[3], zb[3]; std::vector<int> pv(n);
+        if (!getenv("OZ_CPUTD_NOUB")) {
+            for (int c = 0; c < 3; c++) F[c] = A[c];
+            double t0 = now();
+            lu_td_cpu(n, F, pv); lu_td_cpu_solve(n, F, pv, b, zz);
+            double tc = now() - t0;
+            char lab[64]; snprintf(lab, sizeof lab, "triple-double LU on the CPU, %d threads", thr);
+            printf("%-46s %9.2f %15.3g\n", lab, tc, err(zz));
+            printf("%-46s %9.0fx\n", "  speedup of the GPU", tc / tg);
+        }
+        if (bnb) {
+            for (int c = 0; c < 3; c++) Fb[c] = A[c];
+            double t0 = now();
+            lu_td_cpu_blocked(n, bnb, Fb, pv); lu_td_cpu_solve(n, Fb, pv, b, zb);
+            double tc = now() - t0;
+            char lab[80]; snprintf(lab, sizeof lab, "triple-double LU on the CPU, %d threads (blocked nb=%d)", thr, bnb);
+            printf("%-46s %9.2f %15.3g\n", lab, tc, err(zb));
+            printf("%-46s %9.0fx\n", "  speedup of the GPU", tc / tg);
+            if (!getenv("OZ_CPUTD_NOUB")) {
+                size_t dl = 0, dz = 0;
+                for (int c = 0; c < 3; c++) { for (size_t t = 0; t < F[c].size(); t++) dl += memcmp(&F[c][t], &Fb[c][t], 8) != 0;
+                                              for (int i = 0; i < n; i++) dz += memcmp(&zz[c][i], &zb[c][i], 8) != 0; }
+                printf("blocked vs unblocked: %zu of 3 x %zu LU words differ, %zu of 3 x %d solution words\n", dl, F[0].size(), dz, n);
             }
         }
-        auto at = [&](int i, int k) { size_t q = (size_t)i * n + k; return T{F[0][q], F[1][q], F[2][q]}; };
-        std::vector<T> z(n); for (int i = 0; i < n; i++) z[i] = {y[0][i], y[1][i], y[2][i]};
-        for (int j = 0; j < n; j++) std::swap(z[j], z[pv[j]]);
-        for (int i = 0; i < n; i++) for (int k = 0; k < i; k++) z[i] = tsub(z[i], tmul(at(i, k), z[k]));
-        for (int i = n - 1; i >= 0; i--) { for (int k = i + 1; k < n; k++) z[i] = tsub(z[i], tmul(at(i, k), z[k])); z[i] = tdiv(z[i], at(i, i)); }
-        double tc = now() - t0;
-        std::vector<double> zz[3]; for (int c = 0; c < 3; c++) zz[c].resize(n);
-        for (int i = 0; i < n; i++) { zz[0][i] = z[i].x; zz[1][i] = z[i].y; zz[2][i] = z[i].z; }
-        char lab[64]; snprintf(lab, sizeof lab, "triple-double LU on the CPU, %d threads", thr);
-        printf("%-46s %9.2f %15.3g\n", lab, tc, err(zz));
-        printf("%-46s %9.0fx\n", "  speedup of the GPU", tc / tg);
     }
     if (getenv("OZ_NOMPFR")) return 0;
     {   // MPFR LU with partial pivoting at 160 bits, rows in parallel
