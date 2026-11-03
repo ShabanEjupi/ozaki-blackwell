@@ -8,6 +8,7 @@
 #include <mpfr.h>
 #include <omp.h>
 #include "../src/ozaki_td.cuh"
+#include "cpu_med.h"
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 // Triple-double arithmetic on the CPU, QD-style: the strongest software baseline for ~159 bits (MPFR is far slower).
@@ -113,50 +114,49 @@ int main() {
         oz::release(p); for (auto x : d) cudaFree(x);
     }
 
-    {   // triple-double on the CPU, every core: loop i, k, j so the j loop vectorizes; n = 512 measured, scaled by n^3
-        int n = 512; std::vector<double> h(n * n), m(h.size()), l(h.size()); fill(h, m, l, 0, g);
+    {   // triple-double on the CPU, every core: loop i, k, j so the j loop vectorizes; n = 512 (OZ_CPU_N, OZ_CPU_REP: cpu_med.h)
+        int n = cpu_n(512); std::vector<double> h((size_t)n * n), m(h.size()), l(h.size()); fill(h, m, l, 0, g);
         std::vector<double> Cx(h.size()), Cy(h.size()), Cz(h.size());
-        double t0 = now();
+        std::string all; double t = cpu_median([&]() {
 #pragma omp parallel for schedule(static)
-        for (int i = 0; i < n; i++) {
-            double *sx = &Cx[(size_t)i * n], *sy = &Cy[(size_t)i * n], *sz = &Cz[(size_t)i * n];
-            for (int j = 0; j < n; j++) sx[j] = sy[j] = sz[j] = 0;
-            for (int k = 0; k < n; k++) {
-                double ax = h[i * n + k], ay = m[i * n + k], az = l[i * n + k];
-                const double *bx = &h[(size_t)k * n], *by = &m[(size_t)k * n], *bz = &l[(size_t)k * n];
+            for (int i = 0; i < n; i++) {
+                double *sx = &Cx[(size_t)i * n], *sy = &Cy[(size_t)i * n], *sz = &Cz[(size_t)i * n];
+                for (int j = 0; j < n; j++) sx[j] = sy[j] = sz[j] = 0;
+                for (int k = 0; k < n; k++) {
+                    double ax = h[(size_t)i * n + k], ay = m[(size_t)i * n + k], az = l[(size_t)i * n + k];
+                    const double *bx = &h[(size_t)k * n], *by = &m[(size_t)k * n], *bz = &l[(size_t)k * n];
 #pragma omp simd
-                for (int j = 0; j < n; j++) td_fma(sx[j], sy[j], sz[j], ax, ay, az, bx[j], by[j], bz[j]);
-            }
-        }
-        double t = now() - t0;
-        printf("CPU triple-double GEMM, %d threads: n = 512 %.3f s = %.4f TFLOPS (n = 4096 would take ~%.1f s)\n",
-               omp_get_max_threads(), t, 2.0 * n * n * n / t / 1e12, t * 512);
+                    for (int j = 0; j < n; j++) td_fma(sx[j], sy[j], sz[j], ax, ay, az, bx[j], by[j], bz[j]);
+                }
+            } }, all);
+        printf("CPU triple-double GEMM, %d threads: n = %d, runs%s s, median %.3f s = %.4f TFLOPS (n = 4096 ~%.1f s)\n",
+               omp_get_max_threads(), n, all.c_str(), t, 2.0 * n * n * n / t / 1e12, t * 4096.0 * 4096 * 4096 / ((double)n * n * n));
         double c = 0; for (double v : Cx) c += v; if (c == 12345.678) printf(" ");   // keep the result alive
     }
-    // MPFR at 160 bits, every core: n = 256 measured, scaled by n^3
+    // MPFR at 160 bits, every core: loop i, k, j with a row of sums per thread (each output in ascending k, as before);
+    // n = 256 (OZ_CPU_N, OZ_CPU_REP)
     {
-        int n = 256; std::vector<double> h(n * n), m(h.size()), l(h.size()); fill(h, m, l, 0, g);
+        int n = cpu_n(256); std::vector<double> h((size_t)n * n), m(h.size()), l(h.size()); fill(h, m, l, 0, g);
         std::vector<__mpfr_struct> A(n * n), B(n * n);   // mpfr_t is an array type
-        for (int i = 0; i < n * n; i++) {
+        for (size_t i = 0; i < (size_t)n * n; i++) {
             mpfr_init2(&A[i], 160); mpfr_init2(&B[i], 160);
             mpfr_set_d(&A[i], h[i], MPFR_RNDN); mpfr_add_d(&A[i], &A[i], m[i], MPFR_RNDN); mpfr_add_d(&A[i], &A[i], l[i], MPFR_RNDN);
             mpfr_set(&B[i], &A[i], MPFR_RNDN);
         }
-        double t0 = now();
+        std::string all; double t = cpu_median([&]() {
 #pragma omp parallel
-        {
-            mpfr_t s, t; mpfr_inits2(160, s, t, (mpfr_ptr)0);
+            {
+                std::vector<__mpfr_struct> row(n); for (auto &s : row) mpfr_init2(&s, 160);
 #pragma omp for schedule(static)
-            for (int i = 0; i < n; i++)
-                for (int j = 0; j < n; j++) {
-                    mpfr_set_zero(s, 1);
-                    for (int k = 0; k < n; k++) mpfr_fma(s, &A[i * n + k], &B[k * n + j], s, MPFR_RNDN);
+                for (int i = 0; i < n; i++) {
+                    for (auto &s : row) mpfr_set_zero(&s, 1);
+                    for (int k = 0; k < n; k++) { const __mpfr_struct *a = &A[(size_t)i * n + k], *b = &B[(size_t)k * n];
+                        for (int j = 0; j < n; j++) mpfr_fma(&row[j], a, &b[j], &row[j], MPFR_RNDN); }
                 }
-            mpfr_clears(s, t, (mpfr_ptr)0);
-        }
-        double t = now() - t0;
-        printf("MPFR 160-bit GEMM, %d threads: n = 256 %.2f s = %.4f TFLOPS (n = 4096 would take ~%.0f s)\n",
-               omp_get_max_threads(), t, 2.0 * n * n * n / t / 1e12, t * 4096.0 * 4096 * 4096 / ((double)n * n * n));
-        for (int i = 0; i < n * n; i++) { mpfr_clear(&A[i]); mpfr_clear(&B[i]); }
+                for (auto &s : row) mpfr_clear(&s);
+            } }, all);
+        printf("MPFR 160-bit GEMM, %d threads: n = %d, runs%s s, median %.3f s = %.4f TFLOPS (n = 4096 ~%.0f s)\n",
+               omp_get_max_threads(), n, all.c_str(), t, 2.0 * n * n * n / t / 1e12, t * 4096.0 * 4096 * 4096 / ((double)n * n * n));
+        for (size_t i = 0; i < (size_t)n * n; i++) { mpfr_clear(&A[i]); mpfr_clear(&B[i]); }
     }
 }

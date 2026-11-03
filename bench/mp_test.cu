@@ -8,6 +8,7 @@
 #include <mpfr.h>
 #include <omp.h>
 #include "../src/ozaki_mp.cuh"
+#include "cpu_med.h"
 #include <qd/qd_real.h>
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -71,36 +72,49 @@ template <int Q> static void run(std::mt19937_64 &g) {
         oz::mp_release(pl);
         for (int t = 0; t < 3; t++) for (int q = 0; q < Q; q++) cudaFree(d[t].p[q]);
     }
-    if (Q == 4) {   // the QD library (Hida, Li, Bailey): qd_real, the classic CPU 212-bit arithmetic, every core, n = 256 measured
-        int n = 256; std::vector<double> h[Q]; for (int q = 0; q < Q; q++) h[q].resize(n * n);
-        fill<Q>(h, n * n, 0, g);
-        std::vector<qd_real> X(n * n), Y(n * n);
-        for (int i = 0; i < n * n; i++) X[i] = qd_real(h[0][i], h[1][i], h[2][i], h[3][i]);
+    // the CPU baselines: every core, loop i, k, j (rows of the second factor streamed, a row of sums per thread), each output
+    // summed in ascending k as an i, j, k loop would; n = 256 (in cache) unless OZ_CPU_N, OZ_CPU_REP runs (cpu_med.h)
+    if (Q == 4) {   // the QD library (Hida, Li, Bailey): qd_real, the classic CPU 212-bit arithmetic
+        int n = cpu_n(256); std::vector<double> h[Q]; for (int q = 0; q < Q; q++) h[q].resize((size_t)n * n);
+        fill<Q>(h, (size_t)n * n, 0, g);
+        std::vector<qd_real> X((size_t)n * n), Y((size_t)n * n);
+        for (size_t i = 0; i < (size_t)n * n; i++) X[i] = qd_real(h[0][i], h[1][i], h[2][i], h[3][i]);
         unsigned int cw; fpu_fix_start(&cw);
-        double t0 = now();
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < n; i++)
-            for (int j = 0; j < n; j++) { qd_real s = 0.0; for (int k = 0; k < n; k++) s += X[i * n + k] * X[k * n + j]; Y[i * n + j] = s; }
-        double t = now() - t0;
-        fpu_fix_end(&cw);
-        printf("  QD qd_real GEMM, %d threads: %.5f TFLOPS (n = 2048 would take ~%.1f s)\n", omp_get_max_threads(), 2.0 * n * n * n / t / 1e12, t * 512);
-    }
-    {   // MPFR GEMM at 53 Q bits, every core, n = 256 measured
-        int n = 256; std::vector<double> h[Q]; for (int q = 0; q < Q; q++) h[q].resize(n * n);
-        fill<Q>(h, n * n, 0, g);
-        std::vector<__mpfr_struct> X(n * n);
-        for (int i = 0; i < n * n; i++) { mpfr_init2(&X[i], 53 * Q); mpfr_set_d(&X[i], h[0][i], MPFR_RNDN); for (int q = 1; q < Q; q++) mpfr_add_d(&X[i], &X[i], h[q][i], MPFR_RNDN); }
-        double t0 = now();
+        std::string all; double t = cpu_median([&]() {
 #pragma omp parallel
-        {
-            mpfr_t s; mpfr_init2(s, 53 * Q);
+            {
+                std::vector<qd_real> row(n);
 #pragma omp for schedule(static)
-            for (int i = 0; i < n; i++)
-                for (int j = 0; j < n; j++) { mpfr_set_zero(s, 1); for (int k = 0; k < n; k++) mpfr_fma(s, &X[i * n + k], &X[k * n + j], s, MPFR_RNDN); }
-            mpfr_clear(s);
-        }
-        double t = now() - t0;
-        printf("  MPFR %d-bit GEMM, %d threads: %.5f TFLOPS (n = 2048 would take ~%.0f s)\n", 53 * Q, omp_get_max_threads(), 2.0 * n * n * n / t / 1e12, t * 512);
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j < n; j++) row[j] = 0.0;
+                    for (int k = 0; k < n; k++) { const qd_real a = X[(size_t)i * n + k]; const qd_real *b = &X[(size_t)k * n];
+                        for (int j = 0; j < n; j++) row[j] += a * b[j]; }
+                    for (int j = 0; j < n; j++) Y[(size_t)i * n + j] = row[j];
+                }
+            } }, all);
+        fpu_fix_end(&cw);
+        printf("  QD qd_real GEMM, %d threads: n = %d, runs%s s, median %.3f s = %.5f TFLOPS (n = 2048 ~%.1f s)\n", omp_get_max_threads(), n,
+               all.c_str(), t, 2.0 * n * n * n / t / 1e12, t * 2048.0 * 2048 * 2048 / ((double)n * n * n));
+    }
+    {   // MPFR GEMM at 53 Q bits
+        int n = cpu_n(256); std::vector<double> h[Q]; for (int q = 0; q < Q; q++) h[q].resize((size_t)n * n);
+        fill<Q>(h, (size_t)n * n, 0, g);
+        std::vector<__mpfr_struct> X((size_t)n * n);
+        for (size_t i = 0; i < (size_t)n * n; i++) { mpfr_init2(&X[i], 53 * Q); mpfr_set_d(&X[i], h[0][i], MPFR_RNDN); for (int q = 1; q < Q; q++) mpfr_add_d(&X[i], &X[i], h[q][i], MPFR_RNDN); }
+        std::string all; double t = cpu_median([&]() {
+#pragma omp parallel
+            {
+                std::vector<__mpfr_struct> row(n); for (auto &s : row) mpfr_init2(&s, 53 * Q);
+#pragma omp for schedule(static)
+                for (int i = 0; i < n; i++) {
+                    for (auto &s : row) mpfr_set_zero(&s, 1);
+                    for (int k = 0; k < n; k++) { const __mpfr_struct *a = &X[(size_t)i * n + k], *b = &X[(size_t)k * n];
+                        for (int j = 0; j < n; j++) mpfr_fma(&row[j], a, &b[j], &row[j], MPFR_RNDN); }
+                }
+                for (auto &s : row) mpfr_clear(&s);
+            } }, all);
+        printf("  MPFR %d-bit GEMM, %d threads: n = %d, runs%s s, median %.3f s = %.5f TFLOPS (n = 2048 ~%.0f s)\n", 53 * Q, omp_get_max_threads(), n,
+               all.c_str(), t, 2.0 * n * n * n / t / 1e12, t * 2048.0 * 2048 * 2048 / ((double)n * n * n));
         for (auto &x : X) mpfr_clear(&x);
     }
 }
