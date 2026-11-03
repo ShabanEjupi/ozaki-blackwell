@@ -343,6 +343,14 @@ wide-integer accumulation, Q doubles peeled. Errors vs an exact 2400-bit MPFR su
 | 318 bits (Q = 6), n = 2048 | **52 ms, 0.33 TFLOPS** | — | ~37 s (**713×**) |
 | 424 bits (Q = 8), n = 2048 | **80 ms, 0.22 TFLOPS** | — | ~41 s (**514×**) |
 
+03-11-2026, the same table again with the machine held (`bench/speed_all.sh`, log `/opt/ozaki/job/speed.log`), today's code:
+FP64 16 moduli 20.3 ms, **6.76 TFLOPS** (15.1× the native peak; 5.56 on 15-10); double-double 32 moduli 36.1 ms, **3.81 TFLOPS**
+(1.76 before the direct-sum CRT); triple-double n = 4096 68.8 ms, **2.00 TFLOPS**; 212 / 318 / 424 bits at n = 2048: 34.7 / 46.4 /
+69.3 ms (0.50 / 0.37 / 0.25 TFLOPS). CPU references at n = 256/512 vary by up to 2.8× between runs (td AVX 10.7 s on 22-10,
+29.5 s today): the paper takes the fastest logged. Accuracy against exact references (Dot2 for FP64, 600-bit MPFR for dd):
+FP64 0.99 / 3.1 / 0.24 / 1.87, dd 0.71 / 47.1 / 0.41 / 12.6 units; the old 80-bit and __float128 references were off by up to
+0.012 and 0.41 units.
+
 Residues cut once into 16-bit chunks (32-bit multiply-adds per modulus): td residues 57 → 19 ms at n = 4096.
 Honest limits: the INT8 GEMMs are power-bound on this laptop (~95 W); cost grows ~p² with precision, as MPFR's does at
 these sizes, so the ratio to MPFR does not grow without bound — it is largest against software emulation of each width.

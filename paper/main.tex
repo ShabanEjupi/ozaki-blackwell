@@ -22,8 +22,8 @@ Consumer and laptop GPUs execute FP64 at 1/64 of their FP32 rate, while their IN
 faster than their FP64 units. On a laptop Blackwell GPU (RTX PRO 3000, sm\_120) we measure 232~TOPS of INT8
 \texttt{mma.sync} against 0.449~TFLOPS of native FP64, a ratio of $517\times$. Building on the Ozaki scheme~II---exact integer
 products of residues and reconstruction by the Chinese remainder theorem---we implement, in CUDA C and inline PTX, matrix
-multiplication at FP64 (5.56~TFLOPS, $12.4\times$ the native peak and more accurate), double-double ($\sim$106 bits,
-1.76~TFLOPS), triple-double ($\sim$159 bits, 1.58~TFLOPS) and arbitrary precision (212, 318 and 424 bits) from the same INT8
+multiplication at FP64 (6.76~TFLOPS, $15.1\times$ the native peak and more accurate), double-double ($\sim$106 bits,
+3.81~TFLOPS), triple-double ($\sim$159 bits, 2.00~TFLOPS) and arbitrary precision (212, 318 and 424 bits) from the same INT8
 units. To our knowledge no GEMM beyond FP64 had been built this way on GPU tensor cores (on CPU INT8 units, Ozaki-II
 reaches 2048 bits~\cite{ozamx}). The higher precisions pay off in a real task: solving
 $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.956~s at $n=8192$ (0.855~s alone on a cool GPU), $499\times$ sooner than a
@@ -55,10 +55,10 @@ set by the number of moduli and by how many floating-point words each input and 
 INT8 GEMMs, runs at the same speed whatever the precision. This turns precision into a software choice on hardware that has
 no wide floating-point unit at all. We build and measure:
 \begin{itemize}
-\item FP64 GEMM at 16 moduli: 5.56~TFLOPS, $12.4\times$ the native FP64 peak, with smaller error than native FP64;
-\item double-double ($\sim$106-bit) GEMM at 32 moduli: 1.76~TFLOPS, $3.9\times$ the native FP64 peak with twice the bits;
+\item FP64 GEMM at 16 moduli: 6.76~TFLOPS, $15.1\times$ the native FP64 peak, with smaller error than native FP64;
+\item double-double ($\sim$106-bit) GEMM at 32 moduli: 3.81~TFLOPS, $8.5\times$ the native FP64 peak with twice the bits;
 \item triple-double ($\sim$159-bit) GEMM at 49 moduli---after which every prime below 256 divides one of them, so no further
-8-bit modulus can join---at 1.58~TFLOPS;
+8-bit modulus can join---at 2.00~TFLOPS;
 \item arbitrary precision beyond that from balanced 160-bit slices: 212, 318 and 424 bits;
 \item dense linear solves at condition numbers where FP64 and double-double fail, all on the GPU;
 \item exact determinants of int8 matrices up to $n=32\,768$ ($40$--$355\times$ faster than FLINT), and of matrices with 32--256-bit entries by high-order lifting on tensor cores ($17$--$404\times$).
@@ -134,27 +134,31 @@ $K$ & magnitudes & 41 moduli & 45 moduli & \textbf{49 moduli} \\\midrule
 1024 & $2^{\pm8}$ & $4.3\cdot10^5$ & 110 & \textbf{2.1} \\\bottomrule
 \end{tabular}
 \end{table}
-Beyond triple-double, against an exact 2400-bit sum at $K=256$: 0.13~ulp at 212 bits, 0.25 at 318 bits, 0.08 at 424 bits.
+Beyond triple-double, against an exact 2400-bit sum at $K=256$: 0.13~ulp at 212 bits, 0.24 at 318 bits, 0.12 at 424 bits
+(0.75, 17.4 and 0.54 with magnitudes spread over $2^{\pm8}$).
 
 \section{Speed}
 \begin{table}[h]\centering
-\caption{GEMM speed on the laptop. CPU numbers with the CPU otherwise idle, measured at $n=256$/512 and scaled by $n^3$.}\label{tab:speed}
+\caption{GEMM speed on the laptop, measured on 3 November 2026 with the machine to itself (\texttt{bench/speed\_all.sh}).
+CPU numbers with the CPU otherwise idle, measured at $n=256$/512 and scaled by $n^3$; such short runs vary by up to
+$2.8\times$, so each is the fastest we logged (22 October or 3 November).}\label{tab:speed}
 \small
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{rrrrll}\toprule
 bits & $n$ & GPU time & GPU TFLOPS & best CPU code, 24 threads & MPFR, 24 threads \\\midrule
-53 (FP64) & 4096 & --- & 5.56 ($12.4\times$ native) & --- & --- \\
-106 (dd) & 4096 & --- & 1.76 & --- & --- \\
-159 (td) & 4096 & 87 ms & 1.58 & td AVX $\sim$10.7 s ($123\times$) & $\sim$208 s ($2390\times$) \\
-212 & 2048 & 36 ms & 0.47 & QD \texttt{qd\_real} $\sim$16.2 s ($445\times$) & $\sim$35 s ($960\times$) \\
-318 & 2048 & 52 ms & 0.33 & --- & $\sim$37 s ($713\times$) \\
-424 & 2048 & 80 ms & 0.22 & --- & $\sim$41 s ($514\times$) \\\bottomrule
+53 (FP64) & 4096 & 20.3 ms & 6.76 ($15.1\times$ native) & --- & --- \\
+106 (dd) & 4096 & 36.1 ms & 3.81 ($8.5\times$ native) & --- & --- \\
+159 (td) & 4096 & 68.8 ms & 2.00 & td AVX $\sim$10.7 s ($156\times$) & $\sim$208 s ($3020\times$) \\
+212 & 2048 & 34.7 ms & 0.50 & QD \texttt{qd\_real} $\sim$15.6 s ($450\times$) & $\sim$30 s ($865\times$) \\
+318 & 2048 & 46.4 ms & 0.37 & --- & $\sim$34 s ($733\times$) \\
+424 & 2048 & 69.3 ms & 0.25 & --- & $\sim$41 s ($592\times$) \\\bottomrule
 \end{tabular}
 \end{table}
-At 16 moduli the time of a $4096^3$ FP64 GEMM splits into scales 1.0~ms, residues 3.0~ms, the 16 INT8 GEMMs 16.8~ms and the
-CRT 3.6~ms: the 16 products run at 131~TOPS there. On its own the INT8 GEMM reaches 157~TOPS, 67\% of the measured peak,
-with a three-stage \texttt{cp.async} pipeline; that faster kernel did not move end-to-end times, because with real data the
-laptop is power-bound (Section~\ref{sec:energy}).
+At 16 moduli a $4096^3$ FP64 GEMM now takes 20.3~ms. In the code of 15 October (24.7~ms, 5.56~TFLOPS) it split into scales
+1.0~ms, residues 3.0~ms, the 16 INT8 GEMMs 16.8~ms (131~TOPS) and the CRT 3.6~ms. For double-double the direct-sum CRT of
+Section~\ref{sec:method} (2.8 to 0.68~ns per output, $\sim$36~ms of the 78) accounts for the doubling, 1.76 to 3.81~TFLOPS.
+On its own the INT8 GEMM reaches 157~TOPS, 67\% of the measured peak, with a three-stage \texttt{cp.async} pipeline; with
+real data the laptop is power-bound (Section~\ref{sec:energy}), so kernel speed and end-to-end time do not move together.
 
 \section{A real task: ill-conditioned linear systems}
 We solve $Ax=b$ with $A=Q_1\,\mathrm{diag}(\sigma)\,Q_2$, $Q_{1,2}$ orthogonal (a DST-I, the second permuted and sign-flipped),
@@ -548,7 +552,7 @@ published scores.
 
 \section{Energy}\label{sec:energy}
 Under these kernels the laptop holds $\sim$95~W and the SM clock drops to $\sim$1.8~GHz (2.76~GHz with only the FP64 units busy).
-For GEMM at $n=4096$ (\texttt{bench/energy.cu}, power every 200~ms): native FP64 7.4~GFLOPS/W, Ozaki-II at 16 moduli 53.6
+For GEMM at $n=4096$ (\texttt{bench/energy.cu}, power every 200~ms, the code of 15 October): native FP64 7.4~GFLOPS/W, Ozaki-II at 16 moduli 53.6
 ($7.2\times$), at 12 moduli 69.5. For a whole solve ($n=4096$, $\kappa=10^{20}$, 20 back-to-back GPU solves after a warm-up; CPU
 package power from the RAPL counters, GPU power from \texttt{nvidia-smi}):
 \begin{center}\begin{tabular}{lrrrr}\toprule
