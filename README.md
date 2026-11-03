@@ -1074,7 +1074,8 @@ and 0 of 10 070 016; the 4-layer step gave the training binary's dB, dA and g₀
 In the training (steps 164–175 the old binary, 176–189 the new one; medians, ranges in brackets): step **1 268.8 → 1 123.3 s**
 (1 234–1 347 → 1 110–1 152), MoE backward **415.3 → 236.7 s** (403–451 → 235–238), forward 486.9 → 490.6 s, attention and LoRA
 backward 360.1 → 385.9 s (343–398 → 377–409). The step is 145.5 s (11.5 %) shorter, less than the 178.6 s the MoE line lost
-(estimated beforehand: ~2 s per MoE layer, ~110 s a step). The held-out loss then left the 1.4018–1.4103 band it had kept
+(estimated beforehand: ~2 s per MoE layer, ~110 s a step); in the 4-layer check step the attention and LoRA backward did
+not move (23.1 → 23.2 s, every part within 0.12 s over the 4 layers), so its rise is an effect of the 61-layer step, not yet separated. The held-out loss then left the 1.4018–1.4103 band it had kept
 since step 148: 1.40123 at step 183, 1.39583 at 187 (the lowest), 1.39663 at 189.
 
 **SQ** — 03-11: tri ndryshime të tjera të vendosura vetë pas kontrollit të digest-eve (hapi 135,6 → 118,5 s). `exp` i përbashkët

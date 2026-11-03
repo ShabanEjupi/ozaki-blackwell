@@ -288,7 +288,9 @@ expert's forward is recomputed there, and its two fills write straight into the 
 path's bits: on a real layer at 10\,240 rows none of the 62.9 million outputs of the input gradient differs, and the old and
 new binaries gave the same digests of a step before the training took the new one. The MoE backward fell from 403--471 to
 235--238~s a step while the attention and LoRA backward rose from 343--398 to 377--409~s, so the median step fell by 145.5~s,
-from 1\,268.8~s (steps 164--175) to 1\,123.3~s (176--189).
+from 1\,268.8~s (steps 164--175) to 1\,123.3~s (176--189). In the 4-layer step of the check the attention and LoRA
+backward did not move (23.1 and 23.2~s, each of its parts within 0.12~s over the 4 layers), so its rise in the full run is an effect of the
+61-layer step that we have not separated.
 
 \paragraph{What exactness costs.} An exact output needs 12 INT8 products per term for a BF16 result and 30 for an FP32 one. At
 69--93~TOPS of digit products that is roughly 15--29 times slower than cuBLAS BF16 on the same GPU (84--91~TFLOPS, measured on
