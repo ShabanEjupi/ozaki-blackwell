@@ -1022,3 +1022,25 @@ which deployed it): the same losses and digests (63e9904ca4c9d00f; two steps 012
 
 Where it stands / Ku është: the attention backward stays in FP64 on the host (the GPU `exp` is not glibc's, and the
 token-by-token model is the reference) and is now the largest share of the step; every expert product now runs in the tiles.
+
+03-11-2026, three more changes, each deployed by `llm/bin_check.sh` only after the 4-layer digests and the timed step's dB/dA/g₀
+digests matched the training's binary: `fuse` (21cf782: dy, dg, du rounded to BF16 where they are made), `bf16x` (b4ea83b +
+25c1d62: no FP32 X/Y buffers in the BF16 dgrad; dw in the pass that fills the down product), `grp` (cede8f2: the routed
+experts' dgrad in groups of 8, one launch, 0 of 13 007 104 outputs differ). The timed step (4 layers, 8 × 1024 tokens + 2
+held out): 135.6 → 133.5 → 119.1 → 118.5 s; backward 63.1 → 53.9 s, MLP/MoE backward 32.9 → 25.4 s; in the MoE layer
+`dg x-host` 6.98 → 1.06 s, `b24 x-host` 2.72 → 0.75 s, `moe dy` 1.48 → 0 s. The group launch's product is 0.02 s of ~0.25 s:
+the rest is the host's fill and FP64 add, which can only move to the GPU if the GPU computes `exp` with the host's bits.
+
+**One `exp` for host and GPU** (`llm/oz_exp.cuh`, 3b24402): CUDA's `exp(-x)` differs from glibc 2.39's for 14 316 892 of the 2³²
+FP32 x (`llm/exp_check.cu`). `oz_exp` is glibc 2.39's x86-64 FMA path (`__ieee754_exp_fma`, read instruction by instruction from
+the machine code of the libm the training calls) written as one sequence of IEEE operations, `_rn` intrinsics on the device;
+algorithm and table from Arm optimized-routines v21.02 (MIT, `llm/oz_exp.LICENSE`), whose 256-word table is the libm's, word
+for word. `llm/oz_exp_check.cu`: host `oz_exp` vs the host's `exp()` and GPU vs host — **0 differences** for all 2³² FP32
+inputs (x = −(double)f), for 2³² hashed doubles with |x| < 2¹⁰ and for 2³² hashed bit patterns (12.9 G inputs); 2³² FP32 inputs in
+4.1 s on 8 host threads (libm 4.6 s), 0.28 s on the GPU. Every `exp` of the training now calls it (aaecb9d, `bin_check.sh
+ozexp` decides): the host no longer depends on its libm for `exp`, and the softmax, `swiglu_back`, the fill and the add can move
+to the GPU with the host's bits.
+
+**SQ** — 03-11: tri ndryshime të tjera të vendosura vetë pas kontrollit të digest-eve (hapi 135,6 → 118,5 s). `exp` i përbashkët
+host/GPU: sekuenca IEEE e glibc 2.39, e lexuar nga kodi makinë; 0 ndryshime në 12,9 miliardë hyrje (të 2³² FP32, 2³² double,
+2³² modele bitesh); trajnimi s'varet më nga libm-ja për `exp`, dhe pjesa e mbetur e MoE backward mund të kalojë te GPU-ja.
