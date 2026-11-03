@@ -14,15 +14,13 @@
 # Used: 31-10 rows (01bf4fa: the experts' rows gathered on the GPU), 03-11 notrim (aab266d: glibc's heap never trimmed).
 LB=${1:?label}; S=/opt/ozaki/src-$LB; R=/opt/ozaki/src; J=/opt/ozaki/jais; C=/opt/ozaki/jlora/corpus; L=/opt/ozaki/job/$LB.log
 cd $S || exit 1
-PS=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
-ac() { [ "$($PS -NoProfile -Command "(Get-CimInstance Win32_Battery).BatteryStatus" 2>/dev/null | tr -d "\r ")" != 1 ]; }
+. $S/llm/hold.sh
 log() { echo "$(date '+%F %T') $*" >> $L; }
 export PATH=/usr/local/cuda-12.8/bin:$PATH
 log "start $(cat .version 2>/dev/null | tr '\n' ' ')"
 nvcc -O3 -arch=sm_120a -std=c++17 -Xcompiler -fopenmp -o out_jlora_new llm/jais_lora.cu -lgomp >> $L 2>&1 || { log "build FAILED"; exit 1; }
 log "built; waiting for the machine (spex.want, then the end of the running training run, AC)"
-while [ -e /opt/ozaki/spex.want ]; do sleep 60; done; echo "$LB <$$>" > /opt/ozaki/spex.want; trap 'rm -f /opt/ozaki/spex.want' EXIT
-while ! ac || pgrep -x out_jlora > /dev/null || pgrep -x out_spex > /dev/null || [ -e /opt/ozaki/chain.busy ]; do sleep 60; done
+hold $LB
 log "machine held"
 bad=0
 # jlora_test.sh runs ./out_jlora_t: first the training's binary, then the new one; digests and losses (not times) must agree
