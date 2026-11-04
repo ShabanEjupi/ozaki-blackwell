@@ -247,6 +247,46 @@ shton atë që s'e ka asnjëri: GEMM përtej FP64 (106, 159 deri 424 bit), zgjid
 aritmetikë të saktë me numra të plotë (përcaktorë, zgjidhje racionale, 10–19× mbi FLINT) dhe prodhime të rrumbullakuara saktë
 për trajnimin e modeleve të mëdha gjuhësore.
 
+## Same laptop, one window: the fair comparisons / Krahasimet e drejta (04-11-2026, `bench/fair_jobs.sh`, `bench/dd_same_run.sh`, `bench/td_same_run.sh`)
+
+**FP64 by emulation** (one harness `bench/emu_harness.h`, median of 5 after a warm-up; error at K = 4096 in units of 2⁻⁵³,
+exponents spread over 2^±s; GFLOPS/W at n = 4096 from `bench/energy_emu.sh`, three 12-s runs):
+
+| | err s=0 | s=8 | s=16 | s=32 | TF n=2048 | 4096 | 8192 | GFLOPS/W |
+|---|---|---|---|---|---|---|---|---|
+| native FP64 (cuBLAS DGEMM) | 0.81 | 6.3 | 12.9 | 13.8 | 0.41 | 0.44 | 0.45 | 7.5–8.1 |
+| ours, 14 moduli | 10.5 | 203 | 800 | 3 680 | 5.41 | 7.05 | 5.77 | 60.0–60.8 |
+| ours, 16 moduli | 0.24 | 1.9 | 4.7 | 31.5 | 4.88 | 6.73 | 5.06 | 54.0–55.2 |
+| cuBLAS 13.8.2, ADP | 0.13 | 0.65 | 1.3 | 13 | 3.16 | 5.26 | 7.02 | 46.9–48.4 |
+| cuBLAS, 55 bits | 0.12 | 1.5 | 4.7 | 31.5 | 6.12 | **8.51** | **9.67** | 68.4–69.2 |
+| GEMMul8 fast, 16 moduli | **0.097** | **0.39** | **0.64** | **1.3** | 5.86 | 8.29 | 9.20 | 64.4–64.6 |
+
+For plain FP64 use cuBLAS 13 or GEMMul8: 1.26× (n = 4096) to 1.91× (n = 8192) faster than ours, as accurate or more, 18–26 %
+more work per joule. / Për FP64 të thjeshtë: cuBLAS 13 ose GEMMul8 — 1,26–1,91× më të shpejtë, po aq ose më të saktë.
+
+**Double-double LU, κ = 10²⁰** (one process per n, seed 1; CPU blocked = the same LU cache-blocked, nb 64, bit for bit the
+unblocked one; GPU speedups in parentheses):
+
+| n | dd LU, GPU | dd LU, CPU blocked | dd LU, CPU unblocked | `__float128` LU |
+|---|---|---|---|---|
+| 2048 | **0.083 s** | 0.30 s (3.6×) | 0.42 s (5.1×) | 8.91 s (107×) |
+| 4096 | **0.223 s** | 1.91 s (8.6×) | 9.24 s (41×) | 56.2 s (252×) |
+| 6144 | **0.419 s** | 6.15 s (15×) | 38.9 s (93×) | 185.6 s (443×) |
+| 8192 | **0.692 s** | 15.52 s (**22×**) | 99.5 s (144×) | 435.4 s (**629×**) |
+
+**Triple-double LU, κ = 10³⁶** (FP64 and double-double have no correct digit):
+
+| n | td LU, GPU | td LU, CPU blocked | td LU, CPU unblocked | MPFR LU, 160 bits |
+|---|---|---|---|---|
+| 1024 | **0.073 s** | 0.10 s (1.4×) | 0.08 s (1.1×) | 1.51 s (21×) |
+| 2048 | **0.171 s** | 0.59 s (3.5×) | 0.99 s (5.8×) | 11.1 s (65×) |
+| 4096 | **0.447 s** | 3.83 s (**8.6×**) | 17.5 s (39×) | 74.1 s (**166×**) |
+
+The honest headline is the blocked CPU column: **22×** (dd, n = 8192) and **8.6×** (td, n = 4096); the hundreds are against
+`__float128` and MPFR. The older sections below keep their numbers as measured then. / Titulli i ndershëm është kolona e
+CPU-së së bllokuar: 22× (dd) dhe 8,6× (td); qindrat janë kundër `__float128` dhe MPFR. Seksionet e vjetra më poshtë i
+mbajnë numrat siç u matën atëherë.
+
 ## A real job: Ax = b at κ = 10²⁰ — Një punë reale: Ax = b me κ = 10²⁰ (18-10-2026, `bench/solve.cu`)
 
 A = Q₁ diag(σ) Q₂ (orthogonal DST-I, the second permuted and sign-flipped; σ from 1 to 10⁻²⁰) — not fixable by scaling.
@@ -282,7 +322,7 @@ Paneli, L11⁻¹ dhe zgjidhjet si kernelë double-double; U12 dhe përditësimi 
 (4 launches per column: the next target), L11⁻¹ + U12 0.04 s, blocked solve 0.03 s. `OZ_TRSM=1` / `OZ_SOLVE=1` select the
 column-by-column versions (0.42 s / 0.13 s). A one-block pivot+swap+divide kernel was slower (0.44 s) and was dropped.
 
-### Recursive panel, CRT on the integer units — 499× at n = 8192 (22-10-2026, evening)
+### Recursive panel, CRT on the integer units — 499× at n = 8192 (22-10-2026, evening) — against `__float128`; against the blocked CPU LU it is 22× (04-11, above)
 Same problem (κ = 10²⁰), `OZ_SKIPCPU=1 ./out_solve n 1024 20 1`; GPU times after one warm-up solve (the GPU clocks idle
 during the CPU reference). Error = max |x − x_ref| / max |x_ref|.
 

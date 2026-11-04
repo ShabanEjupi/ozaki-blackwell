@@ -1,11 +1,11 @@
 Consumer and laptop GPUs run FP64 at 1/64 of their FP32 rate: on a laptop Blackwell GPU (RTX PRO 3000, sm\_120) we measure
 232~TOPS of INT8 \texttt{mma.sync} against 0.449~TFLOPS of native FP64, a ratio of $517\times$. With the Ozaki scheme~II
-we implement in CUDA C and PTX matrix multiplication at FP64 (6.2--6.8~TFLOPS, where cuBLAS~13's own emulation reaches 8.5),
+we implement in CUDA C and PTX matrix multiplication at FP64 (6.7~TFLOPS at $n=4096$, where cuBLAS~13's own emulation reaches 8.5),
 double-double (3.81~TFLOPS), triple-double (2.03~TFLOPS) and up to 424 bits from the same INT8 units, to our knowledge the
-first such GEMMs beyond FP64 on GPU INT8 tensor cores. Solving $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes @T8@~s at
-$n=8192$, $23\times$ sooner than the same LU blocked on 24 CPU threads and $@Q@\times$ sooner than \texttt{\_\_float128}; at
+first such GEMMs beyond FP64 on GPU INT8 tensor cores. Solving $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.692~s at
+$n=8192$, $22\times$ sooner than the same LU blocked on 24 CPU threads and $629\times$ sooner than \texttt{\_\_float128}; at
 $\kappa=10^{36}$, where double-double has no correct digit, a triple-double LU is $9\times$ faster than the same blocked CPU LU
-and $@M@\times$ than MPFR. Exact integer matrix products with 1\,015- to
+and $166\times$ than MPFR. Exact integer matrix products with 1\,015- to
 131\,063-bit entries run $10$--$19\times$ faster than FLINT on 24 CPU threads; exact determinants come up to $355\times$
 (int8, $n=8192$) and $404\times$ (64-bit entries, $n=4096$) sooner than FLINT; on 15 of NIST Matrix Market's most ill-conditioned real
 matrices the certified exact solution is $9$--$7\,857\times$ faster than SPEX where SPEX finished. Power-bound at

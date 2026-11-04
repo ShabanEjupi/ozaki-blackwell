@@ -2,7 +2,7 @@ Consumer and laptop GPUs run FP64 at 1/64 of their FP32 rate: on a laptop Blackw
 232~TOPS of INT8 \texttt{mma.sync} against 0.449~TFLOPS of native FP64, a ratio of $517\times$. With the Ozaki scheme~II
 we implement in CUDA C and PTX matrix multiplication at FP64 (6.76~TFLOPS, $15.1\times$ the native peak and more accurate),
 double-double (3.81~TFLOPS), triple-double (2.00~TFLOPS) and up to 424 bits from the same INT8 units, to our knowledge the
-first such GEMMs beyond FP64 on GPU tensor cores. Solving $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.956~s at
+first such GEMMs beyond FP64 on GPU INT8 tensor cores. Solving $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.956~s at
 $n=8192$, $499\times$ sooner than a \texttt{\_\_float128} LU on 24 CPU threads; at $\kappa=10^{36}$, where double-double has
 no correct digit, a triple-double LU is $145\times$ faster than MPFR. Exact integer matrix products with 1\,015- to
 131\,063-bit entries run $10$--$19\times$ faster than FLINT on 24 CPU threads; exact determinants come up to $355\times$
