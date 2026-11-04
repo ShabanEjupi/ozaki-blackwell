@@ -4,9 +4,7 @@
 # (SPEX timings need an idle machine) and for AC power, pauses model-lokal as ozaki-job does, then runs llm/jlora_steps.sh,
 # read only then. Log /opt/ozaki/jlora/step/run.log.
 J=/opt/ozaki/jais; D=/opt/ozaki/jlora/step; B=/opt/ozaki/src; cd $B
-PS=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
-pw() { $PS -NoProfile -Command "$1" 2>/dev/null | tr -d '\r'; }
-ac() { [ "$(pw '(Get-CimInstance Win32_Battery).BatteryStatus' | tr -d ' ')" != 1 ]; }
+W=$(dirname "${BASH_SOURCE[0]}")/win.sh; [ -f "$W" ] || W=/opt/ozaki/src/llm/win.sh; . "$W"   # PS, pw, ac and a live interop socket (llm/win.sh)
 log() { echo "$(date '+%F %T') $*" >> $D/run.log; }
 log "waiting: SPEX, ozaki-job, AC"
 # chain.busy from before this WSL boot is a dead run's (31-10: the laptop was switched off at 01:24 mid-step, the marker stayed

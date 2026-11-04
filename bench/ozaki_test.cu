@@ -1,9 +1,13 @@
-// Error is measured componentwise against |A||B|, against an exact-to-2^-80 reference: each product split exactly (TwoProd,
-// fma) and summed as a double-double (TwoSum), kept unrounded as hi + lo (Dot2 of Ogita, Rump and Oishi without the final
-// rounding: off by at most ~(K 2^-53)^2 |A||B|). The 80-bit (long double) sum used before is printed beside it ("ref80"):
-// its own error reaches K 2^-64 |A||B| in the worst case, 2 units of 2^-53 at K = 4096.// ozaki_test.cu -- how exact, and how fast, FP64 from INT8 is next to the GPU's own FP64.
-// Error is measured against an 80-bit (long double) CPU reference, componentwise against |A||B|:
-//   err = max_ij |C - Cref|_ij / (|A||B|)_ij   -- the bound a classic FP64 GEMM is judged by (~K * 2^-53).
+// ozaki_test.cu -- how exact, and how fast, FP64 from INT8 is next to the GPU's own FP64.
+// Error is measured componentwise against |A||B|, err = max_ij |C - Cref|_ij / (|A||B|)_ij (the bound a classic FP64 GEMM is
+// judged by, ~K 2^-53), against an exact-to-2^-80 reference: each product split exactly (TwoProd, fma) and summed as a
+// double-double (TwoSum), kept unrounded as hi + lo (Dot2 of Ogita, Rump and Oishi without the final rounding: off by at most
+// ~(K 2^-53)^2 |A||B|). The 80-bit (long double) sum used before is printed beside it ("ref80"): its own error reaches
+// K 2^-64 |A||B| in the worst case, 2 units of 2^-53 at K = 4096.
+// Speed is timed as bench/emu_harness.h times cuBLAS's emulation and GEMMul8 (04-11-2026: n = 2048, 4096, 8192, one warm-up
+// and five timed calls, the median): until then it was the mean of three calls at n = 2048 and 4096 only, so the paper's
+// same-laptop table had no 8192 for us and two different statistics side by side.
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -71,8 +75,8 @@ int main() {
             cudaFree(dA); cudaFree(dB); cudaFree(dC);
         }
 
-    printf("\nspeed, n x n x n (FP64-equivalent TFLOPS; native FP64 peak measured 0.449)\n");
-    for (int n : {2048, 4096}) {
+    printf("\nspeed, n x n x n (FP64-equivalent TFLOPS; native FP64 peak measured 0.449), median of 5 after a warm-up\n");
+    for (int n : {2048, 4096, 8192}) {
         std::vector<double> A((size_t)n * n);
         fill(A, 0, 7);
         double *dA, *dB, *dC;
@@ -87,11 +91,15 @@ int main() {
         printf("n=%d  native(naive) %.3f TF |", n, 2.0 * n * n * n / (ms * 1e-3) / 1e12);
         for (int nm : {12, 14, 16}) {
             oz::Plan p = oz::plan(n, n, n, nm);
-            oz::dgemm(p, dA, dB, dC);
-            cudaEventRecord(t0);
-            for (int r = 0; r < 3; r++) oz::dgemm(p, dA, dB, dC);
-            cudaEventRecord(t1); CK(cudaEventSynchronize(t1)); cudaEventElapsedTime(&ms, t0, t1); ms /= 3;
-            printf(" oz%d %.2f TF (%.1f ms)", nm, 2.0 * n * n * n / (ms * 1e-3) / 1e12, ms);
+            oz::dgemm(p, dA, dB, dC);   // the warm-up
+            CK(cudaGetLastError());     // the plan's cudaMalloc at n = 8192 (6 GB at 16 moduli) or the warm-up
+            float t[5];
+            for (int r = 0; r < 5; r++) {
+                cudaEventRecord(t0); oz::dgemm(p, dA, dB, dC); cudaEventRecord(t1);
+                CK(cudaEventSynchronize(t1)); cudaEventElapsedTime(&t[r], t0, t1);
+            }
+            std::sort(t, t + 5); ms = t[2];
+            printf(" oz%d %.3f TF (%.1f ms, %.1f-%.1f)", nm, 2.0 * n * n * n / (ms * 1e-3) / 1e12, ms, t[0], t[4]);
             oz::release(p);
         }
         printf("\n");

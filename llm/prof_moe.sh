@@ -9,8 +9,7 @@
 # faults and zeroes the pages again (192 x 58 times a step) -- if run 3 is faster, that was time. Out: prof8/{1,2,3}.{log,err},
 # the phases summed per run in prof8/summary{2,3}.txt
 J=/opt/ozaki/jais; C=/opt/ozaki/jlora/corpus/public-2910.u32; O=/opt/ozaki/jlora/prof8; L=/opt/ozaki/job/night.log
-PS=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
-ac() { [ "$($PS -NoProfile -Command "(Get-CimInstance Win32_Battery).BatteryStatus" 2>/dev/null | tr -d "\r ")" != 1 ]; }
+W=$(dirname "${BASH_SOURCE[0]}")/win.sh; [ -f "$W" ] || W=/opt/ozaki/src/llm/win.sh; . "$W"   # PS, pw, ac and a live interop socket (llm/win.sh)
 log() { echo "$(date '+%F %T') prof: $*" >> $L; }
 until grep -q "GPU checks done" $L 2>/dev/null; do sleep 60; done
 while [ -e /opt/ozaki/spex.want ]; do sleep 60; done; echo "prof <$$>" > /opt/ozaki/spex.want

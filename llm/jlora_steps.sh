@@ -7,8 +7,7 @@
 # sequences in the same forward, a checkpoint after every step, in runs of 2 steps -- between runs it waits for AC and yields
 # to a SPEX measurement that asks for the machine (/opt/ozaki/spex.want); /opt/ozaki/jlora/train/STOP ends it.
 J=/opt/ozaki/jais; D=/opt/ozaki/jlora/step; C=/opt/ozaki/jlora/corpus; T=/opt/ozaki/jlora/train; cd /opt/ozaki/src; mkdir -p $T
-PS=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
-ac() { [ "$($PS -NoProfile -Command '(Get-CimInstance Win32_Battery).BatteryStatus' 2>/dev/null | tr -dc 0-9)" != 1 ]; }   # never on battery
+W=$(dirname "${BASH_SOURCE[0]}")/win.sh; [ -f "$W" ] || W=/opt/ozaki/src/llm/win.sh; . "$W"   # PS, pw, ac and a live interop socket (llm/win.sh)
 log() { echo "$(date '+%F %T') $*" >> $D/run.log; }
 if [ ! -s $T/ckpt.bin ]; then   # 30-10: with a checkpoint the training has begun -- straight to it (a restart with a new binary)
 ./out_jlora --selftest $J >> $D/run.log 2>&1; log "selftest rc=$?"

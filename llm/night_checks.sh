@@ -10,13 +10,12 @@
 #     8 h at most, the CPU alone (spex.want only for those hours: the days stay with the training and the voice job).
 # The home crawler stops for the measurements and starts again after. Log /opt/ozaki/job/night.log
 NEW=${NEW:-/opt/ozaki/src-fd}; J=/opt/ozaki/jais; I=/opt/ozaki/jlora/step/gzk2512.ids; L=/opt/ozaki/job/night.log
-PS=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
-ac() { [ "$($PS -NoProfile -Command "(Get-CimInstance Win32_Battery).BatteryStatus" 2>/dev/null | tr -d "\r ")" != 1 ]; }
+W=$(dirname "${BASH_SOURCE[0]}")/win.sh; [ -f "$W" ] || W=/opt/ozaki/src/llm/win.sh; . "$W"   # PS, pw, ac and a live interop socket (llm/win.sh)
 log() { echo "$(date '+%F %T') $*" >> $L; }
 crawler() {   # stop | start the home crawler (its process by pid: a pattern given to pkill -f also matches this shell)
-    if [ $1 = stop ]; then $PS -NoProfile -Command "Stop-ScheduledTask -TaskName korpusi-shtepi" > /dev/null 2>&1
+    if [ $1 = stop ]; then pw "Stop-ScheduledTask -TaskName korpusi-shtepi" > /dev/null
         for p in $(pgrep -f '[h]arvest.py --sources sources-shtepi'); do kill $p; done; sleep 30
-    else $PS -NoProfile -Command "Start-ScheduledTask -TaskName korpusi-shtepi" > /dev/null 2>&1; fi; }
+    else pw "Start-ScheduledTask -TaskName korpusi-shtepi" > /dev/null; fi; }
 idle() { while ! ac || pgrep -x out_jlora > /dev/null || pgrep -x out_spex > /dev/null || [ -e /opt/ozaki/chain.busy ]; do sleep 60; done; }
 (while true; do echo "$(date +%T) up $(uptime -s) vram $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)" >> /opt/ozaki/job/heartbeat; sleep 60; done) &
 while [ -e /opt/ozaki/spex.want ]; do sleep 60; done   # someone else measures

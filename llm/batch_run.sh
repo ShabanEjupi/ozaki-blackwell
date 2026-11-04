@@ -5,9 +5,8 @@
 # embedded controller timed out three times and the laptop powered off at 13:40. So the job starts only on AC, is stopped
 # (its whole process group) within a minute of the charger leaving, and restarts from the beginning when it is back --
 # also after a reboot (logon trigger) until job.done exists.
-B=/opt/ozaki/b; PS=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+B=/opt/ozaki/b; W=$(dirname "${BASH_SOURCE[0]}")/win.sh; [ -f "$W" ] || W=/opt/ozaki/src/llm/win.sh; . "$W"   # PS, pw, ac and a live interop socket (llm/win.sh)
 log() { echo "$(date '+%F %T') $*" >> $B/job.log; }
-ac() { [ "$($PS -NoProfile -Command '(Get-CimInstance Win32_Battery).BatteryStatus' 2>/dev/null | tr -d '\r ')" != 1 ]; }   # 1 = discharging
 [ -e $B/job.done ] && exit 0
 [ -e $B/run.lock ] && kill -0 "$(cat $B/run.lock)" 2>/dev/null && exit 0; echo $$ > $B/run.lock
 trap 'rm -f /opt/ozaki/chain.busy $B/run.lock; [ -n "$pid" ] && kill -- -$pid 2>/dev/null' EXIT
