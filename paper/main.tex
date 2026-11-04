@@ -12,7 +12,7 @@
 
 \title{Precision as a software choice:\\FP64, double-double, triple-double and beyond\\from the INT8 tensor cores of a laptop GPU}
 \author{Shaban Ejupi\\Independent researcher\\{\small ORCID \href{https://orcid.org/0009-0008-9406-0042}{0009-0008-9406-0042}}}
-\date{3 November 2026}
+\date{4 November 2026}
 
 \setlength{\emergencystretch}{1.5em}   % 04-11-2026: a 0.49 pt overfull line in sec:real; lets TeX loosen a line before it overflows
 \begin{document}
@@ -59,12 +59,13 @@ set by the number of moduli and by how many floating-point words each input and 
 INT8 GEMMs, runs at the same speed whatever the precision. This turns precision into a software choice on hardware that has
 no wide floating-point unit at all. We build and measure:
 \begin{itemize}
-\item FP64 GEMM at 16 moduli: 6.2--6.8~TFLOPS, 14--15$\times$ the native FP64 peak, with smaller error than native FP64; on
+\item FP64 GEMM at 16 moduli: 6.2--6.8~TFLOPS at $n=4096$, 14--15$\times$ the native FP64 peak, with smaller error than native
+FP64 for exponents spread up to $2^{\pm16}$ (not at $2^{\pm32}$, Table~\ref{tab:emu}); on
 the same laptop cuBLAS~13's own emulation and GEMMul8 are faster and at least as accurate (Section~\ref{sec:emu}), so FP64 is
 our baseline, not our claim;
 \item double-double ($\sim$106-bit) GEMM at 32 moduli: 3.81~TFLOPS, $8.5\times$ the native FP64 peak with twice the bits;
 \item triple-double ($\sim$159-bit) GEMM at 49 moduli---after which every prime below 256 divides one of them, so no further
-8-bit modulus can join---at 2.00~TFLOPS;
+8-bit modulus can join---at 2.03~TFLOPS;
 \item arbitrary precision beyond that from balanced 160-bit slices: 212, 318 and 424 bits;
 \item dense linear solves at condition numbers where FP64 and double-double fail, all on the GPU: $22\times$ (double-double,
 $n=8192$) and $9\times$ (triple-double, $n=4096$) sooner than the same LUs cache-blocked on the laptop's 24 CPU threads;
@@ -762,6 +763,11 @@ modulus, at the GPU's most efficient clock, it gives an FP64-accurate DGEMM for 
 joules than the GPU's own FP64 at its best clock. The next steps are the panel (now the bound of the triple-double solve), CUDA graphs for its launches, a
 subquadratic residue conversion for wide integers, the operand sums of Strassen fused into the products' loads, and
 out-of-core sizes beyond the GPU's 12~GB.
+
+\paragraph{Code and data.} The code is source-available under the Ozaki-Blackwell Restricted Source License 1.0 at
+\url{https://git.spacecode.tech/shaban/ozaki-blackwell} (mirrored at
+\url{https://github.com/ShabanEjupi/ozaki-blackwell}). The scripts behind the measurements are in \texttt{bench/} and
+\texttt{llm/}, and each of their logs begins with the commit it ran.
 
 \begin{thebibliography}{99}
 \bibitem{he25} H.~He and Thinking Machines Lab. Defeating nondeterminism in LLM inference. Blog post, 10 September 2025, \url{https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference}.
