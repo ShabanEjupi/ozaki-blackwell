@@ -132,12 +132,25 @@ inline Plan plan(int M, int N, int K, int nm, int maxbits = 62) {   // 62: llrin
 inline void release(Plan &p) { cudaFree(p.Ar); cudaFree(p.Br); cudaFree(p.Cl); cudaFree(p.sa); cudaFree(p.sb); }
 
 template <int NM> void dgemm_t(Plan &p, const double *A, const double *B, double *C) {
+    // OZ_PROF=1: the GPU time of each stage, from events recorded on the stream between the kernels (no host sync among
+    // them), to stderr. 04-11-2026: this GEMM fell from 6.73 TFLOPS at n = 4096 to 5.06 at 8192 while cuBLAS's rose.
+    static const bool prof = getenv("OZ_PROF"); cudaEvent_t ev[4];
+    if (prof) { for (auto &e : ev) cudaEventCreate(&e); cudaEventRecord(ev[0]); }
     scales<<<p.M, 256>>>(A, p.M, p.K, p.K, 1, p.bits, p.sa);
     scales<<<p.N, 256>>>(B, p.N, p.K, 1, p.N, p.bits, p.sb);   // column j of B: element k at k*N + j
     residues<NM><<<dim3((p.K + 255) / 256, p.M), 256>>>(A, p.M, p.K, p.K, 1, p.sa, p.Ar, p.Kp, (size_t)p.Mp * p.Kp);
     residues<NM><<<dim3((p.K + 255) / 256, p.N), 256>>>(B, p.N, p.K, 1, p.N, p.sb, p.Br, p.Kp, (size_t)p.Np * p.Kp);
+    if (prof) cudaEventRecord(ev[1]);
     gemm_i8_run(p.Ar, p.Br, p.Cl, p.Mp, p.Np, p.Kp, NM);   // all moduli in one launch
+    if (prof) cudaEventRecord(ev[2]);
     crt<NM><<<dim3((p.N + 255) / 256, p.M), 256>>>(p.Cl, (size_t)p.Mp * p.Np, p.M, p.N, p.Np, p.sa, p.sb, C);
+    if (prof) {
+        cudaEventRecord(ev[3]); cudaEventSynchronize(ev[3]); float t[3];
+        for (int i = 0; i < 3; i++) cudaEventElapsedTime(&t[i], ev[i], ev[i + 1]);
+        fprintf(stderr, "oz%d %dx%dx%d: scale+residues %.2f  INT8 GEMMs %.2f (%.0f TOPS)  CRT %.2f ms\n", NM, p.M, p.N, p.K,
+                t[0], t[1], 2.0 * NM * p.Mp * (double)p.Np * p.Kp / (t[1] * 1e9), t[2]);
+        for (auto &e : ev) cudaEventDestroy(e);
+    }
 }
 
 inline void dgemm(Plan &p, const double *A, const double *B, double *C) {
