@@ -3,10 +3,8 @@
 // ctypes can call them with NumPy (host) or CUDA (device) pointers and nobody has to compile anything. cudart is linked
 // statically: the library needs only the NVIDIA driver. All matrices are row-major float64: A is M x K, B is K x N.
 // Every function returns 0 or a cudaError_t / OZB_E* code; ozb_error() turns it into text. Nothing here aborts the process.
-#include <algorithm>
 #include <cstring>
 #include <mutex>
-#include <vector>
 #include "../src/ozaki2.cuh"
 #include "../src/ozaki_dd.cuh"
 #include "../src/ozaki_td.cuh"
@@ -147,7 +145,7 @@ OZB_API int ozb_bench(int n, int kind, int reps, double *median_ms) {
         free(h);
     }
     // layout: A parts at d[0..parts), B parts at d[2parts..3parts), C parts at d[parts..2parts)
-    std::vector<float> t;
+    float t[101]; int nt = 0;   // no std::vector: its instantiation would be exported from the library
     cudaEvent_t e0, e1;
     if (!err) { cudaEventCreate(&e0); cudaEventCreate(&e1); }
     for (int r = -1; r < reps && !err; r++) {   // r = -1: warm-up (plans, first launches)
@@ -157,9 +155,10 @@ OZB_API int ozb_bench(int n, int kind, int reps, double *median_ms) {
         else err = ozb_tdgemm(n, n, n, d[0], d[1], d[2], d[6], d[7], d[8], d[3], d[4], d[5], 0);
         cudaEventRecord(e1); cudaEventSynchronize(e1);
         float ms; cudaEventElapsedTime(&ms, e0, e1);
-        if (r >= 0) t.push_back(ms);
+        if (r >= 0) t[nt++] = ms;
     }
-    if (!t.empty()) { std::sort(t.begin(), t.end()); *median_ms = t[t.size() / 2]; cudaEventDestroy(e0); cudaEventDestroy(e1); }
+    if (nt) { for (int i = 1; i < nt; i++) for (int j = i; j > 0 && t[j - 1] > t[j]; j--) { const float x = t[j]; t[j] = t[j - 1]; t[j - 1] = x; }
+        *median_ms = t[nt / 2]; cudaEventDestroy(e0); cudaEventDestroy(e1); }
     for (double *p : d) if (p) cudaFree(p);
     return err;
 }

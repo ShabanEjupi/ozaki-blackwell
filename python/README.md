@@ -45,7 +45,8 @@ https://git.spacecode.tech/shaban/ozaki-blackwell (mirror: https://github.com/Sh
 
 **License.** Ozaki-Blackwell Restricted Source License 1.0 (the LICENSE file in the package). This is not an
 open-source license: free for private study (90 days) and for open academic research; every other use, including any use
-by or for an organization, needs a commercial license.
+by or for an organization, needs a commercial license. The prohibited uses of its section 4 (interest, gambling, alcohol,
+images of living beings, music, weapons, surveillance, ...) bind everyone, licensees included.
 
 ## Shqip
 
@@ -54,4 +55,5 @@ kartelave NVIDIA (sm_80 e më të reja), me skemën Ozaki II. Te një laptop RTX
 (14–15× FP64-ja e vetë kartelës), double-double 3,81, triple-double 2,03 TFLOPS te n = 4096. Për FP64 të thjeshtë,
 emulimi i cuBLAS 13 dhe GEMMul8 janë më të shpejtë; vlera e kësaj pakete është double-double dhe triple-double.
 Instalimi: `pip install ozaki-blackwell`, prova: `python -m ozaki_blackwell`. Licenca: falas për studim privat (90
-ditë) dhe kërkim akademik të hapur; çdo përdorim tjetër kërkon licencë tregtare.
+ditë) dhe kërkim akademik të hapur; çdo përdorim tjetër kërkon licencë tregtare; përdorimet e ndaluara të nenit 4 vlejnë
+për këdo.
