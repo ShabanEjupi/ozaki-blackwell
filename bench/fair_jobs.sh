@@ -20,9 +20,7 @@ P=/opt/ozaki/cu13/lib/python3.12/site-packages/nvidia/cu13
   nice -n 19 $P/bin/nvcc -O3 -std=c++20 -arch=sm_120 -DGEMMUL8_BUILD_INT8=1 -DGEMMUL8_BUILD_FP8=0 -I/opt/ozaki/GEMMul8/include \
       -o out_gemmul8_emu bench/gemmul8_emu.cu /opt/ozaki/GEMMul8/lib/libgemmul8.a -L$P/lib -l:libcublas.so.13 \
       -l:libcublasLt.so.13 -l:libcudart.so.13 -lcuda -ldl -Xlinker -rpath=$P/lib &&
-  nice -n 19 g++ -O3 -fopenmp -c bench/solve_ref.cpp -o out_ref.o &&
-  nice -n 19 nvcc -O3 -arch=sm_120 -std=c++17 --fmad=false -Xcompiler -fopenmp,-ffp-contract=off,-march=native -o out_solve \
-      bench/solve.cu out_ref.o -lquadmath -lgomp; } >> $L 2>&1 || { log "build FAILED"; exit 1; }
+  bash bench/build_solvers.sh solve; } >> $L 2>&1 || { log "build FAILED"; exit 1; }
 . llm/hold.sh; hold fair; log "machine held"
 if win_interop 2>> $L; then log "Windows reachable (WSL_INTEROP=$WSL_INTEROP), AC: $(battery)"; else log "Windows NOT reachable"; fi
 log "== ours (ozaki_test)"; ./out_test >> $L 2>&1; log "rc=$?"

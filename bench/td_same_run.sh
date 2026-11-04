@@ -9,8 +9,7 @@ L=/opt/ozaki/job/td_same.log; cd "$(dirname "$0")/.." || exit 1
 export PATH=/usr/local/cuda-12.8/bin:$PATH
 log() { echo "$(date '+%F %T') $*" >> $L; }
 log "start $(cat .version 2>/dev/null | tr '\n' ' ')"
-nice -n 19 nvcc -O3 -arch=sm_120 -std=c++17 --fmad=false -Xcompiler -fopenmp,-ffp-contract=off,-march=native -o out_soltd \
-    bench/solve_td.cu -lmpfr -lgmp -lgomp >> $L 2>&1 || { log "build FAILED"; exit 1; }
+bash bench/build_solvers.sh soltd >> $L 2>&1 || { log "build FAILED"; exit 1; }
 . llm/hold.sh; hold tdsame; log "machine held"
 for n in 1024 2048 4096; do
     log "== n=$n seed=1"; OZ_CPUTD_NB=64 timeout 3600 ./out_soltd $n 256 36 1 >> $L 2>&1; log "rc=$?"; done

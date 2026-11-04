@@ -1,3 +1,0 @@
-wip/ (04-11-2026): drafts waiting for /opt/ozaki/job/{fair,td_same,dd_same}.log. Fill the @...@ cells, then:
-perl wip/rep.pl main.tex wip/abstract-old.tex wip/abstract-04-11.tex; perl wip/wc_abs.pl main.tex (<= 300);
-insert wip/sec-emu-04-11.tex before \section{A real task...}; delete wip/ after.

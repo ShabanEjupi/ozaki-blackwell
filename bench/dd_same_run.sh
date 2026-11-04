@@ -10,9 +10,7 @@ L=/opt/ozaki/job/dd_same.log; cd "$(dirname "$0")/.." || exit 1
 export PATH=/usr/local/cuda-12.8/bin:$PATH
 log() { echo "$(date '+%F %T') $*" >> $L; }
 log "start $(cat .version 2>/dev/null | tr '\n' ' ')"
-{ nice -n 19 g++ -O3 -fopenmp -c bench/solve_ref.cpp -o out_ref.o &&
-  nice -n 19 nvcc -O3 -arch=sm_120 -std=c++17 --fmad=false -Xcompiler -fopenmp,-ffp-contract=off,-march=native -o out_solve \
-      bench/solve.cu out_ref.o -lquadmath -lgomp; } >> $L 2>&1 || { log "build FAILED"; exit 1; }
+{ bash bench/build_solvers.sh solve; } >> $L 2>&1 || { log "build FAILED"; exit 1; }
 . llm/hold.sh; hold ddsame; log "machine held"
 for n in 2048 4096 6144 8192; do
     log "== n=$n seed=1"; OZ_SKIPCPU=1 OZ_CPUDD_NB=64 timeout 3600 ./out_solve $n 1024 20 1 >> $L 2>&1; log "rc=$?"; done

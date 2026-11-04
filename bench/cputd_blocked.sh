@@ -13,8 +13,7 @@ L=/opt/ozaki/job/cputd.log; cd "$(dirname "$0")/.." || exit 1
 export PATH=/usr/local/cuda-12.8/bin:$PATH
 log() { echo "$(date '+%F %T') $*" >> $L; }
 log "start $(cat .version 2>/dev/null | tr '\n' ' ')"
-nice -n 19 nvcc -O3 -arch=sm_120 -std=c++17 --fmad=false -Xcompiler -fopenmp,-ffp-contract=off,-march=native -o out_soltd \
-    bench/solve_td.cu -lmpfr -lgmp -lgomp >> $L 2>&1 || { log "build FAILED"; exit 1; }
+bash bench/build_solvers.sh soltd >> $L 2>&1 || { log "build FAILED"; exit 1; }
 . llm/hold.sh; hold cputd; log "machine held"
 log "== check n=2048"; OZ_NOMPFR=1 OZ_CPUTD_NB=128 ./out_soltd 2048 256 36 1 >> $L 2>&1; log "rc=$?"
 best=128; bt=1e9

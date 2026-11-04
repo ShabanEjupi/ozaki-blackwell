@@ -27,7 +27,8 @@ cat $D/marks
 # number with CONVFMT %.6g -- the epoch became "1.7938e+09", outside every window: 0 RAPL samples in each, GPU fine (its time
 # was a field, not computed). The same RAPL stream read by hand gave a sample a second.
 awk 'FILENAME ~ /rapl$/ { gsub(/\r/, ""); if (NF == 2 && $1 ~ /^[0-9]+$/) { rt[++nr] = $1 / 1000; rp[nr] = $2 + 0 }; next }
-     FILENAME ~ /gpu$/ { if (NF == 2) { gt[++ng] = $1 + 0; gp[ng] = $2 + 0 }; next }
+     FILENAME ~ /gpu$/ { if (NF == 2 && $2 ~ /^[0-9.]+$/) {   # "[N/A]" is no sample, not 0 W
+                          gt[++ng] = $1 + 0; gp[ng] = $2 + 0 }; next }
      /^MARK/ { m[$2] = $3; next }
      /blocked nb=/ { tc = $(NF-1) }
      /^all on GPU/ { tg += $4; ngs++ }

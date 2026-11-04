@@ -12,10 +12,7 @@ L=/opt/ozaki/job/eprof.log; cd "$(dirname "$0")/.." || exit 1
 export PATH=/usr/local/cuda-12.8/bin:$PATH
 log() { echo "$(date '+%F %T') $*" >> $L; }
 log "start $(cat .version 2>/dev/null | tr '\n' ' ')"
-F="-O3 -arch=sm_120 -std=c++17 --fmad=false -Xcompiler -fopenmp,-ffp-contract=off,-march=native"
-{ nice -n 19 g++ -O3 -fopenmp -c bench/solve_ref.cpp -o out_ref.o &&
-  nice -n 19 nvcc $F -o out_solve bench/solve.cu out_ref.o -lquadmath -lgomp &&
-  nice -n 19 nvcc $F -o out_soltd bench/solve_td.cu -lmpfr -lgmp -lgomp; } >> $L 2>&1 || { log "build FAILED"; exit 1; }
+bash bench/build_solvers.sh solve soltd >> $L 2>&1 || { log "build FAILED"; exit 1; }
 . llm/hold.sh; hold eprof; log "machine held"
 if win_interop 2>> $L; then log "Windows reachable (WSL_INTEROP=$WSL_INTEROP), AC: $(battery)"; else log "Windows NOT reachable"; fi
 log "== energy per solve, n=4096 (bench/energy_cpudd.sh, nb 64, 8 CPU solves)"
