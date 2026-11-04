@@ -898,5 +898,15 @@ int main(int argc, char **argv) {
         char lab[64]; snprintf(lab, sizeof lab, "double-double LU, CPU, %d threads (AVX)", thr);
         printf("%-44s %9.2f %15.3g %15.3g\n", lab, tc, err_t(zh.data(), zl.data()), err_q(zh.data(), zl.data()));
     }
+    if (getenv("OZ_CPUDD_NB")) {   // OZ_CPUDD_NB=<nb>: the blocked CPU double-double LU too, in the same run as the GPU solver and
+        // __float128 (04-11-2026: the paper's dd table had the GPU beside quad in one run and beside the blocked CPU LU in another)
+        std::vector<double> H(Ah), L(Al), zh, zl; std::vector<int> pv(n);
+        const int bnb = std::max(16, atoi(getenv("OZ_CPUDD_NB")));
+        double t0 = now();
+        lu_dd_cpu_blocked(n, bnb, H, L, pv); lu_dd_cpu_solve(n, H, L, pv, bh, bl, zh, zl);
+        double tc = now() - t0;
+        char lab[80]; snprintf(lab, sizeof lab, "double-double LU, CPU, %d threads (AVX, blocked nb=%d)", thr, bnb);
+        printf("%-44s %9.2f %15.3g %15.3g\n", lab, tc, err_t(zh.data(), zl.data()), err_q(zh.data(), zl.data()));
+    }
     printf("%-44s %9.2f %15.3g %15s\n", "__float128 LU (CPU, reference)", tq, err_t(rh.data(), rl.data()), "0");
 }
