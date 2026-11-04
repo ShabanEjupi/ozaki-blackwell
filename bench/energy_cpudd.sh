@@ -23,15 +23,18 @@ $SMI --query-gpu=power.draw --format=csv,noheader,nounits -lms 100 | while read 
 sleep 2; kill $RP $GP 2> /dev/null; sleep 0.5
 cat $D/marks
 # mean power in each window: RAPL in mW (the counter's unit; "> 1000 means mW" took an idle package under 1 W for 800 W), GPU in W
-awk 'FILENAME ~ /rapl$/ { gsub(/\r/, ""); if (NF == 2) r[++nr] = ($1 / 1000) " " $2; next }
-     FILENAME ~ /gpu$/ { g[++ng] = $1 " " $2; next }
+# Times and powers are kept as numbers: until 04-11-2026 a sample was the string ($1 / 1000) " " $2, and awk prints a computed
+# number with CONVFMT %.6g -- the epoch became "1.7938e+09", outside every window: 0 RAPL samples in each, GPU fine (its time
+# was a field, not computed). The same RAPL stream read by hand gave a sample a second.
+awk 'FILENAME ~ /rapl$/ { gsub(/\r/, ""); if (NF == 2 && $1 ~ /^[0-9]+$/) { rt[++nr] = $1 / 1000; rp[nr] = $2 + 0 }; next }
+     FILENAME ~ /gpu$/ { if (NF == 2) { gt[++ng] = $1 + 0; gp[ng] = $2 + 0 }; next }
      /^MARK/ { m[$2] = $3; next }
      /blocked nb=/ { tc = $(NF-1) }
      /^all on GPU/ { tg += $4; ngs++ }
      END { split("idle cpudd gpu", W, " ");
            for (w = 1; w <= 3; w++) { s = m[W[w] "-start"]; e = m[W[w] "-end"]; ps = pc = gs = gc = 0
-               for (i = 1; i <= nr; i++) { split(r[i], a, " "); if (a[1] >= s && a[1] <= e) { ps += a[2]; pc++ } }
-               for (i = 1; i <= ng; i++) { split(g[i], a, " "); if (a[1] >= s && a[1] <= e) { gs += a[2]; gc++ } }
+               for (i = 1; i <= nr; i++) if (rt[i] >= s && rt[i] <= e) { ps += rp[i]; pc++ }
+               for (i = 1; i <= ng; i++) if (gt[i] >= s && gt[i] <= e) { gs += gp[i]; gc++ }
                P[w] = pc ? ps / pc / 1000 : -1; G[w] = gc ? gs / gc : -1
                printf "%s: window %.1f s, package %.1f W (%d samples), GPU %.1f W (%d samples)\n", W[w], e - s, P[w], pc, G[w], gc }
            # a window without samples is not a measurement (04-11: 0 package samples printed as -1 W and summed)
