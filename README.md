@@ -1,12 +1,16 @@
 # ozaki-blackwell
 
-**EN** — Full-precision FP64 matrix multiplication on a *laptop* Blackwell GPU (RTX PRO 3000, sm_120), built from its
-INT8 tensor cores (Ozaki scheme II: exact integer products + Chinese remainder theorem), written in CUDA C and inline PTX.
-Goal: make a consumer GPU behave like a data-center FP64 part.
+**EN** — Precision as a software choice on a *laptop* Blackwell GPU (RTX PRO 3000, sm_120): FP64, double-double,
+triple-double and up to 424-bit matrix multiplication, exact integer arithmetic and correctly rounded products for large
+language models, all from its INT8 tensor cores (Ozaki scheme II: exact integer products + Chinese remainder theorem),
+written in CUDA C and inline PTX. For plain FP64, cuBLAS 13's own emulation and RIKEN's GEMMul8 are faster on this laptop
+(measured side by side, 04-11-2026, below); this code is for what lies beyond FP64.
 
-**SQ** — Shumëzim matricash me saktësi të plotë FP64 mbi një GPU *laptopi* Blackwell (RTX PRO 3000, sm_120), i ndërtuar nga
-tensor core-t INT8 (skema Ozaki II: prodhime të sakta me numra të plotë + teorema kineze e mbetjeve), në CUDA C dhe PTX.
-Qëllimi: një GPU e zakonshme të punojë si një kartelë FP64 e qendrave të të dhënave.
+**SQ** — Precizioni si zgjedhje softueri mbi një GPU *laptopi* Blackwell (RTX PRO 3000, sm_120): shumëzim matricash FP64,
+double-double, triple-double deri 424 bit, aritmetikë e saktë me numra të plotë dhe prodhime të rrumbullakuara saktë për
+modelet e mëdha gjuhësore, të gjitha nga tensor core-t INT8 (skema Ozaki II: prodhime të sakta me numra të plotë + teorema
+kineze e mbetjeve), në CUDA C dhe PTX. Për FP64 të thjeshtë, emulimi i vetë cuBLAS 13 dhe GEMMul8 i RIKEN-it janë më të
+shpejtë në këtë laptop (matur krah për krah, 04-11-2026, më poshtë); ky kod është për atë që shkon përtej FP64.
 
 > **License / Licenca** — source-available under the [Ozaki-Blackwell Restricted Source License 1.0](LICENSE), **not open
 > source**: free only for private study (90 days) and open academic research; every other use -- any company or organization,

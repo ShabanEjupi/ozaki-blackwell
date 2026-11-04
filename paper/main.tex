@@ -22,7 +22,7 @@ Consumer and laptop GPUs run FP64 at 1/64 of their FP32 rate: on a laptop Blackw
 232~TOPS of INT8 \texttt{mma.sync} against 0.449~TFLOPS of native FP64, a ratio of $517\times$. With the Ozaki scheme~II
 we implement in CUDA C and PTX matrix multiplication at FP64 (6.76~TFLOPS, $15.1\times$ the native peak and more accurate),
 double-double (3.81~TFLOPS), triple-double (2.00~TFLOPS) and up to 424 bits from the same INT8 units, to our knowledge the
-first such GEMMs beyond FP64 on GPU tensor cores. Solving $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.956~s at
+first such GEMMs beyond FP64 on GPU INT8 tensor cores. Solving $Ax=b$ with $\kappa(A)=10^{20}$ in double-double takes 0.956~s at
 $n=8192$, $499\times$ sooner than a \texttt{\_\_float128} LU on 24 CPU threads; at $\kappa=10^{36}$, where double-double has
 no correct digit, a triple-double LU is $145\times$ faster than MPFR. Exact integer matrix products with 1\,015- to
 131\,063-bit entries run $10$--$19\times$ faster than FLINT on 24 CPU threads; exact determinants come up to $355\times$
@@ -57,12 +57,15 @@ set by the number of moduli and by how many floating-point words each input and 
 INT8 GEMMs, runs at the same speed whatever the precision. This turns precision into a software choice on hardware that has
 no wide floating-point unit at all. We build and measure:
 \begin{itemize}
-\item FP64 GEMM at 16 moduli: 6.76~TFLOPS, $15.1\times$ the native FP64 peak, with smaller error than native FP64;
+\item FP64 GEMM at 16 moduli: 6.2--6.8~TFLOPS, 14--15$\times$ the native FP64 peak, with smaller error than native FP64; on
+the same laptop cuBLAS~13's own emulation and GEMMul8 are faster and at least as accurate (Section~\ref{sec:emu}), so FP64 is
+our baseline, not our claim;
 \item double-double ($\sim$106-bit) GEMM at 32 moduli: 3.81~TFLOPS, $8.5\times$ the native FP64 peak with twice the bits;
 \item triple-double ($\sim$159-bit) GEMM at 49 moduli---after which every prime below 256 divides one of them, so no further
 8-bit modulus can join---at 2.00~TFLOPS;
 \item arbitrary precision beyond that from balanced 160-bit slices: 212, 318 and 424 bits;
-\item dense linear solves at condition numbers where FP64 and double-double fail, all on the GPU;
+\item dense linear solves at condition numbers where FP64 and double-double fail, all on the GPU: $23\times$ (double-double,
+$n=8192$) and $9\times$ (triple-double, $n=4096$) sooner than the same LUs cache-blocked on the laptop's 24 CPU threads;
 \item exact products of integer matrices with 1\,015- to 131\,063-bit entries, the GEMM work linear in the bits
 ($10$--$19\times$ faster than FLINT, Section~\ref{sec:big});
 \item exact determinants of int8 matrices up to $n=32\,768$ ($40$--$355\times$ faster than FLINT), and of matrices with 32--256-bit entries by high-order lifting on tensor cores ($17$--$404\times$);
@@ -151,19 +154,21 @@ Beyond triple-double, against an exact 2400-bit sum at $K=256$: 0.13~ulp at 212 
 
 \section{Speed}
 \begin{table}[h]\centering
-\caption{GEMM speed on the laptop, measured on 3 November 2026 with the machine to itself (\texttt{bench/speed\_all.sh}).
-CPU numbers with the CPU otherwise idle, measured at $n=256$/512 and scaled by $n^3$; such short runs vary by up to
-$2.8\times$, so each is the fastest we logged (22 October or 3 November).}\label{tab:speed}
+\caption{GEMM speed on the laptop with the machine to itself. FP64 and dd: 3 November (\texttt{bench/speed\_all.sh}); the
+rows at $n=2048$: 4 November (\texttt{bench/cpu\_base.sh}), GPU and CPU in the same held window, each CPU time the median of
+five full runs at $n=2048$ (none scaled), the triple-double CPU code built with \texttt{-march=native} (without it
+\texttt{std::fma} is a libm call and the loop does not vectorize: 3.54~s instead of 2.46).}\label{tab:speed}
 \small
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{rrrrll}\toprule
 bits & $n$ & GPU time & GPU TFLOPS & best CPU code, 24 threads & MPFR, 24 threads \\\midrule
 53 (FP64) & 4096 & 20.3 ms & 6.76 ($15.1\times$ native) & --- & --- \\
 106 (dd) & 4096 & 36.1 ms & 3.81 ($8.5\times$ native) & --- & --- \\
-159 (td) & 4096 & 68.8 ms & 2.00 & td AVX $\sim$10.7 s ($156\times$) & $\sim$208 s ($3020\times$) \\
-212 & 2048 & 34.7 ms & 0.50 & QD \texttt{qd\_real} $\sim$15.6 s ($450\times$) & $\sim$30 s ($865\times$) \\
-318 & 2048 & 46.4 ms & 0.37 & --- & $\sim$34 s ($733\times$) \\
-424 & 2048 & 69.3 ms & 0.25 & --- & $\sim$41 s ($592\times$) \\\bottomrule
+159 (td) & 4096 & 67.7 ms & 2.03 & --- & --- \\
+159 (td) & 2048 & 11.3 ms & 1.52 & td AVX2 2.46 s ($218\times$) & 22.8 s ($2018\times$) \\
+212 & 2048 & 34.2 ms & 0.50 & QD \texttt{qd\_real} 15.0 s ($439\times$) & 26.4 s ($772\times$) \\
+318 & 2048 & 44.8 ms & 0.38 & --- & 30.6 s ($682\times$) \\
+424 & 2048 & 69.4 ms & 0.25 & --- & 35.3 s ($508\times$) \\\bottomrule
 \end{tabular}
 \end{table}
 At 16 moduli a $4096^3$ FP64 GEMM now takes 20.3~ms. In the code of 15 October (24.7~ms, 5.56~TFLOPS) it split into scales
@@ -652,19 +657,23 @@ longer fit 12~GB together; inside the FP64 emulation the card still forces opera
 number of slices, as MPFR's does at these sizes, so the ratio against MPFR does not grow without bound; it is largest
 against software emulation of each width. The triple-double solver is panel-bound at $n=4096$. Kernel launches cost
 $\sim$7~$\mu$s under WSL2 (0.83~$\mu$s per node in a CUDA graph), which matters for the many small launches of the panel.
-All measurements are on one laptop model; the CPU references use the same machine's 24 threads.
+For FP64 itself our GEMM is not the one to use: on this laptop cuBLAS~13's emulation and GEMMul8 are faster and at least as
+accurate (Section~\ref{sec:emu}). The CPU baselines of the double-double and triple-double solves are our own LUs in the same
+arithmetic, cache-blocked (AVX2, 24 threads, bit for bit the unblocked loop); against those the GPU's lead is $23\times$
+and $9\times$, not the hundreds it has against \texttt{\_\_float128} and MPFR, and at $n\le2048$ it is small. We have not measured
+MPLAPACK's double-double LU. All measurements are on one laptop model; the CPU references use the same machine's 24 threads.
 
 \section{Related work}
 Ozaki scheme~II~\cite{ozaki2} emulates FP64 GEMM with INT8 and the CRT and reports 7.4--9.8~TFLOPS on an RTX~4090; RIKEN's GEMMul8~\cite{gemmul8}
 is its public code. NVIDIA's cuBLAS has emulated DGEMM on INT8 tensor cores since CUDA Toolkit 13.0 Update 2 (October 2025),
-by the Ozaki scheme with fixed-point slices, either with an automatic dynamic precision that analyses the inputs and keeps an
+by the Ozaki scheme with fixed-point slices~\cite{schwarz26}, either with an automatic dynamic precision that analyses the inputs and keeps an
 accuracy equal to or better than native FP64 (or runs native FP64 instead) or with a fixed number of mantissa
 bits~\cite{nvemu,cublasdoc}; NVIDIA reports up to $13\times$ native FP64 on an RTX PRO 6000 Blackwell Server Edition. Both
 return an FP64 result at most; Section~\ref{sec:emu} measures them beside ours on this laptop. Follow-up work covers SGEMM and power efficiency on an RTX~5080~\cite{ozaki2sgemm}, FP8 and FP4
 variants~\cite{fp8,fp4a,fp4b}, fused kernels reaching 81\% of INT8 peak on Blackwell~\cite{emugemm} and complex
 GEMM~\cite{cgemm}. Beyond FP64, Ozaki scheme~I already gave binary128 GEMM from FP64 GEMMs~\cite{mukunoki21}, and
 Kouya runs Ozaki-II for multiple-precision GEMM, 53 to 2048 bits, on CPU INT8 units (Intel AMX, Arm SVE2-i8mm)~\cite{ozamx};
-we found no double-double or wider GEMM built from GPU tensor cores, nor linear solves at these condition numbers on this
+Chen and Verschelde multiply multiple doubles on the FP64 tensor cores of an A100 with an Ozaki-like splitting~\cite{chenv26}; we found no double-double or wider GEMM built from INT8 tensor cores, the only fast ones consumer and laptop GPUs have, nor linear solves at these condition numbers on this
 class of hardware. Multimodular exact integer matrix multiplication is classical (FLINT; conversions to and from a residue
 system written as matrix products by Doliskani, Giorgi, Lebreton and Schost~\cite{dgls}). Close in spirit: integer matrix
 products at various precisions on AMX and IFMA by van der Hoeven and Mezzarobba~\cite{vdhm}; modular products over large
@@ -713,6 +722,10 @@ of equations. \emph{Information Processing Letters} 28(2):71--75, 1988. doi:10.1
 Proc.\ ISSAC 1999, 197--204. doi:10.1145/309831.309934.
 \bibitem{ozaki2} K.~Ozaki, Y.~Uchino, T.~Imamura. Ozaki Scheme II: A GEMM-oriented emulation of floating-point matrix
 multiplication using an integer modular technique. arXiv:2504.08009, 2025.
+\bibitem{schwarz26} A.~Schwarz, A.~Anders, C.~Brower, H.~Bayraktar, J.~Gunnels, K.~Clark, R.~G.~Xu, S.~Rodriguez, S.~Cayrols,
+P.~Tabaszewski, V.~Podlozhnyuk. Guaranteed DGEMM accuracy while using reduced precision tensor cores through extensions of
+the Ozaki scheme. Proc.\ SCA/HPCAsia 2026, Osaka. doi:10.1145/3773656.3773670.
+\bibitem{chenv26} H.~Chen, J.~Verschelde. Multiple double arithmetic on NVIDIA tensor cores. arXiv:2607.06881, 2026 (ICMS 2026).
 \bibitem{nvemu} C.~Brower, J.~Gunnels, G.~Lopez. Unlocking Tensor Core performance with floating point emulation in cuBLAS.
 NVIDIA Technical Blog, 24 October 2025, \url{https://developer.nvidia.com/blog/unlocking-tensor-core-performance-with-floating-point-emulation-in-cublas/}.
 \bibitem{cublasdoc} NVIDIA. cuBLAS library documentation, cuBLAS~13: floating point emulation

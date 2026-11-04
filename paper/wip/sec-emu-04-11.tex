@@ -1,0 +1,29 @@
+\section{FP64 emulation on one laptop}\label{sec:emu}
+FP64 from INT8 is not our claim, and two public implementations of it run on this laptop: cuBLAS~13's own emulation
+(\texttt{CUBLAS\_COMPUTE\_64F\_EMULATED\_FIXEDPOINT}, cuBLAS 13.8.2 from NVIDIA's wheels, 8~GB workspace; its automatic dynamic
+precision, ADP, or a fixed number of mantissa bits)~\cite{nvemu,cublasdoc} and GEMMul8~\cite{gemmul8} (commit 30b5b5d, INT8
+backend, fast and accurate modes). We ran the three in one held window with one harness (\texttt{bench/emu\_harness.h},
+\texttt{bench/fair\_jobs.sh}, 4 November 2026): the same inputs (normal values times $2^{u}$, $u$ uniform in $[-s,s]$), the error
+componentwise against an exact-to-$2^{-80}$ reference at $M=N=256$, and the time as the median of five calls after a warm-up.
+
+\begin{table}[h]\centering
+\caption{FP64 by emulation on the INT8 tensor cores of the laptop, three implementations in one window. Error:
+$\max_{ij}|C-C_{\mathrm{ref}}|_{ij}/(|A||B|)_{ij}$ in units of $2^{-53}$ at $K=4096$, exponents spread over $2^{\pm s}$;
+speed in FP64-equivalent TFLOPS (median of five); energy at $n=4096$, three 12-s runs each (\texttt{bench/energy\_emu.sh},
+the same inputs for all).}\label{tab:emu}
+\small\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{lrrrrrrrr}\toprule
+& \multicolumn{4}{c}{error at $K=4096$, $s=$} & \multicolumn{3}{c}{TFLOPS at $n=$} & GFLOPS/W \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-8}
+& 0 & 8 & 16 & 32 & 2048 & 4096 & 8192 & $n=4096$ \\\midrule
+native FP64 (cuBLAS DGEMM) & 0.81 & 6.3 & 12.9 & 13.8 & @N2@ & @N4@ & @N8@ & 7.5--8.1 \\
+ours, 14 moduli & 10.5 & 203 & 800 & 3\,680 & @O14_2@ & @O14_4@ & @O14_8@ & 60.0--60.8 \\
+ours, 16 moduli & 0.24 & 1.9 & 4.7 & 31.5 & @O16_2@ & @O16_4@ & @O16_8@ & 54.0--55.2 \\
+cuBLAS, ADP & 0.13 & 0.65 & 1.3 & 13 & @CA_2@ & @CA_4@ & @CA_8@ & 46.9--48.4 \\
+cuBLAS, 47 bits & 22.2 & 389 & 1\,170 & 6\,510 & @C47_2@ & @C47_4@ & @C47_8@ & 75.3--76.8 \\
+cuBLAS, 55 bits & 0.12 & 1.5 & 4.7 & 31.5 & @C55_2@ & @C55_4@ & @C55_8@ & 68.4--69.2 \\
+GEMMul8 fast, 14 moduli & 3.4 & 20.2 & 40.5 & 222 & @G14_2@ & @G14_4@ & @G14_8@ & 70.6--72.5 \\
+GEMMul8 fast, 16 moduli & 0.097 & 0.39 & 0.64 & 1.3 & @G16_2@ & @G16_4@ & @G16_8@ & 64.4--64.6 \\
+GEMMul8 accurate, 16 moduli & 0.097 & 0.39 & 0.64 & 1.05 & @A16_2@ & @A16_4@ & @A16_8@ & 56.9--57.1 \\\bottomrule
+\end{tabular}
+\end{table}
