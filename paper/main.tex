@@ -43,7 +43,7 @@ tensor core-t INT8 janë qindra herë më të shpejtë. Mbi një GPU Blackwell l
 FP64 ($517\times$). Me skemën Ozaki~II (prodhime të sakta të mbetjeve dhe teorema kineze e mbetjeve) ndërtuam shumëzim
 matricash me saktësi FP64 (6,7~TFLOPS; emulimi i vetë cuBLAS~13 arrin 8,5), double-double, triple-double dhe arbitrare (deri 424 bit) nga të njëjtat njësi INT8. Te një punë
 reale---$Ax=b$ me $\kappa=10^{20}$---zgjidhja double-double mbaron $22\times$ më shpejt se e njëjta LU e bllokuar mbi 24 fije CPU dhe $629\times$ më shpejt
-se LU \texttt{\_\_float128} ($n=8192$), me gabim po aq të vogël, dhe me $\sim$270$\times$ më pak energji se \texttt{\_\_float128} ($n=4096$). Me prime nën $2^{16}$ e $2^{23}$ të ndara në bajte, shumëzimi i \emph{saktë} i matricave me numra të plotë 1\,015--131\,063 bitësh del bit për bit i saktë, $10$--$19\times$ më shpejt se FLINT dhe me $15$--$18\times$ më pak energji. Përcaktori i saktë i një matrice int8 del $224\times$ më shpejt se FLINT te $n=4096$ dhe $355\times$ te $n=8192$, me një kufi të provuar që bie brenda një biti te këto madhësi; te $n=32\,768$ (425\,348 bit) mbaron për 594--615~s brenda 12~GB të GPU-së. Për hyrje 32--256 bit, ngritja e rendit të lartë mbi të njëjtat GEMM modulare dhe një kufi i provuar për hyrje me plane bajtesh e japin përcaktorin $291\times$ më shpejt se FLINT te $n=2048$ me hyrje 64-bit, $359\times$ me 128-bit dhe $404\times$ te $n=4096$; raporti rritet me madhësinë e hyrjeve. Te 15 nga sistemet reale më të keqkushtëzuara të NIST Matrix Market zgjidhja e saktë e certifikuar del për 0,17--115~s, 9--7\,857$\times$ më shpejt se SPEX aty ku SPEX mbaron, ndërsa FP64 s'ka asnjë shifër të saktë te 8 prej tyre. Algoritmi i Strassen-it modulo $m$, i saktë për çdo modul, arrin 91\,\% të shpejtësisë INT8 që laptopi mban, dhe një DGEMM me saktësi FP64 te $n=16\,384$ kushton 73,6~J, 13,9$\times$ më pak se FP64-ja e vetë GPU-së në pikën e saj më të mirë. Të njëjtat njësi japin prodhime MXFP4, NVFP4, FP8 dhe BF16 të rrumbullakuara saktë mbi peshat reale të modeleve gjuhësore të hapura deri 2,78 mijë miliardë parametra, të njëjta për çdo madhësi grupi; Nemotron~3 Ultra (560 miliardë parametra) xhiron i tëri nga disku i laptopit, pa kosto në dekodim.
+se LU \texttt{\_\_float128} ($n=8192$), me gabim po aq të vogël, dhe me $12\times$ më pak energji se LU e bllokuar e CPU-së dhe $\sim$270$\times$ më pak se \texttt{\_\_float128} ($n=4096$). Me prime nën $2^{16}$ e $2^{23}$ të ndara në bajte, shumëzimi i \emph{saktë} i matricave me numra të plotë 1\,015--131\,063 bitësh del bit për bit i saktë, $10$--$19\times$ më shpejt se FLINT dhe me $15$--$18\times$ më pak energji. Përcaktori i saktë i një matrice int8 del $224\times$ më shpejt se FLINT te $n=4096$ dhe $355\times$ te $n=8192$, me një kufi të provuar që bie brenda një biti te këto madhësi; te $n=32\,768$ (425\,348 bit) mbaron për 594--615~s brenda 12~GB të GPU-së. Për hyrje 32--256 bit, ngritja e rendit të lartë mbi të njëjtat GEMM modulare dhe një kufi i provuar për hyrje me plane bajtesh e japin përcaktorin $291\times$ më shpejt se FLINT te $n=2048$ me hyrje 64-bit, $359\times$ me 128-bit dhe $404\times$ te $n=4096$; raporti rritet me madhësinë e hyrjeve. Te 15 nga sistemet reale më të keqkushtëzuara të NIST Matrix Market zgjidhja e saktë e certifikuar del për 0,17--115~s, 9--7\,857$\times$ më shpejt se SPEX aty ku SPEX mbaron, ndërsa FP64 s'ka asnjë shifër të saktë te 8 prej tyre. Algoritmi i Strassen-it modulo $m$, i saktë për çdo modul, arrin 91\,\% të shpejtësisë INT8 që laptopi mban, dhe një DGEMM me saktësi FP64 te $n=16\,384$ kushton 73,6~J, 13,9$\times$ më pak se FP64-ja e vetë GPU-së në pikën e saj më të mirë. Të njëjtat njësi japin prodhime MXFP4, NVFP4, FP8 dhe BF16 të rrumbullakuara saktë mbi peshat reale të modeleve gjuhësore të hapura deri 2,78 mijë miliardë parametra, të njëjta për çdo madhësi grupi; Nemotron~3 Ultra (560 miliardë parametra) xhiron i tëri nga disku i laptopit, pa kosto në dekodim.
 
 \section{Introduction}
 The FP64 units of consumer and laptop GPUs are a small fraction of the chip: on our laptop Blackwell part a peak kernel
@@ -251,6 +251,10 @@ makes the CPU LU 1.4--6.4$\times$ faster (it is memory-bound otherwise), and the
 it the GPU's lead grows with $n$, from $3.6\times$ to $22\times$, because the work moves into the tensor-core GEMMs; against
 \texttt{\_\_float128}, the quad precision a user would reach for, it is 107--629$\times$. The errors of all three are of one order,
 5--240 times $\kappa u\approx1.2\cdot10^{-12}$ with $u=2^{-106}$: the conditioning sets them, not the solver.
+With a synchronization at every phase boundary (\texttt{bench/energy\_prof\_run.sh}) the solve at $n=8192$ spends 0.33~s in
+the panel (its leaves 0.16~s, bound by the FP64 units at $\sim$10~GFLOPS per SM), 0.13~s in the trailing GEMMs, 0.03~s in
+$U_{12}$ and 0.10~s in the solves and the refinement step; the other 0.12~s of its 0.71~s move $A$ (1~GB in double-double)
+to the device and keep a copy of it for the refinement.
 
 \paragraph{Triple-double, $\kappa=10^{36}$.} Here $\kappa u$ is $10^{20}$ for FP64 and $10^4$ for double-double: neither has a
 correct digit. The same solver structure in three parts per number, with 16-column leaves:
@@ -269,9 +273,10 @@ $n$ & \textbf{td LU, GPU} & blocked & unblocked & MPFR LU, 160 bits & GPU / CPU 
 4096 & \textbf{0.447 s} & 3.83 s ($\mathbf{8.6\times}$) & 17.5 s ($39\times$) & 74.1 s ($\mathbf{166\times}$) & 3.5 / 12 / 9.6 & 86 \\\bottomrule
 \end{tabular}
 \end{table}
-At $n\le1024$ a well-vectorized triple-double LU on 24 cores keeps up; the gap opens with $n$ as the work moves into the
-tensor-core GEMMs. At $n=4096$ the panels take 0.38~s of the 0.563~s (leaves 0.14~s): the panel, not the GEMM, is now the
-limit.
+At $n\le1024$ a well-vectorized triple-double LU on 24 cores keeps up, and blocking it does not pay there; the gap opens with
+$n$ as the work moves into the tensor-core GEMMs. At $n=4096$, with a synchronization at every phase boundary, the panels take
+0.26--0.29~s of 0.47~s (leaves 0.12--0.13~s), $U_{12}$ and the trailing GEMMs 0.09~s, the solves 0.07~s, the upload 0.05~s: the
+panel, not the GEMM, is the limit.
 
 \section{Thousands of bits, exactly: linear in the bits}\label{sec:big}
 The 49 moduli $\le 256$ cap one Ozaki-II product at $\sim$160-bit inputs, and slicing beyond that costs a number of GEMMs that
@@ -630,14 +635,21 @@ runs each on 3 November with the current code, \texttt{bench/energy\_all.sh}): n
 Ozaki-II at 16 moduli 50.2--51.3 ($6.9$--$7.5\times$; 5.79--5.87~TFLOPS sustained at 113--117~W), at 12 moduli 64.4--65.1. The
 code of 15 October gave 7.4, 53.6 and 69.5 at $\sim$95~W: the current code is 14--16\% faster at 16 moduli and draws
 20--24\% more power, so its joules per product barely moved; under a power cap only fewer operations help
-(Section~\ref{sec:strassen}). For a whole solve ($n=4096$, $\kappa=10^{20}$, 20 back-to-back GPU solves after a warm-up; CPU
-package power from the RAPL counters, GPU power from \texttt{nvidia-smi}):
+(Section~\ref{sec:strassen}). For a whole solve ($n=4096$, $\kappa=10^{20}$; CPU package power from the RAPL counters at 1~s, GPU power from
+\texttt{nvidia-smi} at 100~ms; 20 back-to-back GPU solves after a warm-up, each charged its share of their whole window,
+which can only flatter the CPU). Each pair was measured in one window: \texttt{\_\_float128} against the GPU on 22 October
+(\texttt{bench/energy\_solve.sh}), the blocked CPU LU against the GPU on 4 November (\texttt{bench/energy\_cpudd.sh}):
 \begin{center}\begin{tabular}{lrrrr}\toprule
 & time & CPU package & GPU & energy per solve \\\midrule
-\texttt{\_\_float128} LU, 24 threads & 55.0 s & 106.5 W & 8.4 W (idle) & 6.3 kJ \\
-dd LU on the GPU & 0.238 s & 28.2 W & 68.3 W & \textbf{23 J} \\\bottomrule
+\multicolumn{5}{l}{\emph{22 October}} \\
+\texttt{\_\_float128} LU, 24 CPU threads & 55.0 s & 106.5 W & 8.4 W (idle) & 6.3 kJ \\
+dd LU on the GPU & 0.238 s & 28.2 W & 68.3 W & \textbf{23 J} \\\midrule
+\multicolumn{5}{l}{\emph{4 November}} \\
+dd LU, 24 CPU threads, blocked & 1.78 s & 143.2 W & 11.6 W & 276 J \\
+dd LU on the GPU & 0.264 s & 23.4 W & 62.4 W & \textbf{22.6 J} \\\bottomrule
 \end{tabular}\end{center}
-That is $\sim$270$\times$ less energy per solve with both CPU and GPU counted ($360\times$ GPU alone against CPU package alone).
+With both CPU and GPU counted the GPU solve takes $12\times$ less energy than the same LU blocked on the CPU and $\sim$270$\times$
+less than \texttt{\_\_float128}.
 DRAM power is not exposed on this laptop.
 
 \section{Past the classical ceiling: Strassen over $\mathbb{Z}/m$}\label{sec:strassen}
@@ -739,7 +751,7 @@ For low-precision neural networks, exact (Kulisch-style) accumulation was propos
 On a laptop GPU whose FP64 units are 517 times slower than its INT8 tensor cores, precision becomes a software parameter:
 the same INT8 GEMMs yield FP64, double-double, triple-double and wider products, and an ill-conditioned dense solve that needs
 quad precision finishes $22\times$ sooner than the same LU cache-blocked on the laptop's 24 CPU threads and $629\times$
-sooner than \texttt{\_\_float128} ($n=8192$), with $\sim$270$\times$ less energy than \texttt{\_\_float128} ($n=4096$). Exact integer products of up to 131\,063-bit entries come from the same units, $10$--$19\times$ faster than FLINT. Exact determinants and exact rational solutions of int8 systems, where no big number has to enter the GPU, come $36$--$355\times$ faster than FLINT, and with 32--256-bit entries high-order lifting on the same GEMMs keeps the ratio rising with the bits, up to $404\times$. On real matrices
+sooner than \texttt{\_\_float128} ($n=8192$), with $12\times$ less energy than the blocked CPU LU and $\sim$270$\times$ less than \texttt{\_\_float128} ($n=4096$). Exact integer products of up to 131\,063-bit entries come from the same units, $10$--$19\times$ faster than FLINT. Exact determinants and exact rational solutions of int8 systems, where no big number has to enter the GPU, come $36$--$355\times$ faster than FLINT, and with 32--256-bit entries high-order lifting on the same GEMMs keeps the ratio rising with the bits, up to $404\times$. On real matrices
 of NIST Matrix Market the certified exact solution comes 9--7\,857$\times$ sooner than SPEX, where FP64 often has no correct
 digit; and the same units give correctly rounded MXFP4, NVFP4, FP8 and BF16 products on the real weights of open models of
 up to 2.78 trillion parameters, identical for any batch, and run the whole 560-billion-parameter Nemotron~3 Ultra from disk

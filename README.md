@@ -282,6 +282,10 @@ unblocked one; GPU speedups in parentheses):
 | 2048 | **0.171 s** | 0.59 s (3.5×) | 0.99 s (5.8×) | 11.1 s (65×) |
 | 4096 | **0.447 s** | 3.83 s (**8.6×**) | 17.5 s (39×) | 74.1 s (**166×**) |
 
+**Energy per solve, n = 4096** (one window, `bench/energy_cpudd.sh`: RAPL package power at 1 s, nvidia-smi at 100 ms, 4 November):
+the blocked CPU dd LU 1.78 s × 154.8 W = 276 J, the GPU 0.264 s × 85.8 W = **22.6 J** → **12×** less energy on the GPU
+(against `__float128`: ~270×, 22 October). / Energjia për zgjidhje: 276 J kundër 22,6 J — 12× më pak te GPU.
+
 The honest headline is the blocked CPU column: **22×** (dd, n = 8192) and **8.6×** (td, n = 4096); the hundreds are against
 `__float128` and MPFR. The older sections below keep their numbers as measured then. / Titulli i ndershëm është kolona e
 CPU-së së bllokuar: 22× (dd) dhe 8,6× (td); qindrat janë kundër `__float128` dhe MPFR. Seksionet e vjetra më poshtë i
