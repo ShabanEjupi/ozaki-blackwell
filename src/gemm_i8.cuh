@@ -118,22 +118,22 @@ __device__ __forceinline__ void gemm_i8_tile(const int8_t *__restrict__ A, const
 }
 
 __global__ void __launch_bounds__(THREADS) gemm_i8(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt,
-                                                    int32_t *__restrict__ C, int M, int N, int K) {
+                                                    int32_t *__restrict__ C, int M, int N, int K, int g = 0) {
     A += (size_t)blockIdx.z * M * K; Bt += (size_t)blockIdx.z * N * K; C += (size_t)blockIdx.z * M * N;   // z = modulus: one launch for all planes
     gemm_i8_tile(A, Bt, K, [&](int row, int col, int c00, int c01, int c10, int c11) {
         *(int2 *)&C[(size_t)row * N + col] = make_int2(c00, c01);
         *(int2 *)&C[(size_t)(row + 8) * N + col] = make_int2(c10, c11);
-    });
+    }, 0, 0, g);
 }
 
 // the same with the 128 x 256 tile (warps 64 x 64): needs N % 256 == 0
 __global__ void __launch_bounds__(THREADS, 1) gemm_i8w(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt,
-                                                        int32_t *__restrict__ C, int M, int N, int K) {
+                                                        int32_t *__restrict__ C, int M, int N, int K, int g = 0) {
     A += (size_t)blockIdx.z * M * K; Bt += (size_t)blockIdx.z * N * K; C += (size_t)blockIdx.z * M * N;
     gemm_i8_tile<64, 3>(A, Bt, K, [&](int row, int col, int c00, int c01, int c10, int c11) {
         *(int2 *)&C[(size_t)row * N + col] = make_int2(c00, c01);
         *(int2 *)&C[(size_t)(row + 8) * N + col] = make_int2(c10, c11);
-    });
+    }, 0, 0, g);
 }
 
 // C = A Bt^T for Z planes (blockIdx.z), M % 128 == 0, N % 128 == 0, K % 64 == 0. The 128 x 256 tile (a third fewer shared-
@@ -141,7 +141,12 @@ __global__ void __launch_bounds__(THREADS, 1) gemm_i8w(const int8_t *__restrict_
 // 113.8 TOPS with int32 C). Short work runs at boost clock, where 128 x 128 (16 warps per SM, not 8) hides latency better
 // (n = 4096, one plane: 151.4 vs 137.8). Measured 29-10-2026; FP64 emulation errors identical on both.
 // OZ_NARROW=1 forces 128 x 128 (A/B measurements in one binary).
+// Blocks walk each plane in bands of 8 tile rows (gemm_i8_tile's `group`, as the Strassen leaves already did): in row-major
+// order every tile row re-reads all of B, which stops fitting in L2 once one plane of B (N x K bytes) does -- 64 MiB at
+// n = 8192, where OZ_PROF measured the INT8 GEMMs at 93 TOPS against 155-171 at 4096 (4 November 2026). OZ_BAND=0 restores
+// row-major order, OZ_BAND=g sets the band (A/B measurements in one binary).
 inline void gemm_i8_run(const int8_t *A, const int8_t *Bt, int32_t *C, int M, int N, int K, int Z = 1, cudaStream_t st = 0) {
+    static const int band = [] { const char *e = getenv("OZ_BAND"); return e && *e ? atoi(e) : 8; }();
     static const bool wide = [] {
         const char *e = getenv("OZ_NARROW"); if (e && *e == '1') return false;
         // a GPU that cannot grant 72 KB of shared memory per block keeps the 128 x 128 tile
@@ -150,8 +155,8 @@ inline void gemm_i8_run(const int8_t *A, const int8_t *Bt, int32_t *C, int M, in
         }
         return true;
     }();
-    if (wide && N % 256 == 0 && (size_t)M * N * Z >= (1ull << 26)) gemm_i8w<<<dim3(N / 256, M / BM, Z), THREADS, gemm_smem<64, 3>(), st>>>(A, Bt, C, M, N, K);
-    else gemm_i8<<<dim3(N / BN, M / BM, Z), THREADS, 0, st>>>(A, Bt, C, M, N, K);
+    if (wide && N % 256 == 0 && (size_t)M * N * Z >= (1ull << 26)) gemm_i8w<<<dim3(N / 256, M / BM, Z), THREADS, gemm_smem<64, 3>(), st>>>(A, Bt, C, M, N, K, band);
+    else gemm_i8<<<dim3(N / BN, M / BM, Z), THREADS, 0, st>>>(A, Bt, C, M, N, K, band);
 }
 
 }  // namespace oz
